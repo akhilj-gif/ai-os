@@ -17,7 +17,8 @@ Akhil's long-term project: a personal AI Operating System — a persistent, trus
 
 ## Current status
 
-- **Milestone: M0 (Definition & Skeleton)** — in progress as of 2026-07-02.
+- **Milestone: M0 (Definition & Skeleton) — COMPLETE 2026-07-03** (commit e9d6eca). All three exit criteria met: docs reviewed by Akhil ✓, `pnpm dev` boots kernel+UI ✓, hello-world model call traced in Langfuse ✓. **M1 (Walking Skeleton) is next.**
+- Rolling (not milestone-gated): failure corpus 12/50 → 50, ~5/week from daily life+work; `support-triage` eval suite needs its ~20 real tickets before M2.
 - M0 docs drafted 2026-07-02 (pending Akhil's review): `docs/VISION.md`, `docs/PRINCIPLES.md`, `docs/PRD-support-ops.md`, `docs/EVAL-SPEC.md`, and `docs/FAILURE-CORPUS.md` (12/50 entries seeded from real documented failures — Akhil to collect the remaining 38 during daily work).
 - Skeleton built 2026-07-02: pnpm monorepo (blueprint §10 layout), docker-compose (`infra/` — Postgres+pgvector, Redis, Langfuse v2 self-host headless-initialized on :3030), 5 data contracts as tables (`infra/migrations/0001_contracts.sql`) + zod v4 types (`packages/shared`), tracing (every API request + kernel task writes `trace_events`; model calls span to Langfuse). `pnpm dev` boots API (:4000) + web shell (:3000); `pnpm db:migrate`, `pnpm hello` work. Dev choices recorded in `docs/adr/0001-m0-skeleton-choices.md`.
 - Model provider is env-resolved (ADR-0002): `ANTHROPIC_API_KEY` → Claude (production intent) > `XAI_API_KEY` → Grok (Anthropic-compatible; key present but team has $0 credits) > `GEMINI_API_KEY` → Gemini free tier via OpenAI-compatible endpoint (**active dev provider**; Akhil's personal Pro key, fallback key commented in `.env`).
