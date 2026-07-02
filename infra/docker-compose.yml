@@ -1,0 +1,57 @@
+name: ai-os
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_PASSWORD: aios
+      POSTGRES_DB: aios
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d aios"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # Langfuse v2 (single container, shares the postgres instance).
+  # Dev-only credentials — headless-initialized so SDK keys work with zero UI setup.
+  langfuse:
+    image: langfuse/langfuse:2
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3030:3000"
+    environment:
+      DATABASE_URL: postgresql://postgres:aios@postgres:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3030
+      NEXTAUTH_SECRET: aios-dev-nextauth-secret
+      SALT: aios-dev-salt
+      ENCRYPTION_KEY: 0f2a9c1d8e7b6a5f4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_INIT_ORG_ID: aios
+      LANGFUSE_INIT_ORG_NAME: AI OS
+      LANGFUSE_INIT_PROJECT_ID: ai-os-dev
+      LANGFUSE_INIT_PROJECT_NAME: ai-os
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-aios-dev
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-aios-dev
+      LANGFUSE_INIT_USER_EMAIL: akhil.j@emergent.sh
+      LANGFUSE_INIT_USER_NAME: Akhil
+      LANGFUSE_INIT_USER_PASSWORD: aios-dev-password
+
+volumes:
+  pgdata:
