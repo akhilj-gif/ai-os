@@ -8,6 +8,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@ai-os/shared": "workspace:*"
+    "@ai-os/shared": "workspace:*",
+    "pg": "^8.22.0"
   }
 }

@@ -43,13 +43,13 @@
 
 | Category | Target | Seeded | Maps to eval suite |
 |---|---|---|---|
-| Ticket triage & reply drafting | 12 | 2 (FC-003, FC-008) | `support-triage` |
+| Ticket triage & reply drafting | 12 | 3 (FC-003, FC-008, FC-014) | `support-triage` |
 | Billing / Redash lookups | 8 | 1 (FC-002) | `support-triage`, `tool-reliability` |
 | Memory & continuity | 8 | 1 (FC-001) | `memory-recall` |
-| Tool reliability & ergonomics | 8 | 4 (FC-004..007) | `tool-reliability` |
+| Tool reliability & ergonomics | 8 | 6 (FC-004..007, FC-013, FC-015) | `tool-reliability` |
 | Background work & proactivity | 6 | 2 (FC-009, FC-010) | `planning` |
 | Trust, approvals & injection | 8 | 2 (FC-011, FC-012 — trust UX; **0 real injection payloads yet, collect from the queue, don't invent**) | `injection-defense` |
-| **Total** | **50** | **12** | |
+| **Total** | **50** | **15** | |
 
 ---
 
@@ -165,7 +165,34 @@
 
 ---
 
-### FC-013 … FC-050 · *(to collect — copy the template below)*
+### FC-013 · Model rate limit killed a task instead of waiting
+- **Date:** 2026-07-03 (M1 kill/resume exit test)
+- **Assistant:** AI OS itself (M1 kernel, Gemini free tier)
+- **Task (verbatim):** Multi-step research task resumed after a mid-run server kill.
+- **What happened:** Gemini free tier returned 429 with an explicit "retry in 28.8s" hint. The model router had no retry/backoff, so the whole task failed instantly — despite the server literally saying how long to wait.
+- **Failure mode:** `TOOL-REL` (secondary: `COST`) · **Severity:** S2 · **Frequency:** F1 (free tier: 5 req/min)
+- **Pass condition:** 429/503 → honor Retry-After/body hint with capped backoff (≤4 attempts); task completes. **Fixed same day** (`fetchWithRateLimitRetry`, model-router) — keep as a regression eval case.
+- **Eval suite:** `tool-reliability`
+
+### FC-014 · Gmail search too literal — missed an email it had already seen
+- **Date:** 2026-07-03
+- **Assistant:** AI OS (M1 kernel)
+- **Task (verbatim):** "Read the GitHub token expiry email from my inbox and tell me exactly what it says I should do."
+- **What happened:** The agent had listed "[GitHub] Your personal access token (classic) is about to expire" minutes earlier in the SAME session, but searched Gmail for the literal phrase "GitHub token expiry", found nothing, and gave up — offering an unrelated Supabase email as "closest".
+- **Failure mode:** `PLAN` (secondary: `MEM`) · **Severity:** S3 · **Frequency:** F2
+- **Pass condition:** Query reformulation on zero-hit searches (broader terms, from:github), and reuse of message ids already surfaced in-context.
+- **Eval suite:** `support-triage` (retrieval rubric), `planning`
+
+### FC-015 · Keyless web search intermittently returns nothing parseable
+- **Date:** 2026-07-03
+- **Assistant:** AI OS (M1 `web_search` = DuckDuckGo Lite scrape)
+- **Task (verbatim):** "web_search for the latest pgvector release…"
+- **What happened:** Same query class succeeded earlier in the day, then returned "no parseable results" on the resumed run — HTML scrape flakiness (layout/ratelimit). Known-fragile choice (ADR-0004 #4); now it has a measured failure.
+- **Failure mode:** `TOOL-REL` · **Severity:** S3 · **Frequency:** F2
+- **Pass condition:** Search succeeds ≥95% on the eval fixture set — likely requires swapping to a real search API (Brave/Tavily) or adding a fallback engine.
+- **Eval suite:** `tool-reliability`
+
+### FC-016 … FC-050 · *(to collect — copy the template below)*
 
 <!-- Add new entries above this line. Keep IDs sequential. -->
 
@@ -188,9 +215,10 @@
 
 | | Count |
 |---|---|
-| Entries collected | **12 / 50** |
+| Entries collected | **15 / 50** |
 | S1 (real mistake shipped) | 0 |
-| S2 (task blocked) | 4 |
+| S2 (task blocked) | 5 |
 | Trust entries / real injection payloads | 2 / 0 |
+| From the OS's own runs (dogfood) | 3 (FC-013..015) |
 
 **Biggest gaps to collect:** real ticket-triage failures with actual ticket numbers (the `support-triage` suite needs ~20 real tickets per blueprint §6), and real injection/trust incidents — watch for suspicious ticket bodies during daily work rather than inventing payloads.

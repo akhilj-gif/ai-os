@@ -4,3 +4,4 @@ node_modules/
 dist/
 *.tsbuildinfo
 evals/reports/
+workspaces/

@@ -140,6 +140,32 @@ async function callAnthropicShape(
   };
 }
 
+/** POST with rate-limit resilience: on 429/503, honor Retry-After or the
+ *  "retry in Xs" hint in the body (Gemini free tier is 5 req/min), capped waits,
+ *  up to 4 attempts. Tool/model unreliability is a first-class concern (FC-002). */
+async function fetchWithRateLimitRetry(
+  url: string,
+  init: RequestInit,
+  label: string,
+): Promise<Response> {
+  const MAX_ATTEMPTS = 4;
+  const MAX_WAIT_MS = 70_000;
+  let lastRes: Response | null = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const res = await fetch(url, init);
+    if (res.status !== 429 && res.status !== 503) return res;
+    lastRes = res;
+    if (attempt === MAX_ATTEMPTS) break;
+    const body = await res.clone().text();
+    const headerWait = Number(res.headers.get('retry-after')) * 1000 || 0;
+    const bodyWait = (Number(body.match(/retry in (\d+(?:\.\d+)?)s/i)?.[1]) || 0) * 1000;
+    const waitMs = Math.min(Math.max(headerWait, bodyWait, attempt * 5_000) + 1_000, MAX_WAIT_MS);
+    console.warn(`[model-router] ${label} got ${res.status}, retrying in ${Math.round(waitMs / 1000)}s (attempt ${attempt}/${MAX_ATTEMPTS})`);
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+  return lastRes!;
+}
+
 async function callOpenAIShape(
   provider: Provider,
   model: string,
@@ -149,14 +175,18 @@ async function callOpenAIShape(
   if (input.system) messages.push({ role: 'system', content: input.system });
   messages.push({ role: 'user', content: input.prompt });
 
-  const res = await fetch(`${provider.baseURL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${provider.apiKey}`,
+  const res = await fetchWithRateLimitRetry(
+    `${provider.baseURL}/chat/completions`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${provider.apiKey}`,
+      },
+      body: JSON.stringify({ model, max_tokens: input.maxTokens ?? 1024, messages }),
     },
-    body: JSON.stringify({ model, max_tokens: input.maxTokens ?? 1024, messages }),
-  });
+    `${provider.name}/${model}`,
+  );
   if (!res.ok) {
     throw new Error(`${provider.name} ${res.status}: ${(await res.text()).slice(0, 500)}`);
   }
@@ -207,4 +237,129 @@ export async function callModel(input: ModelCallInput): Promise<ModelCallResult>
 /** Flush buffered Langfuse events — call before process exit. */
 export async function flushTelemetry(): Promise<void> {
   await getLangfuse()?.flushAsync();
+}
+
+// ---------------------------------------------------------------------------
+// chat(): multi-turn, tool-calling completion for the executor loop.
+// M1 supports the OpenAI shape only (Gemini/Groq/OpenRouter); running the tool
+// loop on an Anthropic-shape provider needs the provider-neutral message IR —
+// deferred to M2 (ADR-0004). Message arrays are stored in task checkpoints, so
+// the checkpoint format is OpenAI-shaped for now (same ADR).
+// ---------------------------------------------------------------------------
+
+export interface ChatMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | null;
+  tool_calls?: Array<{
+    id: string;
+    type: 'function';
+    function: { name: string; arguments: string };
+  }>;
+  tool_call_id?: string;
+}
+
+export interface ChatToolDef {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+export interface ParsedToolCall {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+}
+
+export interface ChatResult {
+  model: string;
+  message: ChatMessage;
+  toolCalls: ParsedToolCall[];
+  usage: { inputTokens: number; outputTokens: number };
+}
+
+export interface ChatInput {
+  role: ModelRole;
+  messages: ChatMessage[];
+  tools?: ChatToolDef[];
+  maxTokens?: number;
+  traceId: string;
+  taskId?: string;
+  name?: string;
+}
+
+export async function chat(input: ChatInput): Promise<ChatResult> {
+  const provider = resolveProvider();
+  if (provider.kind !== 'openai') {
+    throw new Error(
+      `chat() with tools is OpenAI-shape only at M1 (provider "${provider.name}" is ${provider.kind}) — see ADR-0004`,
+    );
+  }
+  const model = routingTable(provider)[input.role];
+  const lf = getLangfuse();
+  const trace = lf?.trace({
+    id: input.traceId,
+    name: input.name ?? `chat.${input.role}`,
+    metadata: { provider: provider.name, ...(input.taskId ? { taskId: input.taskId } : {}) },
+  });
+  const generation = trace?.generation({
+    name: input.name ?? `chat.${input.role}`,
+    model,
+    input: { messages: input.messages.slice(-6), tools: input.tools?.map((t) => t.name) },
+  });
+
+  try {
+    const res = await fetchWithRateLimitRetry(
+      `${provider.baseURL}/chat/completions`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${provider.apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: input.maxTokens ?? 2048,
+          messages: input.messages,
+          ...(input.tools?.length
+            ? {
+                tools: input.tools.map((t) => ({
+                  type: 'function',
+                  function: { name: t.name, description: t.description, parameters: t.inputSchema },
+                })),
+              }
+            : {}),
+        }),
+      },
+      `${provider.name}/${model}`,
+    );
+    if (!res.ok) {
+      throw new Error(`${provider.name} ${res.status}: ${(await res.text()).slice(0, 500)}`);
+    }
+    const data = (await res.json()) as {
+      choices?: Array<{ message?: ChatMessage }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number };
+    };
+    const message = data.choices?.[0]?.message ?? { role: 'assistant' as const, content: '' };
+    const toolCalls: ParsedToolCall[] = (message.tool_calls ?? []).map((tc, i) => {
+      let args: Record<string, unknown> = {};
+      try {
+        args = JSON.parse(tc.function.arguments || '{}') as Record<string, unknown>;
+      } catch {
+        // leave args empty; the tool will report missing params back to the model
+      }
+      return { id: tc.id ?? `call_${i}`, name: tc.function.name, args };
+    });
+    const usage = {
+      inputTokens: data.usage?.prompt_tokens ?? 0,
+      outputTokens: data.usage?.completion_tokens ?? 0,
+    };
+    generation?.end({
+      output: toolCalls.length ? { toolCalls: toolCalls.map((t) => t.name) } : message.content,
+      usage: { input: usage.inputTokens, output: usage.outputTokens },
+    });
+    return { model, message, toolCalls, usage };
+  } catch (err) {
+    generation?.end({ level: 'ERROR', statusMessage: String(err) });
+    throw err;
+  }
 }

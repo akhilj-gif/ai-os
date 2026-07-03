@@ -1,4 +1,29 @@
-// Tool Layer (blueprint §4.1) — built in M1: MCP client + first 3 tools
-// (web search, filesystem workspace, Redash). Every call goes through the
-// Trust Gate and is recorded as a ToolCall row.
-export const MILESTONE = 'M1';
+// Tool Layer (blueprint §4.1) — M1: web search, per-task filesystem workspace,
+// Gmail/Calendar read+draft. Registry shapes are MCP-compatible (ADR-0004).
+import { ToolRegistry } from './registry.js';
+import { webSearch } from './tools/web-search.js';
+import { workspaceList, workspaceRead, workspaceWrite } from './tools/workspace.js';
+import { gmailList, gmailRead, gmailCreateDraft } from './tools/gmail.js';
+import { calendarList } from './tools/calendar.js';
+
+export type { ToolDef, ToolContext, ToolSchema } from './registry.js';
+export { ToolRegistry } from './registry.js';
+export { GoogleNotConnectedError, getGoogleAccessToken, googleApi } from './google.js';
+export { todayRange } from './tools/calendar.js';
+
+export function buildRegistry(): ToolRegistry {
+  const registry = new ToolRegistry();
+  for (const tool of [
+    webSearch,
+    workspaceList,
+    workspaceRead,
+    workspaceWrite,
+    gmailList,
+    gmailRead,
+    gmailCreateDraft,
+    calendarList,
+  ]) {
+    registry.register(tool);
+  }
+  return registry;
+}

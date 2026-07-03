@@ -82,6 +82,12 @@ importers:
       '@ai-os/shared':
         specifier: workspace:*
         version: link:../shared
+      '@ai-os/tools':
+        specifier: workspace:*
+        version: link:../tools
+      '@ai-os/trust':
+        specifier: workspace:*
+        version: link:../trust
       dotenv:
         specifier: ^17.4.2
         version: 17.4.2
@@ -127,12 +133,18 @@ importers:
       '@ai-os/shared':
         specifier: workspace:*
         version: link:../shared
+      pg:
+        specifier: ^8.22.0
+        version: 8.22.0
 
   packages/trust:
     dependencies:
       '@ai-os/shared':
         specifier: workspace:*
         version: link:../shared
+      pg:
+        specifier: ^8.22.0
+        version: 8.22.0
 
 packages:
 
