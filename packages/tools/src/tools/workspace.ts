@@ -1,7 +1,7 @@
 // Filesystem workspace, scoped per task (blueprint §8.2: the filesystem tool is
 // scoped to per-task workspaces — never the host FS at large).
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, existsSync } from 'node:fs';
-import { join, resolve, relative, sep } from 'node:path';
+import { join, resolve, relative, sep, isAbsolute } from 'node:path';
 import type { ToolDef, ToolContext } from '../registry.js';
 
 function workspaceDir(ctx: ToolContext): string {
@@ -15,7 +15,12 @@ function safePath(ctx: ToolContext, p: string): string {
   const base = workspaceDir(ctx);
   const full = resolve(base, p);
   const rel = relative(base, full);
-  if (rel.startsWith('..') || rel.includes(`..${sep}`)) {
+  // Containment check. `isAbsolute(rel)` is the critical guard on Windows: an
+  // absolute or cross-DRIVE input (e.g. "D:\\evil", "C:\\Windows\\...", a UNC
+  // "\\\\host\\share") makes relative() return an ABSOLUTE path that does NOT
+  // start with ".." — so the startsWith check alone lets it escape (review
+  // finding). An empty rel means the path IS the workspace dir, not a file.
+  if (rel === '' || rel.startsWith('..') || rel.includes(`..${sep}`) || isAbsolute(rel)) {
     throw new Error('path escapes the task workspace — refused');
   }
   return full;

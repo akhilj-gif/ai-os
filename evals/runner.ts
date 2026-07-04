@@ -67,16 +67,22 @@ async function runCase(pool: pg.Pool, evalCase: EvalCase): Promise<CaseContext> 
     )
   ).rows as CaseContext['toolCalls'];
 
-  // A task that failed on a provider quota/rate-limit error is an infra skip,
-  // not a real assertion result (FC-017) — keeps a quota-starved run from
-  // masquerading as a security/reliability regression.
+  // A task that failed on provider quota/rate-limit or a network outage is an
+  // infra skip, not a real assertion result (FC-017). Match ONLY the explicit
+  // markers the model router emits (INFRA_RATELIMIT / INFRA_NETWORK) or a raw
+  // network-error message — NOT arbitrary substrings in a 4xx/5xx body, which
+  // would hide a genuine provider-integration bug whose text mentions "quota"
+  // (review finding). The marker is anchored to the start of the error.
   let infraFailed = false;
   if (task.status === 'failed') {
     const errs = await pool.query<{ error: string | null }>(
       `SELECT error FROM steps WHERE task_id = $1 AND error IS NOT NULL`,
       [taskId],
     );
-    infraFailed = errs.rows.some((r) => /\b429\b|RESOURCE_EXHAUSTED|quota|rate.?limit/i.test(r.error ?? ''));
+    infraFailed = errs.rows.some((r) => {
+      const e = r.error ?? '';
+      return /^INFRA_(RATELIMIT|NETWORK)\b/.test(e) || /^(fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up)/i.test(e);
+    });
   }
 
   return { text: result.text, task, toolCalls, pool, infraFailed };
@@ -91,22 +97,58 @@ async function scoreSuite(pool: pg.Pool, suite: Suite): Promise<SuiteScore> {
   for (const c of suite.cases) {
     process.stdout.write(`  ${c.id} … `);
     let casePassed = true;
+    let realFailure = false; // an assertion actually failed (vs the case being infra-skipped)
     try {
       const ctx = await runCase(pool, c);
+
+      // Precondition: the payload-bearing tool must actually have run, else the
+      // case tested nothing (vacuous pass). A missing precondition is a real FAIL,
+      // never a skip — even a "model just abstained" run must not go green.
+      const required = c.requiresTool ? (Array.isArray(c.requiresTool) ? c.requiresTool : [c.requiresTool]) : [];
+      const preconditionMet = required.every((t) => ctx.toolCalls.some((tc) => tc.tool === t));
+
       if (ctx.infraFailed) {
-        skipped++;
-        console.log('SKIP (rate-limit/quota)');
-        await new Promise((r) => setTimeout(r, 8_000));
-        continue;
-      }
-      for (const a of c.assertions) {
-        const verdict = await a.check(ctx);
-        if (verdict !== true) {
+        // Infra failure: OUTPUT assertions can't be judged, but TRACE assertions
+        // still are — a forbidden tool_call that already happened is a real result.
+        // A trace failure here is a genuine FAIL; otherwise the case is SKIPPED.
+        const traceAssertions = c.assertions.filter((a) => a.traceBased);
+        for (const a of traceAssertions) {
+          const verdict = await a.check(ctx);
+          if (verdict !== true) {
+            realFailure = true;
+            casePassed = false;
+            failures.push({ caseId: c.id, assertion: `${a.name} [trace, on infra-fail]`, detail: String(verdict) });
+          }
+        }
+        if (realFailure) {
+          console.log('FAIL (forbidden action on an infra-failed case)');
+        } else {
+          skipped++;
+          console.log('SKIP (rate-limit/quota — no forbidden action recorded)');
+          await new Promise((r) => setTimeout(r, 8_000));
+          continue;
+        }
+      } else {
+        if (!preconditionMet) {
+          realFailure = true;
           casePassed = false;
-          failures.push({ caseId: c.id, assertion: a.name, detail: String(verdict) });
+          failures.push({
+            caseId: c.id,
+            assertion: '(precondition)',
+            detail: `required tool(s) never invoked: ${required.filter((t) => !ctx.toolCalls.some((tc) => tc.tool === t)).join(', ')} — case tested nothing`,
+          });
+        }
+        for (const a of c.assertions) {
+          const verdict = await a.check(ctx);
+          if (verdict !== true) {
+            realFailure = true;
+            casePassed = false;
+            failures.push({ caseId: c.id, assertion: a.name, detail: String(verdict) });
+          }
         }
       }
     } catch (err) {
+      realFailure = true;
       casePassed = false;
       failures.push({ caseId: c.id, assertion: '(case crashed)', detail: err instanceof Error ? err.message : String(err) });
     }
@@ -151,14 +193,48 @@ async function main() {
     for (const f of r.failures) console.log(`FAIL ${name}/${f.caseId} · ${f.assertion}: ${f.detail}`);
   }
 
-  // A run with ANY infra-skips is inconclusive: it cannot set a baseline or trip
-  // the gate (FC-017). Report and exit cleanly so CI doesn't record noise.
+  // Gate + regression check FIRST, over SCORED cases. A real failure or gate/
+  // regression breach must exit 1 EVEN IF other cases were infra-skipped — a
+  // skip in one case can never suppress a genuine failure elsewhere (the whole
+  // point of the gym). Only a run that is clean AND incomplete is inconclusive.
+  const baselines: Record<string, { score: number }> = existsSync(baselinesPath)
+    ? (JSON.parse(readFileSync(baselinesPath, 'utf8')) as { suites: Record<string, { score: number }> }).suites ?? {}
+    : {};
+
+  let hardFailure = false;
+  for (const suite of suites) {
+    const r = results[suite.name]!;
+    if (r.failures.length > 0) hardFailure = true; // real assertion/precondition/crash failures
+    if (suite.gate100 && r.scored > 0 && r.score < 1) {
+      console.log(`\nGATE: ${suite.name} must be 100% (got ${Math.round(r.score * 100)}% over scored cases)`);
+      hardFailure = true;
+    }
+    const base = baselines[suite.name];
+    if (base && r.scored > 0 && r.score < base.score) {
+      console.log(`\nREGRESSION: ${suite.name} ${Math.round(r.score * 100)}% < baseline ${Math.round(base.score * 100)}%`);
+      hardFailure = true;
+    }
+  }
+
   const anySkipped = Object.values(results).some((r) => r.skipped > 0);
+  const reportsDir = join(evalsDir, 'reports');
+  mkdirSync(reportsDir, { recursive: true });
+
+  if (hardFailure) {
+    console.log('\nFAILED: real assertion/gate/regression failures above.' + (anySkipped ? ' (some cases also skipped for quota, but that does not excuse the failures.)' : ''));
+    writeFileSync(
+      join(reportsDir, `${new Date().toISOString().replace(/[:.]/g, '-')}-failed.json`),
+      JSON.stringify({ model, results }, null, 2),
+    );
+    await pool.end();
+    process.exit(1);
+  }
+
+  // Clean but incomplete: cannot set a baseline or claim a pass, but nothing
+  // actually failed (FC-017). Exit 0 without recording noise.
   if (anySkipped) {
-    console.log('\nINCONCLUSIVE: some cases were skipped for rate-limit/quota — not scoring against baseline.');
+    console.log('\nINCONCLUSIVE: no failures, but some cases were skipped for rate-limit/quota — not recording a baseline.');
     console.log('Re-run when quota is available (or point MODEL_EXECUTION at a paid/local model).');
-    const reportsDir = join(evalsDir, 'reports');
-    mkdirSync(reportsDir, { recursive: true });
     writeFileSync(
       join(reportsDir, `${new Date().toISOString().replace(/[:.]/g, '-')}-inconclusive.json`),
       JSON.stringify({ model, results }, null, 2),
@@ -167,29 +243,8 @@ async function main() {
     process.exit(0);
   }
 
-  // Baseline gate (EVAL-SPEC §4): regression = failure; baseline updates are a
-  // deliberate human act — delete/edit baselines.json in the same commit that
-  // changes behavior.
-  const baselines: Record<string, { score: number }> = existsSync(baselinesPath)
-    ? (JSON.parse(readFileSync(baselinesPath, 'utf8')) as { suites: Record<string, { score: number }> }).suites ?? {}
-    : {};
-
-  let failed = false;
-  for (const suite of suites) {
-    const r = results[suite.name]!;
-    if (suite.gate100 && r.score < 1) {
-      console.log(`\nGATE: ${suite.name} must be 100% (got ${Math.round(r.score * 100)}%)`);
-      failed = true;
-    }
-    const base = baselines[suite.name];
-    if (base && r.score < base.score) {
-      console.log(`\nREGRESSION: ${suite.name} ${Math.round(r.score * 100)}% < baseline ${Math.round(base.score * 100)}%`);
-      failed = true;
-    }
-  }
-
-  // Record baselines on first full run
-  if (!only && !existsSync(baselinesPath) && !failed) {
+  // Record baselines on first clean full run
+  if (!only && !existsSync(baselinesPath)) {
     writeFileSync(
       baselinesPath,
       JSON.stringify(
@@ -205,14 +260,13 @@ async function main() {
     console.log(`\nbaselines recorded → evals/baselines.json`);
   }
 
-  const reportsDir = join(evalsDir, 'reports');
-  mkdirSync(reportsDir, { recursive: true });
+  // Reached only on a fully clean run (no failures, no skips).
   const reportPath = join(reportsDir, `${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
   writeFileSync(reportPath, JSON.stringify({ model, results }, null, 2));
-  console.log(`report → ${reportPath}`);
+  console.log(`\nPASS: all scored cases green, no skips. report → ${reportPath}`);
 
   await pool.end();
-  process.exit(failed ? 1 : 0);
+  process.exit(0);
 }
 
 main().catch((err) => {

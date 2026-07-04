@@ -155,10 +155,22 @@ async function fetchWithRateLimitRetry(
 ): Promise<Response> {
   const MAX_ROUNDS = 4;
   const MAX_WAIT_MS = 70_000;
-  let lastRes: Response | null = null;
+  let lastNetErr: unknown = null;
   for (let round = 1; round <= MAX_ROUNDS; round++) {
+    // Reset per round so the FINAL round's outcome decides what we return — a
+    // 429 from an earlier round must not shadow a network error in the last one.
+    let lastRes: Response | null = null;
     for (let k = 0; k < keys.length; k++) {
-      const res = await fetch(url, buildInit(keys[k]!));
+      let res: Response;
+      try {
+        res = await fetch(url, buildInit(keys[k]!));
+      } catch (err) {
+        // Transient network throw (fetch failed / ECONNRESET / ETIMEDOUT) — not
+        // a status we can inspect. Treat like a retryable failure (FC-017).
+        lastNetErr = err;
+        console.warn(`[model-router] ${label}: network error on key #${k + 1} (${err instanceof Error ? err.message : err}) — retrying`);
+        continue;
+      }
       if (res.status !== 429 && res.status !== 503) {
         if (k > 0) console.warn(`[model-router] ${label}: primary key rate-limited, fallback key #${k + 1} served the call`);
         return res;
@@ -168,15 +180,33 @@ async function fetchWithRateLimitRetry(
         console.warn(`[model-router] ${label} got ${res.status} on key #${k + 1}, rotating to key #${k + 2}`);
       }
     }
-    if (round === MAX_ROUNDS) break;
-    const body = await lastRes!.clone().text();
-    const headerWait = Number(lastRes!.headers.get('retry-after')) * 1000 || 0;
+    // Last round: return this round's 429 if it had one, else the network error.
+    if (round === MAX_ROUNDS) {
+      if (lastRes) return lastRes;
+      throw new Error(`INFRA_NETWORK: ${lastNetErr instanceof Error ? lastNetErr.message : String(lastNetErr)}`);
+    }
+    const body = lastRes ? await lastRes.clone().text() : '';
+    const headerWait = (lastRes && Number(lastRes.headers.get('retry-after')) * 1000) || 0;
     const bodyWait = (Number(body.match(/retry in (\d+(?:\.\d+)?)s/i)?.[1]) || 0) * 1000;
     const waitMs = Math.min(Math.max(headerWait, bodyWait, round * 5_000) + 1_000, MAX_WAIT_MS);
-    console.warn(`[model-router] ${label}: all ${keys.length} key(s) rate-limited, waiting ${Math.round(waitMs / 1000)}s (round ${round}/${MAX_ROUNDS})`);
+    const reason = lastRes ? `all ${keys.length} key(s) rate-limited` : 'network errors';
+    console.warn(`[model-router] ${label}: ${reason}, waiting ${Math.round(waitMs / 1000)}s (round ${round}/${MAX_ROUNDS})`);
     await new Promise((r) => setTimeout(r, waitMs));
   }
-  return lastRes!;
+  // Unreachable (loop returns/throws on MAX_ROUNDS), but satisfies the type.
+  throw new Error(`INFRA_NETWORK: ${lastNetErr instanceof Error ? lastNetErr.message : 'exhausted retries'}`);
+}
+
+/** Classify a non-ok HTTP response into a thrown Error. 429/503 (rate-limit
+ *  exhaustion after retries) get a distinct INFRA_RATELIMIT marker so the eval
+ *  gym can tell genuine quota exhaustion apart from a real 4xx/5xx bug whose
+ *  body merely happens to contain words like "quota" (review finding). */
+function throwHttp(provider: Provider, status: number, body: string): never {
+  const snippet = body.slice(0, 500);
+  if (status === 429 || status === 503) {
+    throw new Error(`INFRA_RATELIMIT ${status} (${provider.name}): ${snippet}`);
+  }
+  throw new Error(`${provider.name} ${status}: ${snippet}`);
 }
 
 async function callOpenAIShape(
@@ -201,9 +231,7 @@ async function callOpenAIShape(
     }),
     `${provider.name}/${model}`,
   );
-  if (!res.ok) {
-    throw new Error(`${provider.name} ${res.status}: ${(await res.text()).slice(0, 500)}`);
-  }
+  if (!res.ok) throwHttp(provider, res.status, await res.text());
   const data = (await res.json()) as {
     choices?: Array<{ message?: { content?: string } }>;
     usage?: { prompt_tokens?: number; completion_tokens?: number };
@@ -347,22 +375,25 @@ export async function chat(input: ChatInput): Promise<ChatResult> {
       }),
       `${provider.name}/${model}`,
     );
-    if (!res.ok) {
-      throw new Error(`${provider.name} ${res.status}: ${(await res.text()).slice(0, 500)}`);
-    }
+    if (!res.ok) throwHttp(provider, res.status, await res.text());
     const data = (await res.json()) as {
       choices?: Array<{ message?: ChatMessage }>;
       usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
     const message = data.choices?.[0]?.message ?? { role: 'assistant' as const, content: '' };
     const toolCalls: ParsedToolCall[] = (message.tool_calls ?? []).map((tc, i) => {
+      // Defensive: a provider may return a malformed tool_call with `function`
+      // missing/null. Read every field safely so one bad entry can't throw and
+      // abort the whole executor loop — an empty-named/arg call surfaces back to
+      // the model as a normal (rejected) tool result instead.
+      const fn = tc?.function ?? { name: '', arguments: '' };
       let args: Record<string, unknown> = {};
       try {
-        args = JSON.parse(tc.function.arguments || '{}') as Record<string, unknown>;
+        args = JSON.parse(fn.arguments || '{}') as Record<string, unknown>;
       } catch {
         // leave args empty; the tool will report missing params back to the model
       }
-      return { id: tc.id ?? `call_${i}`, name: tc.function.name, args };
+      return { id: tc?.id ?? `call_${i}`, name: fn.name ?? '', args };
     });
     const usage = {
       inputTokens: data.usage?.prompt_tokens ?? 0,

@@ -27,6 +27,12 @@ export interface Assertion {
   name: string;
   /** Return true to pass, or a string explaining the failure. */
   check: (ctx: CaseContext) => boolean | string | Promise<boolean | string>;
+  /** A trace/tool_call-based assertion whose verdict is meaningful even when the
+   *  task failed on infra (a recorded forbidden tool_call is a REAL result, not a
+   *  rate-limit artifact). These are evaluated on infra-failed cases; a failure
+   *  here is a genuine FAIL, not a SKIP. Output/text assertions must be false
+   *  here — they can't be judged if the task never produced its final answer. */
+  traceBased?: boolean;
 }
 
 export interface EvalCase {
@@ -34,6 +40,11 @@ export interface EvalCase {
   /** Failure-corpus traceability (docs/FAILURE-CORPUS.md). */
   source?: string;
   goal: string;
+  /** Precondition: the tool(s) the case exists to exercise. If, after the run,
+   *  none of these was actually invoked, the case is INVALID (fails as a
+   *  precondition breach) rather than passing vacuously — a model or registry
+   *  that never delivers the payload cannot earn a green. */
+  requiresTool?: string | string[];
   /** Mock tool executors by name; unmocked tools run for real. Extra tools may
    *  be added via `extraTools`. */
   mocks?: Record<string, (args: Record<string, unknown>) => Promise<unknown>>;

@@ -186,6 +186,14 @@ export async function runTask(
         content: JSON.stringify(result).slice(0, TOOL_RESULT_MAX_CHARS),
       });
     }
+    // Checkpoint at END of the iteration (not per tool): the OpenAI message format
+    // requires every tool_call in an assistant turn to be answered before the next
+    // turn, so a mid-loop checkpoint would resume with a malformed request.
+    // CONSEQUENCE — at-least-once execution (FC-019): if the process dies AFTER a
+    // side-effecting tool ran but BEFORE this checkpoint, resume re-runs the tool.
+    // Only gmail_create_draft is non-idempotent today (workspace_write overwrites),
+    // and it becomes approval-gated at M5. Exactly-once lands with the M4 durable
+    // workflow engine (Temporal/Inngest); do NOT hand-roll dedup here.
     await saveCheckpoint(pool, taskId, stepId, `iteration-${iter}`, messages);
   }
 
