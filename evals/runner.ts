@@ -30,6 +30,8 @@ interface SuiteScore {
   /** per-case verdicts — the basis for per-case regression detection */
   caseResults: Record<string, 'pass' | 'fail' | 'skip'>;
   failures: Array<{ caseId: string; assertion: string; detail: string }>;
+  /** soft-assertion failures — reported, never gating (FC-021) */
+  softNotes: Array<{ caseId: string; assertion: string; detail: string }>;
 }
 
 function registryFor(evalCase: EvalCase): ToolRegistry {
@@ -93,6 +95,7 @@ async function runCase(pool: pg.Pool, evalCase: EvalCase): Promise<CaseContext> 
 async function scoreSuite(pool: pg.Pool, suite: Suite): Promise<SuiteScore> {
   resetSuiteState();
   const failures: SuiteScore['failures'] = [];
+  const softNotes: SuiteScore['failures'] = [];
   const caseResults: SuiteScore['caseResults'] = {};
   let passed = 0;
   let skipped = 0;
@@ -146,9 +149,15 @@ async function scoreSuite(pool: pg.Pool, suite: Suite): Promise<SuiteScore> {
         for (const a of c.assertions) {
           const verdict = await a.check(ctx);
           if (verdict !== true) {
-            realFailure = true;
-            casePassed = false;
-            failures.push({ caseId: c.id, assertion: a.name, detail: String(verdict) });
+            if (a.soft) {
+              // Reported but never gates (FC-021): flaky text-quality checks must
+              // not flip a case's verdict or trigger a false regression.
+              softNotes.push({ caseId: c.id, assertion: a.name, detail: String(verdict) });
+            } else {
+              realFailure = true;
+              casePassed = false;
+              failures.push({ caseId: c.id, assertion: a.name, detail: String(verdict) });
+            }
           }
         }
       }
@@ -159,7 +168,8 @@ async function scoreSuite(pool: pg.Pool, suite: Suite): Promise<SuiteScore> {
     }
     if (caseResults[c.id] !== 'skip') caseResults[c.id] = casePassed ? 'pass' : 'fail';
     if (casePassed) passed++;
-    console.log(casePassed ? 'PASS' : 'FAIL');
+    const softForCase = softNotes.filter((s) => s.caseId === c.id).length;
+    console.log(casePassed ? `PASS${softForCase ? ` (${softForCase} soft note${softForCase > 1 ? 's' : ''})` : ''}` : 'FAIL');
     // pace cases so a suite doesn't burst through the per-minute free-tier quota
     await new Promise((r) => setTimeout(r, 8_000));
   }
@@ -172,6 +182,7 @@ async function scoreSuite(pool: pg.Pool, suite: Suite): Promise<SuiteScore> {
     skipped,
     score: scored > 0 ? passed / scored : 0,
     failures,
+    softNotes,
   };
 }
 
@@ -198,6 +209,7 @@ async function main() {
 
   for (const [name, r] of Object.entries(results)) {
     for (const f of r.failures) console.log(`FAIL ${name}/${f.caseId} · ${f.assertion}: ${f.detail}`);
+    for (const s of r.softNotes) console.log(`soft ${name}/${s.caseId} · ${s.assertion}: ${s.detail} (non-gating, FC-021)`);
   }
 
   // A baseline is a REGRESSION TRIPWIRE, not a demand for 100% (blueprint §6:

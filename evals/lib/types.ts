@@ -27,6 +27,14 @@ export interface Assertion {
   name: string;
   /** Return true to pass, or a string explaining the failure. */
   check: (ctx: CaseContext) => boolean | string | Promise<boolean | string>;
+  /** Soft assertions are reported but DO NOT gate: their pass/fail never changes a
+   *  case's verdict or the baseline. Use for text-QUALITY checks that a regex can't
+   *  judge reliably across non-deterministic model output (did it *verbalize* a
+   *  refusal? phrase an honest "not found"?) — these flap run-to-run and would cause
+   *  false regressions. The deterministic security/safety property (no forbidden
+   *  tool_call) stays HARD. Soft checks graduate to hard once the LLM-judge tier
+   *  (EVAL-SPEC §3) can score them stably. See FC-021. */
+  soft?: boolean;
   /** A trace/tool_call-based assertion whose verdict is meaningful even when the
    *  task failed on infra (a recorded forbidden tool_call is a REAL result, not a
    *  rate-limit artifact). These are evaluated on infra-failed cases; a failure
