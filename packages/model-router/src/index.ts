@@ -12,7 +12,7 @@ export type ModelRole = 'routing' | 'execution' | 'planning';
  *  chat/completions (Gemini free tier, Groq, OpenRouter). Priority when several keys are
  *  set: Anthropic > xAI > Gemini. MODEL_* env vars override any default table. */
 interface Provider {
-  name: 'anthropic' | 'xai' | 'gemini';
+  name: 'anthropic' | 'xai' | 'gemini' | 'groq';
   kind: 'anthropic' | 'openai';
   /** Primary first; extra keys are rotated onto 429s (free-tier quota relief). */
   apiKeys: string[];
@@ -20,50 +20,70 @@ interface Provider {
   defaults: Record<ModelRole, string>;
 }
 
+const PROVIDERS: Record<string, () => Provider | null> = {
+  anthropic: () =>
+    process.env.ANTHROPIC_API_KEY
+      ? {
+          name: 'anthropic',
+          kind: 'anthropic',
+          apiKeys: [process.env.ANTHROPIC_API_KEY],
+          defaults: { routing: 'claude-haiku-4-5-20251001', execution: 'claude-sonnet-5', planning: 'claude-fable-5' },
+        }
+      : null,
+  xai: () =>
+    process.env.XAI_API_KEY
+      ? {
+          name: 'xai',
+          kind: 'anthropic', // xAI is Anthropic-SDK-compatible
+          apiKeys: [process.env.XAI_API_KEY],
+          baseURL: 'https://api.x.ai',
+          defaults: { routing: 'grok-4-fast-non-reasoning', execution: 'grok-4-fast-reasoning', planning: 'grok-4' },
+        }
+      : null,
+  gemini: () =>
+    process.env.GEMINI_API_KEY
+      ? {
+          name: 'gemini',
+          kind: 'openai', // Gemini's OpenAI-compatible endpoint
+          apiKeys: [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_FALLBACK].filter((k): k is string => !!k),
+          baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
+          defaults: { routing: 'gemini-2.5-flash-lite', execution: 'gemini-2.5-flash', planning: 'gemini-2.5-pro' },
+        }
+      : null,
+  // Groq (NOT xAI Grok — gsk_ keys): OpenAI-compatible, generous free tier, fast
+  // open models with tool-calling. Used for eval runs the Gemini free tier can't sustain.
+  groq: () =>
+    process.env.GROQ_API_KEY
+      ? {
+          name: 'groq',
+          kind: 'openai',
+          apiKeys: [process.env.GROQ_API_KEY],
+          baseURL: 'https://api.groq.com/openai/v1',
+          defaults: {
+            routing: 'llama-3.1-8b-instant',
+            execution: 'llama-3.3-70b-versatile',
+            planning: 'llama-3.3-70b-versatile',
+          },
+        }
+      : null,
+};
+
+// Auto-priority when MODEL_PROVIDER is unset. MODEL_PROVIDER forces one provider
+// (used to point the gym at Groq without switching the chat app off Gemini).
+const PROVIDER_PRIORITY = ['anthropic', 'xai', 'gemini', 'groq'] as const;
+
 function resolveProvider(): Provider {
-  if (process.env.ANTHROPIC_API_KEY) {
-    return {
-      name: 'anthropic',
-      kind: 'anthropic',
-      apiKeys: [process.env.ANTHROPIC_API_KEY],
-      defaults: {
-        routing: 'claude-haiku-4-5-20251001',
-        execution: 'claude-sonnet-5',
-        planning: 'claude-fable-5',
-      },
-    };
+  const forced = process.env.MODEL_PROVIDER;
+  if (forced) {
+    const p = PROVIDERS[forced]?.();
+    if (!p) throw new Error(`MODEL_PROVIDER=${forced} but its API key is not set (or unknown provider)`);
+    return p;
   }
-  if (process.env.XAI_API_KEY) {
-    return {
-      name: 'xai',
-      kind: 'anthropic', // xAI is Anthropic-SDK-compatible
-      apiKeys: [process.env.XAI_API_KEY],
-      baseURL: 'https://api.x.ai',
-      defaults: {
-        routing: 'grok-4-fast-non-reasoning',
-        execution: 'grok-4-fast-reasoning',
-        planning: 'grok-4',
-      },
-    };
+  for (const name of PROVIDER_PRIORITY) {
+    const p = PROVIDERS[name]!();
+    if (p) return p;
   }
-  if (process.env.GEMINI_API_KEY) {
-    return {
-      name: 'gemini',
-      kind: 'openai', // Gemini's OpenAI-compatible endpoint
-      apiKeys: [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_FALLBACK].filter(
-        (k): k is string => !!k,
-      ),
-      baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
-      defaults: {
-        routing: 'gemini-2.5-flash-lite',
-        execution: 'gemini-2.5-flash',
-        planning: 'gemini-2.5-pro',
-      },
-    };
-  }
-  throw new Error(
-    'No model provider configured — set ANTHROPIC_API_KEY, XAI_API_KEY, or GEMINI_API_KEY in .env',
-  );
+  throw new Error('No model provider configured — set ANTHROPIC_API_KEY, XAI_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY in .env');
 }
 
 function routingTable(provider: Provider): Record<ModelRole, string> {
