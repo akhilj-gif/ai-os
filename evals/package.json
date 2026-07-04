@@ -1,0 +1,13 @@
+{
+  "name": "@ai-os/evals",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@ai-os/kernel": "workspace:*",
+    "@ai-os/shared": "workspace:*",
+    "@ai-os/tools": "workspace:*",
+    "dotenv": "^17.4.2",
+    "pg": "^8.22.0"
+  }
+}

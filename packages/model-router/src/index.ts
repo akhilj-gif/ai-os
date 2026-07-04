@@ -14,7 +14,8 @@ export type ModelRole = 'routing' | 'execution' | 'planning';
 interface Provider {
   name: 'anthropic' | 'xai' | 'gemini';
   kind: 'anthropic' | 'openai';
-  apiKey: string;
+  /** Primary first; extra keys are rotated onto 429s (free-tier quota relief). */
+  apiKeys: string[];
   baseURL?: string;
   defaults: Record<ModelRole, string>;
 }
@@ -24,7 +25,7 @@ function resolveProvider(): Provider {
     return {
       name: 'anthropic',
       kind: 'anthropic',
-      apiKey: process.env.ANTHROPIC_API_KEY,
+      apiKeys: [process.env.ANTHROPIC_API_KEY],
       defaults: {
         routing: 'claude-haiku-4-5-20251001',
         execution: 'claude-sonnet-5',
@@ -36,7 +37,7 @@ function resolveProvider(): Provider {
     return {
       name: 'xai',
       kind: 'anthropic', // xAI is Anthropic-SDK-compatible
-      apiKey: process.env.XAI_API_KEY,
+      apiKeys: [process.env.XAI_API_KEY],
       baseURL: 'https://api.x.ai',
       defaults: {
         routing: 'grok-4-fast-non-reasoning',
@@ -49,7 +50,9 @@ function resolveProvider(): Provider {
     return {
       name: 'gemini',
       kind: 'openai', // Gemini's OpenAI-compatible endpoint
-      apiKey: process.env.GEMINI_API_KEY,
+      apiKeys: [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_FALLBACK].filter(
+        (k): k is string => !!k,
+      ),
       baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
       defaults: {
         routing: 'gemini-2.5-flash-lite',
@@ -78,7 +81,7 @@ function getAnthropicClient(provider: Provider): Anthropic {
   if (client?.providerName !== provider.name) {
     client = {
       providerName: provider.name,
-      sdk: new Anthropic({ apiKey: provider.apiKey, baseURL: provider.baseURL }),
+      sdk: new Anthropic({ apiKey: provider.apiKeys[0], baseURL: provider.baseURL }),
     };
   }
   return client.sdk;
@@ -140,27 +143,37 @@ async function callAnthropicShape(
   };
 }
 
-/** POST with rate-limit resilience: on 429/503, honor Retry-After or the
- *  "retry in Xs" hint in the body (Gemini free tier is 5 req/min), capped waits,
- *  up to 4 attempts. Tool/model unreliability is a first-class concern (FC-002). */
+/** POST with rate-limit resilience (FC-002/FC-013): on 429/503, first rotate to
+ *  the next API key (free-tier quotas are per key), and only when every key in
+ *  the round is exhausted honor Retry-After / the "retry in Xs" body hint with a
+ *  capped wait. Up to 4 rounds across all keys. */
 async function fetchWithRateLimitRetry(
   url: string,
-  init: RequestInit,
+  keys: string[],
+  buildInit: (apiKey: string) => RequestInit,
   label: string,
 ): Promise<Response> {
-  const MAX_ATTEMPTS = 4;
+  const MAX_ROUNDS = 4;
   const MAX_WAIT_MS = 70_000;
   let lastRes: Response | null = null;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const res = await fetch(url, init);
-    if (res.status !== 429 && res.status !== 503) return res;
-    lastRes = res;
-    if (attempt === MAX_ATTEMPTS) break;
-    const body = await res.clone().text();
-    const headerWait = Number(res.headers.get('retry-after')) * 1000 || 0;
+  for (let round = 1; round <= MAX_ROUNDS; round++) {
+    for (let k = 0; k < keys.length; k++) {
+      const res = await fetch(url, buildInit(keys[k]!));
+      if (res.status !== 429 && res.status !== 503) {
+        if (k > 0) console.warn(`[model-router] ${label}: primary key rate-limited, fallback key #${k + 1} served the call`);
+        return res;
+      }
+      lastRes = res;
+      if (keys.length > 1 && k < keys.length - 1) {
+        console.warn(`[model-router] ${label} got ${res.status} on key #${k + 1}, rotating to key #${k + 2}`);
+      }
+    }
+    if (round === MAX_ROUNDS) break;
+    const body = await lastRes!.clone().text();
+    const headerWait = Number(lastRes!.headers.get('retry-after')) * 1000 || 0;
     const bodyWait = (Number(body.match(/retry in (\d+(?:\.\d+)?)s/i)?.[1]) || 0) * 1000;
-    const waitMs = Math.min(Math.max(headerWait, bodyWait, attempt * 5_000) + 1_000, MAX_WAIT_MS);
-    console.warn(`[model-router] ${label} got ${res.status}, retrying in ${Math.round(waitMs / 1000)}s (attempt ${attempt}/${MAX_ATTEMPTS})`);
+    const waitMs = Math.min(Math.max(headerWait, bodyWait, round * 5_000) + 1_000, MAX_WAIT_MS);
+    console.warn(`[model-router] ${label}: all ${keys.length} key(s) rate-limited, waiting ${Math.round(waitMs / 1000)}s (round ${round}/${MAX_ROUNDS})`);
     await new Promise((r) => setTimeout(r, waitMs));
   }
   return lastRes!;
@@ -177,14 +190,15 @@ async function callOpenAIShape(
 
   const res = await fetchWithRateLimitRetry(
     `${provider.baseURL}/chat/completions`,
-    {
+    provider.apiKeys,
+    (apiKey) => ({
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        authorization: `Bearer ${provider.apiKey}`,
+        authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({ model, max_tokens: input.maxTokens ?? 1024, messages }),
-    },
+    }),
     `${provider.name}/${model}`,
   );
   if (!res.ok) {
@@ -310,11 +324,12 @@ export async function chat(input: ChatInput): Promise<ChatResult> {
   try {
     const res = await fetchWithRateLimitRetry(
       `${provider.baseURL}/chat/completions`,
-      {
+      provider.apiKeys,
+      (apiKey) => ({
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          authorization: `Bearer ${provider.apiKey}`,
+          authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify({
           model,
@@ -329,7 +344,7 @@ export async function chat(input: ChatInput): Promise<ChatResult> {
               }
             : {}),
         }),
-      },
+      }),
       `${provider.name}/${model}`,
     );
     if (!res.ok) {

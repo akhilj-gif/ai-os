@@ -74,6 +74,24 @@ importers:
         specifier: ^6.0.3
         version: 6.0.3
 
+  evals:
+    dependencies:
+      '@ai-os/kernel':
+        specifier: workspace:*
+        version: link:../packages/kernel
+      '@ai-os/shared':
+        specifier: workspace:*
+        version: link:../packages/shared
+      '@ai-os/tools':
+        specifier: workspace:*
+        version: link:../packages/tools
+      dotenv:
+        specifier: ^17.4.2
+        version: 17.4.2
+      pg:
+        specifier: ^8.22.0
+        version: 8.22.0
+
   packages/kernel:
     dependencies:
       '@ai-os/model-router':

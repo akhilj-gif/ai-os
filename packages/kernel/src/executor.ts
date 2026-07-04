@@ -7,7 +7,7 @@
 import type pg from 'pg';
 import { TraceStore } from '@ai-os/shared';
 import { chat, type ChatMessage } from '@ai-os/model-router';
-import { buildRegistry } from '@ai-os/tools';
+import { buildRegistry, type ToolRegistry } from '@ai-os/tools';
 import { TrustGate } from '@ai-os/trust';
 import { systemPrompt } from './prompts.js';
 
@@ -56,8 +56,17 @@ export interface TaskRunResult {
   text: string;
 }
 
+export interface RunTaskOptions {
+  /** Override the tool registry — used by the eval gym to inject mocked tools. */
+  registry?: ToolRegistry;
+}
+
 /** Run (or resume) a task to completion. Idempotent on restart. */
-export async function runTask(pool: pg.Pool, taskId: string): Promise<TaskRunResult> {
+export async function runTask(
+  pool: pg.Pool,
+  taskId: string,
+  opts: RunTaskOptions = {},
+): Promise<TaskRunResult> {
   const trace = new TraceStore(pool);
   const { rows } = await pool.query<{
     goal: string;
@@ -83,7 +92,7 @@ export async function runTask(pool: pg.Pool, taskId: string): Promise<TaskRunRes
   }
   await pool.query(`UPDATE tasks SET status = 'running', updated_at = now() WHERE id = $1`, [taskId]);
 
-  const registry = buildRegistry();
+  const registry = opts.registry ?? buildRegistry();
   const gate = new TrustGate(pool);
   const toolDefs = registry.list();
   let totalTokens = 0;
@@ -185,8 +194,15 @@ export async function runTask(pool: pg.Pool, taskId: string): Promise<TaskRunRes
   return { taskId, status: 'failed', text: 'Task exceeded its iteration budget (12).' };
 }
 
-/** Find tasks orphaned mid-run (server killed) and resume them. Returns their ids. */
+/** Find tasks orphaned mid-run (server killed) and resume them. Returns their ids.
+ *  Eval-gym tasks are excluded: their mocked registries don't survive a restart,
+ *  and resuming them against real tools would be wrong (and for injection cases,
+ *  dangerous). A crashed eval run is simply marked failed. */
 export async function findOrphanedTasks(pool: pg.Pool): Promise<string[]> {
+  await pool.query(
+    `UPDATE tasks SET status='failed', updated_at=now()
+     WHERE status IN ('running','planning') AND goal LIKE '[eval:%'`,
+  );
   const { rows } = await pool.query<{ id: string }>(
     `SELECT id FROM tasks WHERE status IN ('running', 'planning') ORDER BY created_at ASC`,
   );
