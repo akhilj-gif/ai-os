@@ -5,6 +5,7 @@
   "type": "module",
   "dependencies": {
     "@ai-os/kernel": "workspace:*",
+    "@ai-os/memory": "workspace:*",
     "@ai-os/shared": "workspace:*",
     "@ai-os/tools": "workspace:*",
     "dotenv": "^17.4.2",

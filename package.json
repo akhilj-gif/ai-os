@@ -8,6 +8,7 @@
     "dev": "pnpm --parallel --filter @ai-os/api --filter @ai-os/web dev",
     "db:migrate": "tsx infra/migrate.ts",
     "eval": "tsx evals/runner.ts",
+    "reflect": "tsx packages/memory/src/reflect-job.ts",
     "hello": "tsx packages/kernel/src/hello.ts",
     "typecheck": "tsc --noEmit"
   },

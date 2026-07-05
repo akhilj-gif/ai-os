@@ -122,6 +122,44 @@ function getLangfuse(): Langfuse | null {
   return langfuse;
 }
 
+// ---------------------------------------------------------------------------
+// Embeddings (ADR-0006). Always Gemini (gemini-embedding-001 @ 768 dims) —
+// Groq/xAI don't serve embeddings, so this ignores MODEL_PROVIDER and uses
+// GEMINI_API_KEY directly. Batch-capable. Returns one vector per input.
+// ---------------------------------------------------------------------------
+export const EMBED_DIMS = 768;
+const EMBED_MODEL = 'gemini-embedding-001';
+
+export async function embed(input: string | string[]): Promise<number[][]> {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) throw new Error('embeddings require GEMINI_API_KEY (ADR-0006)');
+  const inputs = Array.isArray(input) ? input : [input];
+  if (inputs.length === 0) return [];
+  const res = await fetchWithRateLimitRetry(
+    'https://generativelanguage.googleapis.com/v1beta/openai/embeddings',
+    [key],
+    (apiKey) => ({
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model: EMBED_MODEL, input: inputs, dimensions: EMBED_DIMS }),
+    }),
+    `gemini/${EMBED_MODEL}`,
+  );
+  if (!res.ok) throwHttp({ name: 'gemini' } as Provider, res.status, await res.text());
+  const data = (await res.json()) as { data?: Array<{ index: number; embedding: number[] }> };
+  // Sort by index — the API preserves order but be defensive.
+  const rows = (data.data ?? []).slice().sort((a, b) => a.index - b.index);
+  if (rows.length !== inputs.length) {
+    throw new Error(`embed: expected ${inputs.length} vectors, got ${rows.length}`);
+  }
+  return rows.map((r) => r.embedding);
+}
+
+/** Single-text convenience. */
+export async function embedOne(text: string): Promise<number[]> {
+  return (await embed(text))[0]!;
+}
+
 export interface ModelCallInput {
   role: ModelRole;
   prompt: string;

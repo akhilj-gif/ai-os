@@ -19,8 +19,10 @@ import {
   addMessage,
   listMessages,
 } from '@ai-os/kernel';
+import { MemoryService } from '@ai-os/memory';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+const memory = new MemoryService(pool);
 const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', {
   maxRetriesPerRequest: 1,
   lazyConnect: true,
@@ -70,7 +72,7 @@ app.get('/health', async () => {
     services.langfuse = 'unreachable';
   }
   const ok = services.postgres === 'ok' && services.redis === 'ok';
-  return { ok, milestone: 'M1', services };
+  return { ok, milestone: 'M3', services };
 });
 
 // M0 smoke test, kept alive
@@ -208,6 +210,22 @@ app.get('/messages', async (req) => {
   const q = req.query as { sessionId?: string };
   const sessionId = q.sessionId ?? (await ensureDefaultSession(pool));
   return { sessionId, messages: await listMessages(pool, sessionId) };
+});
+
+// ---------------------------------------------------------------------------
+// Memory (blueprint §7.2: user-visible, with source + delete = trust via inspectability)
+// ---------------------------------------------------------------------------
+app.get('/memory', async (req) => {
+  const q = req.query as { includeSuperseded?: string };
+  const records = await memory.list({ includeSuperseded: q.includeSuperseded === 'true' });
+  return { count: records.length, records };
+});
+
+app.delete('/memory/:id', async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const ok = await memory.remove(id);
+  trace.recordSafe({ traceId: req.traceId, component: 'memory', event: 'memory.deleted', payload: { id, ok } });
+  return reply.code(ok ? 200 : 404).send({ deleted: ok });
 });
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 // arrives when rubric-scored quality cases exist.
 import type pg from 'pg';
 import type { ToolRegistry } from '@ai-os/tools';
+import type { MemoryType } from '@ai-os/memory';
 
 export interface CaseContext {
   /** Final assistant text produced by the task. */
@@ -53,6 +54,11 @@ export interface EvalCase {
    *  precondition breach) rather than passing vacuously — a model or registry
    *  that never delivers the payload cannot earn a green. */
   requiresTool?: string | string[];
+  /** Memory-recall cases: records to seed BEFORE the run (tagged 'eval-seed' and
+   *  purged after), plus enableMemory to force memory injection under the mocked
+   *  registry. The task can then only answer correctly by RECALLING the seed. */
+  seedMemory?: Array<{ type: MemoryType; content: string; subject?: string; source: { user_stated?: boolean; task_id?: string } }>;
+  enableMemory?: boolean;
   /** Mock tool executors by name; unmocked tools run for real. Extra tools may
    *  be added via `extraTools`. */
   mocks?: Record<string, (args: Record<string, unknown>) => Promise<unknown>>;

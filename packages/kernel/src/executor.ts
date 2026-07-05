@@ -9,7 +9,9 @@ import { TraceStore } from '@ai-os/shared';
 import { chat, type ChatMessage } from '@ai-os/model-router';
 import { buildRegistry, type ToolRegistry } from '@ai-os/tools';
 import { TrustGate } from '@ai-os/trust';
+import { extractAndStore } from '@ai-os/memory';
 import { systemPrompt } from './prompts.js';
+import { assembleMemoryContext, compactHistory } from './context.js';
 
 const MAX_ITERATIONS = 12;
 const KEEP_CHECKPOINTS = 3;
@@ -59,6 +61,9 @@ export interface TaskRunResult {
 export interface RunTaskOptions {
   /** Override the tool registry — used by the eval gym to inject mocked tools. */
   registry?: ToolRegistry;
+  /** Force memory-context injection even under a mocked registry — the
+   *  memory-recall eval suite needs it (normally injection is off during evals). */
+  enableMemory?: boolean;
 }
 
 /** Run (or resume) a task to completion. Idempotent on restart. */
@@ -84,11 +89,22 @@ export async function runTask(
     messages = lastCp.state.messages;
     await trace.record({ traceId, taskId, component: 'kernel', event: 'task.resumed', payload: { from: lastCp.label } });
   } else {
+    // Context Engine: inject always-loaded preferences + task-relevant recalled
+    // memories at task start (blueprint §7.3). Best-effort — memory must never
+    // block a task. Eval runs (opts.registry set) skip it for determinism.
+    let memoryBlock = '';
+    if (!opts.registry || opts.enableMemory) {
+      try {
+        memoryBlock = await assembleMemoryContext(pool, { goal: task.goal });
+      } catch (err) {
+        console.warn('[kernel] memory context failed (non-fatal):', err instanceof Error ? err.message : err);
+      }
+    }
     messages = [
-      { role: 'system', content: systemPrompt() },
+      { role: 'system', content: memoryBlock ? `${systemPrompt()}\n\n${memoryBlock}` : systemPrompt() },
       { role: 'user', content: task.goal },
     ];
-    await trace.record({ traceId, taskId, component: 'kernel', event: 'task.started' });
+    await trace.record({ traceId, taskId, component: 'kernel', event: 'task.started', payload: { memoryInjected: memoryBlock.length > 0 } });
   }
   await pool.query(`UPDATE tasks SET status = 'running', updated_at = now() WHERE id = $1`, [taskId]);
 
@@ -104,6 +120,9 @@ export async function runTask(
       [taskId, JSON.stringify({ iteration: iter, messageCount: messages.length })],
     );
     const stepId = stepRes.rows[0]!.id;
+
+    // Keep long multi-iteration tasks under budget (§7.3 pt 5).
+    messages = compactHistory(messages);
 
     let resp;
     try {
@@ -139,6 +158,12 @@ export async function runTask(
         [taskId, totalTokens],
       );
       await trace.record({ traceId, taskId, component: 'kernel', event: 'task.done', payload: { iterations: iter + 1, tokens: totalTokens } });
+      // Learn from the exchange: extract durable memories (best-effort; skipped
+      // for eval runs to keep them deterministic and quota-light).
+      if (!opts.registry) {
+        const stored = await extractAndStore(pool, { taskId, traceId, userText: task.goal, assistantText: text });
+        if (stored) await trace.record({ traceId, taskId, component: 'memory', event: 'memory.extracted', payload: { count: stored } });
+      }
       return { taskId, status: 'done', text };
     }
 

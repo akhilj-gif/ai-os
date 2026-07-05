@@ -11,12 +11,14 @@ import { join, dirname } from 'node:path';
 import pg from 'pg';
 import { newTraceId } from '@ai-os/shared';
 import { runTask } from '@ai-os/kernel';
+import { MemoryService } from '@ai-os/memory';
 import { buildRegistry, ToolRegistry } from '@ai-os/tools';
 import type { EvalCase, Suite, CaseContext } from './lib/types.js';
 import { injectionDefense } from './suites/injection-defense.js';
 import { toolReliability, resetSuiteState } from './suites/tool-reliability.js';
+import { memoryRecall } from './suites/memory-recall.js';
 
-const SUITES: Suite[] = [toolReliability, injectionDefense];
+const SUITES: Suite[] = [toolReliability, injectionDefense, memoryRecall];
 const evalsDir = dirname(fileURLToPath(import.meta.url));
 const baselinesPath = join(evalsDir, 'baselines.json');
 
@@ -49,12 +51,22 @@ function registryFor(evalCase: EvalCase): ToolRegistry {
 }
 
 async function runCase(pool: pg.Pool, evalCase: EvalCase): Promise<CaseContext> {
+  // Memory-recall cases: seed memories (tagged for cleanup), then let the task
+  // recall them. Purge any prior eval-seed first so runs are idempotent.
+  if (evalCase.seedMemory?.length) {
+    const mem = new MemoryService(pool);
+    await pool.query(`DELETE FROM memory_records WHERE 'eval-seed' = ANY(tags)`);
+    for (const s of evalCase.seedMemory) {
+      await mem.remember({ ...s, tags: ['eval-seed'], source: s.source });
+    }
+  }
+
   const { rows } = await pool.query<{ id: string }>(
     `INSERT INTO tasks (goal, status, created_by, trace_id) VALUES ($1, 'draft', 'trigger', $2) RETURNING id`,
     [`[eval:${evalCase.id}] ${evalCase.goal}`, newTraceId()],
   );
   const taskId = rows[0]!.id;
-  const result = await runTask(pool, taskId, { registry: registryFor(evalCase) });
+  const result = await runTask(pool, taskId, { registry: registryFor(evalCase), enableMemory: evalCase.enableMemory });
 
   const task = (
     await pool.query<{ status: string; spent: { tokens: number } }>(
@@ -87,6 +99,11 @@ async function runCase(pool: pg.Pool, evalCase: EvalCase): Promise<CaseContext> 
       const e = r.error ?? '';
       return /^INFRA_(RATELIMIT|NETWORK)\b/.test(e) || /^(fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up)/i.test(e);
     });
+  }
+
+  // Purge seeded memories so they don't leak into later cases or the UI.
+  if (evalCase.seedMemory?.length) {
+    await pool.query(`DELETE FROM memory_records WHERE 'eval-seed' = ANY(tags)`);
   }
 
   return { text: result.text, task, toolCalls, pool, infraFailed };

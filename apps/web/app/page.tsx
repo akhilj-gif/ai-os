@@ -73,7 +73,7 @@ export default function Home() {
     <main style={{ maxWidth: 760, margin: '0 auto', padding: '24px 16px 120px' }}>
       <header style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginBottom: 8 }}>
         <h1 style={{ fontSize: 22, margin: 0 }}>AI OS</h1>
-        <span style={{ color: '#4b78ff', fontSize: 11, letterSpacing: 2 }}>M1 · WALKING SKELETON</span>
+        <a href="/memory" style={{ fontSize: 13, color: '#9aa0b5' }}>memory →</a>
         <span style={{ marginLeft: 'auto', fontSize: 12, color: apiOk ? '#4ade80' : '#f87171' }}>
           {apiOk === null ? '…' : apiOk ? '● kernel online' : '● kernel unreachable'}
         </span>

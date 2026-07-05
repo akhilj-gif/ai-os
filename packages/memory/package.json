@@ -8,6 +8,9 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@ai-os/shared": "workspace:*"
+    "@ai-os/model-router": "workspace:*",
+    "@ai-os/shared": "workspace:*",
+    "dotenv": "^17.4.2",
+    "pg": "^8.22.0"
   }
 }

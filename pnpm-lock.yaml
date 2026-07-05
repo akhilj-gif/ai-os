@@ -33,6 +33,9 @@ importers:
       '@ai-os/kernel':
         specifier: workspace:*
         version: link:../../packages/kernel
+      '@ai-os/memory':
+        specifier: workspace:*
+        version: link:../../packages/memory
       '@ai-os/shared':
         specifier: workspace:*
         version: link:../../packages/shared
@@ -79,6 +82,9 @@ importers:
       '@ai-os/kernel':
         specifier: workspace:*
         version: link:../packages/kernel
+      '@ai-os/memory':
+        specifier: workspace:*
+        version: link:../packages/memory
       '@ai-os/shared':
         specifier: workspace:*
         version: link:../packages/shared
@@ -94,6 +100,9 @@ importers:
 
   packages/kernel:
     dependencies:
+      '@ai-os/memory':
+        specifier: workspace:*
+        version: link:../memory
       '@ai-os/model-router':
         specifier: workspace:*
         version: link:../model-router
@@ -115,9 +124,18 @@ importers:
 
   packages/memory:
     dependencies:
+      '@ai-os/model-router':
+        specifier: workspace:*
+        version: link:../model-router
       '@ai-os/shared':
         specifier: workspace:*
         version: link:../shared
+      dotenv:
+        specifier: ^17.4.2
+        version: 17.4.2
+      pg:
+        specifier: ^8.22.0
+        version: 8.22.0
 
   packages/model-router:
     dependencies:
