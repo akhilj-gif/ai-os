@@ -6,12 +6,14 @@ import { fetchUrl } from './tools/fetch-url.js';
 import { workspaceList, workspaceRead, workspaceWrite } from './tools/workspace.js';
 import { gmailList, gmailRead, gmailCreateDraft } from './tools/gmail.js';
 import { calendarList } from './tools/calendar.js';
+import { codeExec } from './tools/code-exec.js';
 
 export type { ToolDef, ToolContext, ToolSchema } from './registry.js';
 export { ToolRegistry } from './registry.js';
 export { GoogleNotConnectedError, getGoogleAccessToken, googleApi } from './google.js';
 export { todayRange } from './tools/calendar.js';
 export { type SandboxRunner, type SandboxSpec, type SandboxResult, notImplementedSandbox } from './sandbox.js';
+export { DockerSandbox, dockerSandbox } from './docker-sandbox.js';
 
 export function buildRegistry(): ToolRegistry {
   const registry = new ToolRegistry();
@@ -25,6 +27,7 @@ export function buildRegistry(): ToolRegistry {
     gmailRead,
     gmailCreateDraft,
     calendarList,
+    codeExec,
   ]) {
     registry.register(tool);
   }
