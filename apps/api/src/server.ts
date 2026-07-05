@@ -25,6 +25,7 @@ import {
   redirectTask,
   decideApproval,
   runResearch,
+  runCodingTask,
 } from '@ai-os/kernel';
 import { MemoryService } from '@ai-os/memory';
 
@@ -255,6 +256,27 @@ app.get('/research/:id', async (req, reply) => {
   const { id } = req.params as { id: string };
   const r = (await pool.query(`SELECT id, question, report, sources, status, created_at FROM research_reports WHERE id=$1`, [id])).rows[0];
   return r ? r : reply.code(404).send({ error: 'no such report' });
+});
+
+// ---------------------------------------------------------------------------
+// Coding engine (M6 §): the test-driven fix loop. Propose → sandbox-test → iterate
+// until green. Returns the passing change for approval. Read-only w.r.t. the host —
+// all code runs in the Docker sandbox; the mutating commit-on-approval step
+// (commitApproved) is a deliberate library call, not exposed over HTTP.
+// ---------------------------------------------------------------------------
+app.post('/code', async (req, reply) => {
+  const { instruction, files, testCmd, language, egress, maxRounds } = (req.body ?? {}) as {
+    instruction?: string;
+    files?: Record<string, string>;
+    testCmd?: string;
+    language?: 'python' | 'node' | 'sh';
+    egress?: boolean;
+    maxRounds?: number;
+  };
+  if (!instruction?.trim() || !files || !testCmd?.trim()) {
+    return reply.code(400).send({ error: 'instruction, files and testCmd are required' });
+  }
+  return runCodingTask(pool, { instruction: instruction.trim(), files, testCmd: testCmd.trim(), language, egress, maxRounds });
 });
 
 // ---------------------------------------------------------------------------

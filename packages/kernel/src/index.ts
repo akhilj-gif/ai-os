@@ -16,3 +16,13 @@ export {
   type GraphResult,
 } from './graph.js';
 export { runResearch, type ResearchResult, type ResearchSource } from './research.js';
+export {
+  runCodingTask,
+  commitApproved,
+  llmProposer,
+  type Proposer,
+  type ProposedFix,
+  type CodingResult,
+  type CommitResult,
+  type RepoFile,
+} from './coding.js';
