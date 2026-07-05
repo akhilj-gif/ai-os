@@ -26,3 +26,16 @@ export {
   type CommitResult,
   type RepoFile,
 } from './coding.js';
+export {
+  computeNextRun,
+  createJob,
+  tick,
+  startScheduler,
+  type Schedule,
+  type JobRow,
+  type JobExecutor,
+  type ExecutorContext,
+  type ExecutorResult,
+  type TickReport,
+} from './scheduler.js';
+export { briefingExecutor, watchExecutor, reflectExecutor, defaultExecutors } from './jobs.js';

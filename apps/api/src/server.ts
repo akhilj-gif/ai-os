@@ -26,6 +26,11 @@ import {
   decideApproval,
   runResearch,
   runCodingTask,
+  createJob,
+  tick,
+  startScheduler,
+  defaultExecutors,
+  type Schedule,
 } from '@ai-os/kernel';
 import { MemoryService } from '@ai-os/memory';
 
@@ -80,7 +85,7 @@ app.get('/health', async () => {
     services.langfuse = 'unreachable';
   }
   const ok = services.postgres === 'ok' && services.redis === 'ok';
-  return { ok, milestone: 'M6', services };
+  return { ok, milestone: 'M7', services };
 });
 
 // M0 smoke test, kept alive
@@ -280,6 +285,76 @@ app.post('/code', async (req, reply) => {
 });
 
 // ---------------------------------------------------------------------------
+// Automation (M7, ADR-0010): durable scheduled jobs + the notifications surface.
+// Jobs are fixed read-only pipelines (briefing/watch/reflect) — the only thing an
+// unattended run can do is write a notification.
+// ---------------------------------------------------------------------------
+const JOB_KINDS = new Set(['briefing', 'watch', 'reflect']);
+
+app.get('/jobs', async () => {
+  const { rows: jobs } = await pool.query(
+    `SELECT j.*,
+            (SELECT to_jsonb(r) FROM (
+               SELECT status, started_at, finished_at, error, output FROM job_runs
+               WHERE job_id = j.id ORDER BY started_at DESC LIMIT 1) r) AS last_run
+     FROM jobs j ORDER BY j.created_at`,
+  );
+  return { jobs };
+});
+
+app.post('/jobs', async (req, reply) => {
+  const { name, kind, schedule, payload } = (req.body ?? {}) as {
+    name?: string; kind?: string; schedule?: Schedule; payload?: Record<string, unknown>;
+  };
+  if (!name?.trim() || !kind || !JOB_KINDS.has(kind) || !schedule) {
+    return reply.code(400).send({ error: `name, kind (${[...JOB_KINDS].join('|')}) and schedule are required` });
+  }
+  if (kind === 'watch' && !/^https?:\/\//i.test(String(payload?.url ?? ''))) {
+    return reply.code(400).send({ error: 'watch jobs need payload.url (http/https)' });
+  }
+  try {
+    return await createJob(pool, { name: name.trim(), kind, schedule, payload });
+  } catch (err) {
+    return reply.code(400).send({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.put('/jobs/:id', async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const { enabled } = (req.body ?? {}) as { enabled?: boolean };
+  if (typeof enabled !== 'boolean') return reply.code(400).send({ error: 'enabled (boolean) is required' });
+  const { rows } = await pool.query(`UPDATE jobs SET enabled=$2, updated_at=now() WHERE id=$1 RETURNING *`, [id, enabled]);
+  return rows[0] ?? reply.code(404).send({ error: 'no such job' });
+});
+
+app.delete('/jobs/:id', async (req, reply) => {
+  const { rowCount } = await pool.query(`DELETE FROM jobs WHERE id=$1`, [(req.params as { id: string }).id]);
+  return rowCount ? { ok: true } : reply.code(404).send({ error: 'no such job' });
+});
+
+app.post('/jobs/:id/run-now', async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const { rowCount } = await pool.query(`UPDATE jobs SET next_run_at=now(), updated_at=now() WHERE id=$1 AND enabled`, [id]);
+  if (!rowCount) return reply.code(404).send({ error: 'no such enabled job' });
+  const report = await tick(pool, { executors: defaultExecutors() });
+  const { rows } = await pool.query(`SELECT status, error, output FROM job_runs WHERE job_id=$1 ORDER BY started_at DESC LIMIT 1`, [id]);
+  return { report, lastRun: rows[0] ?? null };
+});
+
+app.get('/notifications', async (req) => {
+  const unreadOnly = (req.query as { unread?: string }).unread === '1';
+  const { rows } = await pool.query(
+    `SELECT * FROM notifications ${unreadOnly ? 'WHERE NOT read' : ''} ORDER BY created_at DESC LIMIT 50`,
+  );
+  return { notifications: rows };
+});
+
+app.post('/notifications/:id/read', async (req, reply) => {
+  const { rowCount } = await pool.query(`UPDATE notifications SET read=true WHERE id=$1`, [(req.params as { id: string }).id]);
+  return rowCount ? { ok: true } : reply.code(404).send({ error: 'no such notification' });
+});
+
+// ---------------------------------------------------------------------------
 // Trust policies (M5 §8.1): policies are data — the user can tighten/loosen per tool.
 // ---------------------------------------------------------------------------
 app.get('/policies', async () => {
@@ -382,3 +457,11 @@ void (async () => {
     Promise.resolve(p).catch((err) => app.log.error({ err, taskId }, 'orphan resume failed'));
   }
 })();
+
+// M7: the scheduler heartbeat. Ticks every SCHEDULER_POLL_MS (default 30s); due
+// jobs run their fixed pipelines; zombies from a previous crash are reaped on the
+// first tick (the jobs analog of the orphan-resume above).
+startScheduler(pool, {
+  executors: defaultExecutors(),
+  onTick: (r) => app.log.info({ claimed: r.claimed, reaped: r.reaped, missed: r.missed, ran: r.ran }, 'scheduler tick'),
+});

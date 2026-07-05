@@ -75,6 +75,7 @@ export default function Home() {
         <h1 style={{ fontSize: 22, margin: 0 }}>AI OS</h1>
         <a href="/tasks" style={{ fontSize: 13, color: '#9aa0b5' }}>tasks</a>
         <a href="/research" style={{ fontSize: 13, color: '#9aa0b5' }}>research</a>
+        <a href="/automations" style={{ fontSize: 13, color: '#9aa0b5' }}>automations</a>
         <a href="/memory" style={{ fontSize: 13, color: '#9aa0b5' }}>memory</a>
         <a href="/settings" style={{ fontSize: 13, color: '#9aa0b5' }}>trust →</a>
         <span style={{ marginLeft: 'auto', fontSize: 12, color: apiOk ? '#4ade80' : '#f87171' }}>
