@@ -235,6 +235,32 @@ app.delete('/memory/:id', async (req, reply) => {
 });
 
 // ---------------------------------------------------------------------------
+// Trust policies (M5 §8.1): policies are data — the user can tighten/loosen per tool.
+// ---------------------------------------------------------------------------
+app.get('/policies', async () => {
+  const { rows } = await pool.query(
+    `SELECT tool, trust_class, auto_approve, updated_at FROM trust_policies ORDER BY tool`,
+  );
+  return { policies: rows };
+});
+
+app.put('/policies/:tool', async (req, reply) => {
+  const { tool } = req.params as { tool: string };
+  const { trustClass, autoApprove } = (req.body ?? {}) as { trustClass?: string; autoApprove?: boolean };
+  const valid = ['read', 'write', 'irreversible', 'spend'];
+  if (trustClass !== undefined && !valid.includes(trustClass)) return reply.code(400).send({ error: 'invalid trustClass' });
+  const res = await pool.query(
+    `UPDATE trust_policies
+     SET trust_class = COALESCE($2, trust_class), auto_approve = COALESCE($3, auto_approve), updated_at = now()
+     WHERE tool = $1 RETURNING tool, trust_class, auto_approve`,
+    [tool, trustClass ?? null, autoApprove ?? null],
+  );
+  if (!res.rowCount) return reply.code(404).send({ error: 'no such policy' });
+  trace.recordSafe({ traceId: req.traceId, component: 'trust', event: 'policy.changed', payload: { tool, trustClass, autoApprove } });
+  return { policy: res.rows[0] };
+});
+
+// ---------------------------------------------------------------------------
 // Planner + Task Graph (M4): plan a goal, inspect the graph, control the run.
 // ---------------------------------------------------------------------------
 app.post('/plan', async (req) => {

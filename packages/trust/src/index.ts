@@ -29,10 +29,35 @@ export function requiresApproval(trustClass: TrustClass): boolean {
   return trustClass === 'irreversible' || trustClass === 'spend';
 }
 
+/** A mutating action — anything that changes state or the outside world. */
+export function isMutating(trustClass: TrustClass): boolean {
+  return trustClass === 'write' || trustClass === 'irreversible' || trustClass === 'spend';
+}
+
+/**
+ * The STRUCTURAL injection defense (blueprint §8.3 rule 2), the heart of M5.
+ * When untrusted content (a web page, email/ticket body, or any external tool
+ * result) is in the current context, the model CANNOT be used to trigger a
+ * mutating action — regardless of what it decides. Untrusted content informs;
+ * it never gains authority to cause side effects. Read-only actions stay
+ * allowed. This makes injection defense architectural, not prompt-dependent:
+ * even a fully-compromised model is contained.
+ *
+ * We broaden the blueprint's literal "irreversible/spend" to ALL mutations
+ * (incl. write): a draft/file write induced by a hostile email is exactly the
+ * exfiltration/tampering vector the rule exists to stop. User-requested writes
+ * happen before any untrusted content enters context, so they are unaffected.
+ */
+export function blockedByUntrustedContext(trustClass: TrustClass, untrustedInContext: boolean): boolean {
+  return untrustedInContext && isMutating(trustClass);
+}
+
 /** Classify a tool against a policy set, fail-closed for unknown tools. */
 export function classifyTool(tool: string, policies: TrustPolicy[]): TrustClass {
   return policies.find((p) => p.tool === tool)?.trustClass ?? UNKNOWN_TOOL_CLASS;
 }
+
+export { SecretsBroker, secretsBroker, redactForAudit } from './secrets.js';
 
 export class TrustGate {
   constructor(private readonly pool: pg.Pool) {}

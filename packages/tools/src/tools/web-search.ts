@@ -25,6 +25,7 @@ function unwrapUrl(href: string): string {
 
 export const webSearch: ToolDef = {
   name: 'web_search',
+  untrustedOutput: true, // web content is untrusted (§8.3)
   description: 'Search the web. Returns titles, URLs and snippets for the top results.',
   inputSchema: {
     type: 'object',

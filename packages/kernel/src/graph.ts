@@ -7,7 +7,7 @@ import type pg from 'pg';
 import { TraceStore, newTraceId } from '@ai-os/shared';
 import { callModel } from '@ai-os/model-router';
 import { buildRegistry, type ToolRegistry } from '@ai-os/tools';
-import { TrustGate } from '@ai-os/trust';
+import { TrustGate, redactForAudit } from '@ai-os/trust';
 import { systemPrompt } from './prompts.js';
 import { assembleMemoryContext } from './context.js';
 import { makePlan, type PlannedStep } from './planner.js';
@@ -265,7 +265,7 @@ async function executeStep(
       await pool.query(
         `INSERT INTO tool_calls (step_id, tool, args, result, trust_class, approved_by, duration_ms)
          VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [step.id, step.tool, JSON.stringify(step.tool_args ?? {}), JSON.stringify(result), decision.trustClass, decision.autoApprove ? 'policy' : 'user', Date.now() - started],
+        [step.id, step.tool, redactForAudit(JSON.stringify(step.tool_args ?? {})), redactForAudit(JSON.stringify(result)), decision.trustClass, decision.autoApprove ? 'policy' : 'user', Date.now() - started],
       );
       await pool.query(`UPDATE steps SET status='done', output=$2, updated_at=now() WHERE id=$1`, [step.id, JSON.stringify({ result })]);
       await trace.record({ traceId, taskId, component: 'executor', event: 'step.tool', payload: { tool: step.tool, title: step.title } });

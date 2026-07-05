@@ -46,6 +46,7 @@ interface GEvent {
 
 export const calendarList: ToolDef = {
   name: 'calendar_list',
+  untrustedOutput: true, // event titles/descriptions are attacker-controllable (§8.3)
   description:
     "List events on the user's primary Google Calendar. Defaults to today in the user's timezone if no range is given.",
   inputSchema: {

@@ -51,6 +51,7 @@ function extractBody(part: Part | undefined, want: string): string | null {
 
 export const gmailList: ToolDef = {
   name: 'gmail_list',
+  untrustedOutput: true, // email metadata is untrusted external content (§8.3)
   description:
     "List the user's Gmail messages. Supports Gmail search queries (e.g. 'in:inbox newer_than:1d', 'from:foo is:unread'). Returns id, from, subject, date, snippet per message.",
   inputSchema: {
@@ -91,6 +92,7 @@ export const gmailList: ToolDef = {
 
 export const gmailRead: ToolDef = {
   name: 'gmail_read',
+  untrustedOutput: true, // email BODIES are the #1 injection vector (§8.3)
   description: 'Read one Gmail message in full (plain-text body) by message id from gmail_list.',
   inputSchema: {
     type: 'object',

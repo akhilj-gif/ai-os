@@ -15,6 +15,10 @@ export interface ToolDef {
   description: string;
   /** JSON Schema for the tool arguments (MCP-compatible). */
   inputSchema: Record<string, unknown>;
+  /** True if this tool's OUTPUT is untrusted external content (web pages, email/
+   *  ticket bodies, calendar entries). Once such output enters context, the trust
+   *  gate blocks mutating actions (§8.3 rule 2). Defaults to false. */
+  untrustedOutput?: boolean;
   execute(args: Record<string, unknown>, ctx: ToolContext): Promise<unknown>;
 }
 
@@ -22,6 +26,7 @@ export interface ToolSchema {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  untrustedOutput: boolean;
 }
 
 export class ToolRegistry {
@@ -36,10 +41,11 @@ export class ToolRegistry {
   }
 
   list(): ToolSchema[] {
-    return [...this.tools.values()].map(({ name, description, inputSchema }) => ({
+    return [...this.tools.values()].map(({ name, description, inputSchema, untrustedOutput }) => ({
       name,
       description,
       inputSchema,
+      untrustedOutput: untrustedOutput ?? false,
     }));
   }
 }

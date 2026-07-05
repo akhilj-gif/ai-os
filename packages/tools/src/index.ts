@@ -10,6 +10,7 @@ export type { ToolDef, ToolContext, ToolSchema } from './registry.js';
 export { ToolRegistry } from './registry.js';
 export { GoogleNotConnectedError, getGoogleAccessToken, googleApi } from './google.js';
 export { todayRange } from './tools/calendar.js';
+export { type SandboxRunner, type SandboxSpec, type SandboxResult, notImplementedSandbox } from './sandbox.js';
 
 export function buildRegistry(): ToolRegistry {
   const registry = new ToolRegistry();
