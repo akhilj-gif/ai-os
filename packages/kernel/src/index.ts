@@ -15,3 +15,4 @@ export {
   decideApproval,
   type GraphResult,
 } from './graph.js';
+export { runResearch, type ResearchResult, type ResearchSource } from './research.js';

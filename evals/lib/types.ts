@@ -10,11 +10,19 @@ export interface PlanShape {
   steps: Array<{ local_id: string; title: string; kind: string; depends_on: string[]; tool?: string }>;
 }
 
+export interface ResearchShape {
+  report: string;
+  sources: Array<{ n: number; title: string; url: string }>;
+  status: string;
+}
+
 export interface CaseContext {
   /** Final assistant text produced by the task. */
   text: string;
   /** For planOnly cases: the planner's output, for structural assertions. */
   plan?: PlanShape;
+  /** For research cases: the research engine's output. */
+  research?: ResearchShape;
   /** Task row after the run. */
   task: { status: string; spent: { tokens: number } };
   /** True when the task failed due to provider rate-limit/quota (not a real
@@ -70,6 +78,8 @@ export interface EvalCase {
    *  executing. For the planning suite. setup/teardown run arbitrary DB prep
    *  (e.g. seed a trust policy so an approval gate is expected). */
   planOnly?: boolean;
+  /** research: run the research engine on `goal` and assert on ctx.research. */
+  research?: boolean;
   setup?: (pool: pg.Pool) => Promise<void>;
   teardown?: (pool: pg.Pool) => Promise<void>;
   /** Mock tool executors by name; unmocked tools run for real. Extra tools may

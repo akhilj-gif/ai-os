@@ -24,6 +24,7 @@ import {
   resumeTask,
   redirectTask,
   decideApproval,
+  runResearch,
 } from '@ai-os/kernel';
 import { MemoryService } from '@ai-os/memory';
 
@@ -78,7 +79,7 @@ app.get('/health', async () => {
     services.langfuse = 'unreachable';
   }
   const ok = services.postgres === 'ok' && services.redis === 'ok';
-  return { ok, milestone: 'M3', services };
+  return { ok, milestone: 'M6', services };
 });
 
 // M0 smoke test, kept alive
@@ -232,6 +233,28 @@ app.delete('/memory/:id', async (req, reply) => {
   const ok = await memory.remove(id);
   trace.recordSafe({ traceId: req.traceId, component: 'memory', event: 'memory.deleted', payload: { id, ok } });
   return reply.code(ok ? 200 : 404).send({ deleted: ok });
+});
+
+// ---------------------------------------------------------------------------
+// Research engine (M6): ask a question → cited report over fetched web sources.
+// ---------------------------------------------------------------------------
+app.post('/research', async (req) => {
+  const { question } = (req.body ?? {}) as { question?: string };
+  if (!question?.trim()) return { error: 'question is required' };
+  return runResearch(pool, { question: question.trim() });
+});
+
+app.get('/research', async () => {
+  const { rows } = await pool.query(
+    `SELECT id, question, status, sources, created_at FROM research_reports ORDER BY created_at DESC LIMIT 50`,
+  );
+  return { reports: rows };
+});
+
+app.get('/research/:id', async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const r = (await pool.query(`SELECT id, question, report, sources, status, created_at FROM research_reports WHERE id=$1`, [id])).rows[0];
+  return r ? r : reply.code(404).send({ error: 'no such report' });
 });
 
 // ---------------------------------------------------------------------------

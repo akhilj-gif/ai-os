@@ -11,7 +11,7 @@ import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { newTraceId } from '@ai-os/shared';
-import { runTask, makePlan } from '@ai-os/kernel';
+import { runTask, makePlan, runResearch } from '@ai-os/kernel';
 import { MemoryService } from '@ai-os/memory';
 import { buildRegistry, ToolRegistry } from '@ai-os/tools';
 import type { EvalCase, Suite, CaseContext } from './lib/types.js';
@@ -19,8 +19,9 @@ import { injectionDefense } from './suites/injection-defense.js';
 import { toolReliability, resetSuiteState } from './suites/tool-reliability.js';
 import { memoryRecall } from './suites/memory-recall.js';
 import { planning } from './suites/planning.js';
+import { research } from './suites/research.js';
 
-const SUITES: Suite[] = [toolReliability, injectionDefense, memoryRecall, planning];
+const SUITES: Suite[] = [toolReliability, injectionDefense, memoryRecall, planning, research];
 const evalsDir = dirname(fileURLToPath(import.meta.url));
 const baselinesPath = join(evalsDir, 'baselines.json');
 
@@ -73,6 +74,24 @@ async function runCase(pool: pg.Pool, evalCase: EvalCase): Promise<CaseContext> 
       return { text: msg, task: { status: 'failed', spent: { tokens: 0 } }, toolCalls: [], pool, infraFailed };
     } finally {
       if (evalCase.teardown) await evalCase.teardown(pool);
+    }
+  }
+
+  // research: run the research engine and assert on its cited output.
+  if (evalCase.research) {
+    try {
+      const r = await runResearch(pool, { question: evalCase.goal, registry: registryFor(evalCase) });
+      return {
+        text: r.report,
+        research: { report: r.report, sources: r.sources, status: r.status },
+        task: { status: r.status === 'done' ? 'done' : 'failed', spent: { tokens: 0 } },
+        toolCalls: [],
+        pool,
+        infraFailed: false,
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { text: msg, task: { status: 'failed', spent: { tokens: 0 } }, toolCalls: [], pool, infraFailed: INFRA_RE.test(msg) || NET_RE.test(msg) };
     }
   }
 

@@ -2,6 +2,7 @@
 // Gmail/Calendar read+draft. Registry shapes are MCP-compatible (ADR-0004).
 import { ToolRegistry } from './registry.js';
 import { webSearch } from './tools/web-search.js';
+import { fetchUrl } from './tools/fetch-url.js';
 import { workspaceList, workspaceRead, workspaceWrite } from './tools/workspace.js';
 import { gmailList, gmailRead, gmailCreateDraft } from './tools/gmail.js';
 import { calendarList } from './tools/calendar.js';
@@ -16,6 +17,7 @@ export function buildRegistry(): ToolRegistry {
   const registry = new ToolRegistry();
   for (const tool of [
     webSearch,
+    fetchUrl,
     workspaceList,
     workspaceRead,
     workspaceWrite,
