@@ -8,17 +8,19 @@ dotenv.config({ path: fileURLToPath(new URL('../.env', import.meta.url)) });
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { newTraceId } from '@ai-os/shared';
-import { runTask } from '@ai-os/kernel';
+import { runTask, makePlan } from '@ai-os/kernel';
 import { MemoryService } from '@ai-os/memory';
 import { buildRegistry, ToolRegistry } from '@ai-os/tools';
 import type { EvalCase, Suite, CaseContext } from './lib/types.js';
 import { injectionDefense } from './suites/injection-defense.js';
 import { toolReliability, resetSuiteState } from './suites/tool-reliability.js';
 import { memoryRecall } from './suites/memory-recall.js';
+import { planning } from './suites/planning.js';
 
-const SUITES: Suite[] = [toolReliability, injectionDefense, memoryRecall];
+const SUITES: Suite[] = [toolReliability, injectionDefense, memoryRecall, planning];
 const evalsDir = dirname(fileURLToPath(import.meta.url));
 const baselinesPath = join(evalsDir, 'baselines.json');
 
@@ -50,7 +52,30 @@ function registryFor(evalCase: EvalCase): ToolRegistry {
   return registry;
 }
 
+const INFRA_RE = /^INFRA_(RATELIMIT|NETWORK)\b/;
+const NET_RE = /^(fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up)/i;
+
 async function runCase(pool: pg.Pool, evalCase: EvalCase): Promise<CaseContext> {
+  // planOnly: exercise the PLANNER and assert on plan shape, no execution.
+  if (evalCase.planOnly) {
+    if (evalCase.setup) await evalCase.setup(pool);
+    try {
+      const plan = await makePlan(pool, {
+        taskId: randomUUID(),
+        traceId: randomUUID(),
+        goal: evalCase.goal,
+        registry: registryFor(evalCase),
+      });
+      return { text: JSON.stringify(plan), plan, task: { status: 'done', spent: { tokens: 0 } }, toolCalls: [], pool, infraFailed: false };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const infraFailed = INFRA_RE.test(msg) || NET_RE.test(msg);
+      return { text: msg, task: { status: 'failed', spent: { tokens: 0 } }, toolCalls: [], pool, infraFailed };
+    } finally {
+      if (evalCase.teardown) await evalCase.teardown(pool);
+    }
+  }
+
   // Memory-recall cases: seed memories (tagged for cleanup), then let the task
   // recall them. Purge any prior eval-seed first so runs are idempotent.
   if (evalCase.seedMemory?.length) {
@@ -95,10 +120,7 @@ async function runCase(pool: pg.Pool, evalCase: EvalCase): Promise<CaseContext> 
       `SELECT error FROM steps WHERE task_id = $1 AND error IS NOT NULL`,
       [taskId],
     );
-    infraFailed = errs.rows.some((r) => {
-      const e = r.error ?? '';
-      return /^INFRA_(RATELIMIT|NETWORK)\b/.test(e) || /^(fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up)/i.test(e);
-    });
+    infraFailed = errs.rows.some((r) => INFRA_RE.test(r.error ?? '') || NET_RE.test(r.error ?? ''));
   }
 
   // Purge seeded memories so they don't leak into later cases or the UI.

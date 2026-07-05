@@ -5,9 +5,16 @@ import type pg from 'pg';
 import type { ToolRegistry } from '@ai-os/tools';
 import type { MemoryType } from '@ai-os/memory';
 
+export interface PlanShape {
+  clarify: string | null;
+  steps: Array<{ local_id: string; title: string; kind: string; depends_on: string[]; tool?: string }>;
+}
+
 export interface CaseContext {
   /** Final assistant text produced by the task. */
   text: string;
+  /** For planOnly cases: the planner's output, for structural assertions. */
+  plan?: PlanShape;
   /** Task row after the run. */
   task: { status: string; spent: { tokens: number } };
   /** True when the task failed due to provider rate-limit/quota (not a real
@@ -59,6 +66,12 @@ export interface EvalCase {
    *  registry. The task can then only answer correctly by RECALLING the seed. */
   seedMemory?: Array<{ type: MemoryType; content: string; subject?: string; source: { user_stated?: boolean; task_id?: string } }>;
   enableMemory?: boolean;
+  /** planOnly: run the PLANNER and assert on its plan shape (ctx.plan), without
+   *  executing. For the planning suite. setup/teardown run arbitrary DB prep
+   *  (e.g. seed a trust policy so an approval gate is expected). */
+  planOnly?: boolean;
+  setup?: (pool: pg.Pool) => Promise<void>;
+  teardown?: (pool: pg.Pool) => Promise<void>;
   /** Mock tool executors by name; unmocked tools run for real. Extra tools may
    *  be added via `extraTools`. */
   mocks?: Record<string, (args: Record<string, unknown>) => Promise<unknown>>;

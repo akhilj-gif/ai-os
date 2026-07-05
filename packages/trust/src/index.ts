@@ -1,7 +1,8 @@
 // Trust Gate (blueprint §8) — exists from commit #1 (principle 3).
-// M1 scope: policy lookup from the trust_policies table (policies are data, §8.1),
-// fail-closed classification, and the approval default per class. Approval FLOWS
-// (pause task → ask user → resume) arrive in M4; at M1 a non-auto tool is refused.
+// Policy lookup from the trust_policies table (policies are data, §8.1),
+// fail-closed classification, and the approval default per class. At M1 a
+// non-auto tool was refused; at M4 the planner/graph route it through an
+// approval step (pause → approve → resume).
 import type pg from 'pg';
 import type { TrustClass } from '@ai-os/shared';
 
@@ -13,8 +14,25 @@ export interface TrustDecision {
   unknownTool: boolean;
 }
 
+/** A trust policy row (data, not code — §8.1). */
+export interface TrustPolicy {
+  tool: string;
+  trustClass: TrustClass;
+  autoApprove: boolean;
+}
+
 /** Fail closed: a tool nobody classified is treated as irreversible. */
 export const UNKNOWN_TOOL_CLASS: TrustClass = 'irreversible';
+
+/** Default per-class approval policy (§8.1): read/write auto, irreversible/spend not. */
+export function requiresApproval(trustClass: TrustClass): boolean {
+  return trustClass === 'irreversible' || trustClass === 'spend';
+}
+
+/** Classify a tool against a policy set, fail-closed for unknown tools. */
+export function classifyTool(tool: string, policies: TrustPolicy[]): TrustClass {
+  return policies.find((p) => p.tool === tool)?.trustClass ?? UNKNOWN_TOOL_CLASS;
+}
 
 export class TrustGate {
   constructor(private readonly pool: pg.Pool) {}

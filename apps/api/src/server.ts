@@ -18,6 +18,12 @@ import {
   ensureDefaultSession,
   addMessage,
   listMessages,
+  planAndStart,
+  runGraph,
+  pauseTask,
+  resumeTask,
+  redirectTask,
+  decideApproval,
 } from '@ai-os/kernel';
 import { MemoryService } from '@ai-os/memory';
 
@@ -229,6 +235,64 @@ app.delete('/memory/:id', async (req, reply) => {
 });
 
 // ---------------------------------------------------------------------------
+// Planner + Task Graph (M4): plan a goal, inspect the graph, control the run.
+// ---------------------------------------------------------------------------
+app.post('/plan', async (req) => {
+  const { text } = (req.body ?? {}) as { text?: string };
+  if (!text?.trim()) return { error: 'text is required' };
+  return planAndStart(pool, { goal: text.trim() });
+});
+
+app.get('/tasks', async () => {
+  const { rows } = await pool.query(
+    `SELECT id, goal, status, created_by, created_at, updated_at FROM tasks ORDER BY created_at DESC LIMIT 50`,
+  );
+  return { tasks: rows };
+});
+
+app.get('/tasks/:id', async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const task = (await pool.query(`SELECT id, goal, status, spent, created_at, updated_at FROM tasks WHERE id=$1`, [id])).rows[0];
+  if (!task) return reply.code(404).send({ error: 'no such task' });
+  const steps = (
+    await pool.query(
+      `SELECT id, kind, title, local_id, depends_on, status, output, tool, tool_args, approval, error, created_at
+       FROM steps WHERE task_id=$1 ORDER BY created_at`,
+      [id],
+    )
+  ).rows;
+  return { task, steps };
+});
+
+app.post('/tasks/:id/pause', async (req) => {
+  const { id } = req.params as { id: string };
+  await pauseTask(pool, id);
+  return { ok: true, status: 'paused' };
+});
+
+app.post('/tasks/:id/resume', async (req) => {
+  const { id } = req.params as { id: string };
+  return resumeTask(pool, id);
+});
+
+app.post('/tasks/:id/redirect', async (req) => {
+  const { id } = req.params as { id: string };
+  const { directive } = (req.body ?? {}) as { directive?: string };
+  if (!directive?.trim()) return { error: 'directive is required' };
+  await redirectTask(pool, id, directive.trim());
+  return { ok: true };
+});
+
+app.post('/tasks/:id/approve', async (req) => {
+  const { id } = req.params as { id: string };
+  const { stepId, decision, note } = (req.body ?? {}) as { stepId?: string; decision?: 'approved' | 'rejected'; note?: string };
+  if (!stepId || (decision !== 'approved' && decision !== 'rejected')) {
+    return { error: 'stepId and decision (approved|rejected) are required' };
+  }
+  return decideApproval(pool, id, stepId, decision, note);
+});
+
+// ---------------------------------------------------------------------------
 // Boot: resume tasks orphaned by a mid-run kill (M1 exit criterion)
 // ---------------------------------------------------------------------------
 const port = Number(process.env.API_PORT ?? 4000);
@@ -237,8 +301,13 @@ await app.listen({ port, host: '127.0.0.1' });
 void (async () => {
   const orphans = await findOrphanedTasks(pool);
   for (const taskId of orphans) {
-    app.log.info({ taskId }, 'resuming orphaned task');
-    trace.recordSafe({ traceId: newTraceId(), taskId, component: 'api', event: 'task.resume_on_boot' });
-    completeChatTask(taskId).catch((err) => app.log.error({ err, taskId }, 'orphan resume failed'));
+    // Route by shape: a task with planner-authored steps (local_id set) is a
+    // graph task → resume via runGraph (skips done steps, exactly-once); a plain
+    // chat task → runTask. Both are durable-resumable.
+    const isGraph = (await pool.query(`SELECT 1 FROM steps WHERE task_id=$1 AND local_id IS NOT NULL LIMIT 1`, [taskId])).rowCount ?? 0;
+    app.log.info({ taskId, isGraph: !!isGraph }, 'resuming orphaned task');
+    trace.recordSafe({ traceId: newTraceId(), taskId, component: 'api', event: 'task.resume_on_boot', payload: { graph: !!isGraph } });
+    const p = isGraph ? runGraph(pool, taskId) : completeChatTask(taskId);
+    Promise.resolve(p).catch((err) => app.log.error({ err, taskId }, 'orphan resume failed'));
   }
 })();
