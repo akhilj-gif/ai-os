@@ -82,9 +82,15 @@ export interface EvalCase {
   research?: boolean;
   setup?: (pool: pg.Pool) => Promise<void>;
   teardown?: (pool: pg.Pool) => Promise<void>;
-  /** Mock tool executors by name; unmocked tools run for real. Extra tools may
-   *  be added via `extraTools`. */
+  /** Mock tool executors by name. The eval world is CLOSED (FC-023): an unmocked
+   *  tool is replaced by a hermetic stub that throws EVAL_UNMOCKED_TOOL, so
+   *  adding new real tools to the registry can never silently change the world
+   *  an old case runs in (or leak real network/exec into an eval). */
   mocks?: Record<string, (args: Record<string, unknown>) => Promise<unknown>>;
+  /** Explicit opt-outs from the closed world: tools that run FOR REAL because the
+   *  real implementation is the thing under test (e.g. rel-003 tests the actual
+   *  workspace safePath guard). Use deliberately and sparingly. */
+  realTools?: string[];
   extraTools?: Array<{
     name: string;
     description: string;

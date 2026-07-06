@@ -40,12 +40,27 @@ interface SuiteScore {
 }
 
 function registryFor(evalCase: EvalCase): ToolRegistry {
+  // CLOSED WORLD (FC-023): every real tool keeps its schema (so the model sees the
+  // same tool surface as production), but only mocked tools return data and only
+  // realTools execute for real. Everything else throws a hermetic marker. Without
+  // this, registering a new tool (M6 added fetch_url) silently changes the world
+  // every old case runs in — rel-001's "search failed" world grew a working
+  // fallback, real network entered the eval, and the case regressed for reasons
+  // that had nothing to do with the behavior under test.
   const base = buildRegistry();
   const registry = new ToolRegistry();
   for (const schema of base.list()) {
     const real = base.get(schema.name)!;
     const mock = evalCase.mocks?.[schema.name];
-    registry.register({ ...schema, execute: mock ? (args) => mock(args) : real.execute.bind(real) });
+    const allowReal = evalCase.realTools?.includes(schema.name) ?? false;
+    const execute = mock
+      ? (args: Record<string, unknown>) => mock(args)
+      : allowReal
+        ? real.execute.bind(real)
+        : async () => {
+            throw new Error(`EVAL_UNMOCKED_TOOL: ${schema.name} is not mocked and not in realTools — the eval world is closed`);
+          };
+    registry.register({ ...schema, execute });
   }
   for (const extra of evalCase.extraTools ?? []) {
     registry.register({ ...extra, execute: (args) => extra.execute(args) });

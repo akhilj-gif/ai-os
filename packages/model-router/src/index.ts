@@ -264,6 +264,13 @@ function throwHttp(provider: Provider, status: number, body: string): never {
   if (status === 429 || status === 503) {
     throw new Error(`INFRA_RATELIMIT ${status} (${provider.name}): ${snippet}`);
   }
+  // 413: Groq signals per-request TPM overflow this way ("Request too large ...
+  // on tokens per minute (TPM)"). Infra-class like 429 — quota geometry, not
+  // model misbehavior — but NOT retryable (the same request would 413 again),
+  // which is why it is classified here and never enters the retry loop.
+  if (status === 413) {
+    throw new Error(`INFRA_RATELIMIT ${status} (${provider.name}): ${snippet}`);
+  }
   throw new Error(`${provider.name} ${status}: ${snippet}`);
 }
 
