@@ -14,6 +14,7 @@ interface Rec {
   created_at: string;
   last_confirmed_at: string;
   superseded_by: string | null;
+  relevance?: number; // present on search results
 }
 
 const TYPE_COLORS: Record<string, string> = {
@@ -32,16 +33,23 @@ function sourceLabel(s: Rec['source']): string {
   return 'unknown';
 }
 
+const TYPES = ['preference', 'semantic', 'procedural', 'project', 'episodic', 'document'];
+
 export default function MemoryPage() {
   const [records, setRecords] = useState<Rec[]>([]);
   const [showSuperseded, setShowSuperseded] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [q, setQ] = useState('');
+  const [typeFilter, setTypeFilter] = useState<string | null>(null);
+  const [searchMode, setSearchMode] = useState<string | null>(null); // null = listing
+  const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
       const res = await fetch(`/api/memory?includeSuperseded=${showSuperseded}`);
       const data = (await res.json()) as { records: Rec[] };
       setRecords(data.records);
+      setSearchMode(null);
       setLoaded(true);
     } catch {
       setLoaded(true);
@@ -51,6 +59,19 @@ export default function MemoryPage() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  async function search() {
+    if (!q.trim()) return void refresh();
+    setBusy(true);
+    try {
+      const res = await fetch(`/api/memory/search?q=${encodeURIComponent(q.trim())}${typeFilter ? `&type=${typeFilter}` : ''}`);
+      const data = (await res.json()) as { records: Rec[]; mode: string };
+      setRecords(data.records);
+      setSearchMode(data.mode);
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function del(id: string) {
     await fetch(`/api/memory/${id}`, { method: 'DELETE' });
@@ -70,7 +91,35 @@ export default function MemoryPage() {
         Everything the OS remembers about you, with its source. Delete anything — trust requires inspectability.
       </p>
 
-      <label style={{ fontSize: 12, color: '#9aa0b5', display: 'flex', gap: 6, alignItems: 'center', margin: '10px 0 18px' }}>
+      {/* M8: semantic search + type filter */}
+      <div style={{ display: 'flex', gap: 8, margin: '12px 0 8px' }}>
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && void search()}
+          placeholder="search memories by meaning… (empty = list all)"
+          style={{ flex: 1, padding: '8px 12px', borderRadius: 8, border: '1px solid #2a2e45', background: '#12141f', color: '#e6e8f0', fontSize: 13, outline: 'none' }}
+        />
+        <button onClick={() => void search()} disabled={busy} style={{ padding: '0 16px', borderRadius: 8, border: 'none', background: busy ? '#2a2e45' : '#4b78ff', color: '#fff', fontSize: 13, cursor: 'pointer' }}>
+          {busy ? '…' : 'search'}
+        </button>
+        {searchMode && (
+          <button onClick={() => { setQ(''); void refresh(); }} style={{ padding: '0 12px', borderRadius: 8, border: '1px solid #2a2e45', background: 'transparent', color: '#9aa0b5', fontSize: 13, cursor: 'pointer' }}>
+            clear
+          </button>
+        )}
+      </div>
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10 }}>
+        {TYPES.map((t) => (
+          <button key={t} onClick={() => setTypeFilter(typeFilter === t ? null : t)}
+            style={{ fontSize: 11, padding: '2px 10px', borderRadius: 999, cursor: 'pointer', border: `1px solid ${typeFilter === t ? TYPE_COLORS[t] ?? '#4b78ff' : '#2a2e45'}`, background: typeFilter === t ? `${TYPE_COLORS[t] ?? '#4b78ff'}22` : 'transparent', color: TYPE_COLORS[t] ?? '#9aa0b5' }}>
+            {t}
+          </button>
+        ))}
+      </div>
+      {searchMode && <p style={{ fontSize: 12, color: '#e0a13a', margin: '0 0 10px' }}>search results · {searchMode}</p>}
+
+      <label style={{ fontSize: 12, color: '#9aa0b5', display: 'flex', gap: 6, alignItems: 'center', margin: '0 0 18px' }}>
         <input type="checkbox" checked={showSuperseded} onChange={(e) => setShowSuperseded(e.target.checked)} />
         show superseded (the auditable history)
       </label>
@@ -80,7 +129,7 @@ export default function MemoryPage() {
       )}
 
       <div style={{ display: 'grid', gap: 8 }}>
-        {records.map((r) => (
+        {records.filter((r) => !typeFilter || r.type === typeFilter).map((r) => (
           <div
             key={r.id}
             style={{
@@ -106,6 +155,7 @@ export default function MemoryPage() {
               </span>
               {r.subject && <span style={{ fontSize: 11, color: '#9aa0b5' }}>· {r.subject}</span>}
               <span style={{ fontSize: 11, color: '#565c72' }}>· conf {r.confidence.toFixed(2)}</span>
+              {r.relevance !== undefined && <span style={{ fontSize: 11, color: '#4b78ff' }}>· match {r.relevance.toFixed(2)}</span>}
               <span style={{ fontSize: 11, color: '#565c72' }}>· from {sourceLabel(r.source)}</span>
               {r.superseded_by && <span style={{ fontSize: 11, color: '#e0a13a' }}>· superseded</span>}
               <button

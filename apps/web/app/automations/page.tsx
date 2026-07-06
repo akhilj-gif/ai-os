@@ -10,7 +10,7 @@ interface Job {
   schedule: { kind: string; time?: string; minutes?: number; at?: string };
   payload: { url?: string }; next_run_at: string | null; last_run: LastRun | null;
 }
-interface Notification { id: string; kind: string; title: string; body: string; read: boolean; created_at: string }
+interface Notification { id: string; kind: string; title: string; body: string; read: boolean; created_at: string; meta?: { taskId?: string; stepId?: string } }
 
 const STATUS_COLOR: Record<string, string> = { done: '#22a06b', running: '#4b78ff', failed: '#f87171', deferred: '#f5a623', missed: '#9aa0b5' };
 
@@ -72,6 +72,15 @@ export default function AutomationsPage() {
   }
   async function markRead(id: string) {
     await fetch(`/api/notifications/${id}/read`, { method: 'POST' });
+    await refresh();
+  }
+  // M8: an approval notification is decidable in place; the decision consumes it.
+  async function decideApproval(n: Notification, decision: 'approved' | 'rejected') {
+    if (!n.meta?.taskId || !n.meta?.stepId) return;
+    await fetch(`/api/tasks/${n.meta.taskId}/approve`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ stepId: n.meta.stepId, decision }),
+    });
     await refresh();
   }
 
@@ -154,10 +163,17 @@ export default function AutomationsPage() {
           <div style={{ display: 'grid', gap: 8 }}>
             {notifs.map((n) => (
               <div key={n.id} style={{ padding: '10px 12px', borderRadius: 10, border: `1px solid ${n.read ? '#23263a' : '#4b532c'}`, background: n.read ? '#0e101a' : '#15170f' }}>
-                <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, cursor: 'pointer' }} onClick={() => setOpenNotif(openNotif === n.id ? null : n.id)}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }} onClick={() => setOpenNotif(openNotif === n.id ? null : n.id)}>
                   {!n.read && <span style={{ color: '#f5a623', fontSize: 10 }}>●</span>}
                   <strong style={{ fontSize: 13 }}>{n.title}</strong>
-                  <span style={{ marginLeft: 'auto', fontSize: 11, color: '#565c72' }}>{new Date(n.created_at).toLocaleTimeString()}</span>
+                  {n.kind === 'approval' && !n.read && n.meta?.stepId ? (
+                    <span style={{ marginLeft: 'auto', display: 'flex', gap: 4 }} onClick={(e) => e.stopPropagation()}>
+                      <button onClick={() => void decideApproval(n, 'approved')} style={{ padding: '2px 10px', borderRadius: 6, border: 'none', background: '#1f7a4d', color: '#fff', fontSize: 12, cursor: 'pointer' }}>✓ approve</button>
+                      <button onClick={() => void decideApproval(n, 'rejected')} style={{ padding: '2px 10px', borderRadius: 6, border: '1px solid #5a2430', background: 'transparent', color: '#f87171', fontSize: 12, cursor: 'pointer' }}>✕</button>
+                    </span>
+                  ) : (
+                    <span style={{ marginLeft: 'auto', fontSize: 11, color: '#565c72' }}>{new Date(n.created_at).toLocaleTimeString()}</span>
+                  )}
                 </div>
                 {openNotif === n.id && (
                   <div>

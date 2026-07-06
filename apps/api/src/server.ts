@@ -33,6 +33,7 @@ import {
   type Schedule,
 } from '@ai-os/kernel';
 import { MemoryService } from '@ai-os/memory';
+import { failoverChain } from '@ai-os/model-router';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const memory = new MemoryService(pool);
@@ -85,7 +86,29 @@ app.get('/health', async () => {
     services.langfuse = 'unreachable';
   }
   const ok = services.postgres === 'ok' && services.redis === 'ok';
-  return { ok, milestone: 'M7', services };
+  return { ok, milestone: 'M8', services };
+});
+
+// M8 settings: which providers/models the router will use, in failover order
+// (ADR-0011). Names and model ids only — never key material.
+app.get('/system/models', async () => {
+  try {
+    const chain = failoverChain();
+    return {
+      pinned: process.env.MODEL_PROVIDER ?? null,
+      chain: chain.map((p, i) => ({
+        name: p.name,
+        position: i === 0 ? 'primary' : `fallback ${i}`,
+        models: {
+          routing: i === 0 ? process.env.MODEL_ROUTING ?? p.defaults.routing : p.defaults.routing,
+          execution: i === 0 ? process.env.MODEL_EXECUTION ?? p.defaults.execution : p.defaults.execution,
+          planning: i === 0 ? process.env.MODEL_PLANNING ?? p.defaults.planning : p.defaults.planning,
+        },
+      })),
+    };
+  } catch (err) {
+    return { pinned: null, chain: [], error: err instanceof Error ? err.message : String(err) };
+  }
 });
 
 // M0 smoke test, kept alive
@@ -239,6 +262,26 @@ app.delete('/memory/:id', async (req, reply) => {
   const ok = await memory.remove(id);
   trace.recordSafe({ traceId: req.traceId, component: 'memory', event: 'memory.deleted', payload: { id, ok } });
   return reply.code(ok ? 200 : 404).send({ deleted: ok });
+});
+
+// M8 memory browser: semantic search over memories. Degrades to a plain keyword
+// match when embeddings are unavailable (quota) — search must never be down.
+app.get('/memory/search', async (req) => {
+  const { q, type } = req.query as { q?: string; type?: string };
+  if (!q?.trim()) return { records: [], mode: 'none' };
+  const types = type ? [type as never] : undefined;
+  try {
+    const records = await memory.recall({ query: q.trim(), types, limit: 25, minRelevance: 0.05 });
+    return { records, mode: 'semantic' };
+  } catch {
+    const { rows } = await pool.query(
+      `SELECT * FROM memory_records
+       WHERE superseded_by IS NULL AND content ILIKE $1 ${type ? 'AND type = $2' : ''}
+       ORDER BY confidence DESC, created_at DESC LIMIT 25`,
+      type ? [`%${q.trim()}%`, type] : [`%${q.trim()}%`],
+    );
+    return { records: rows, mode: 'keyword (embeddings unavailable)' };
+  }
 });
 
 // ---------------------------------------------------------------------------

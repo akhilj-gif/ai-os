@@ -11,7 +11,7 @@ interface Dash {
   approvals: Approval[];
   activeTasks: TaskRow[];
   recentTasks: TaskRow[];
-  notifications: { unread: number; latest: Array<{ id: string; kind: string; title: string; read: boolean; created_at: string }> };
+  notifications: { unread: number; latest: Array<{ id: string; kind: string; title: string; read: boolean; created_at: string; meta?: { taskId?: string; stepId?: string } }> };
   jobs: JobRow[];
   spend: { todayTokens: number; totalTokens: number };
   taskCounts: Record<string, number>;
@@ -144,10 +144,20 @@ export default function DashboardPage() {
             <h2 style={h2}>Notifications {d.notifications.unread > 0 && <span style={{ color: '#f5a623' }}>({d.notifications.unread} unread)</span>}</h2>
             {d.notifications.latest.length === 0 && <p style={{ color: '#565c72', fontSize: 13, margin: 0 }}>None yet.</p>}
             {d.notifications.latest.map((n) => (
-              <div key={n.id} style={{ display: 'flex', gap: 8, padding: '5px 0', fontSize: 13, borderTop: '1px solid #1a1d2e' }}>
-                {!n.read && <span style={{ color: '#f5a623', fontSize: 10, alignSelf: 'center' }}>●</span>}
+              <div key={n.id} style={{ display: 'flex', gap: 8, padding: '5px 0', fontSize: 13, borderTop: '1px solid #1a1d2e', alignItems: 'center' }}>
+                {!n.read && <span style={{ color: '#f5a623', fontSize: 10 }}>●</span>}
                 <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{n.title}</span>
-                <span style={{ color: '#565c72', fontSize: 12 }}>{new Date(n.created_at).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}</span>
+                {n.kind === 'approval' && !n.read && n.meta?.taskId && n.meta?.stepId ? (
+                  // M8: approvals answerable from the notification itself
+                  <span style={{ display: 'flex', gap: 4 }}>
+                    <button onClick={() => void decide({ step_id: n.meta!.stepId!, task_id: n.meta!.taskId!, title: n.title, tool: null, tool_args: null, goal: '', created_at: n.created_at }, 'approved')}
+                      style={{ padding: '2px 10px', borderRadius: 6, border: 'none', background: '#1f7a4d', color: '#fff', fontSize: 12, cursor: 'pointer' }}>✓</button>
+                    <button onClick={() => void decide({ step_id: n.meta!.stepId!, task_id: n.meta!.taskId!, title: n.title, tool: null, tool_args: null, goal: '', created_at: n.created_at }, 'rejected')}
+                      style={{ padding: '2px 10px', borderRadius: 6, border: '1px solid #5a2430', background: 'transparent', color: '#f87171', fontSize: 12, cursor: 'pointer' }}>✕</button>
+                  </span>
+                ) : (
+                  <span style={{ color: '#565c72', fontSize: 12 }}>{new Date(n.created_at).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}</span>
+                )}
               </div>
             ))}
             <a href="/automations" style={{ fontSize: 12, color: '#4b78ff' }}>open feed →</a>

@@ -9,6 +9,7 @@
   "dependencies": {
     "@ai-os/kernel": "workspace:*",
     "@ai-os/memory": "workspace:*",
+    "@ai-os/model-router": "workspace:*",
     "@ai-os/shared": "workspace:*",
     "dotenv": "^17.4.2",
     "fastify": "^5.9.0",

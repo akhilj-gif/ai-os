@@ -175,6 +175,22 @@ export async function runGraph(pool: pg.Pool, taskId: string, opts: { registry?:
       if (barriers.length > 0) {
         await pool.query(`UPDATE tasks SET status='awaiting_approval', updated_at=now() WHERE id=$1`, [taskId]);
         await trace.record({ traceId, taskId, component: 'trust', event: 'task.awaiting_approval', payload: { steps: barriers.map((b) => b.title) } });
+        // M8: approvals are answerable from the notification feed. Push one
+        // notification per DECIDABLE (approval-kind) barrier; runGraph is
+        // re-entrant, so dedupe on an existing unread notification for the step.
+        for (const b of barriers.filter((s) => s.kind === 'approval')) {
+          await pool.query(
+            `INSERT INTO notifications (kind, title, body, meta)
+             SELECT 'approval', $1, $2, $3::jsonb
+             WHERE NOT EXISTS (SELECT 1 FROM notifications WHERE meta->>'stepId' = $4 AND NOT read)`,
+            [
+              `Approval needed: ${b.title ?? 'a gated step'}`,
+              `Task: ${taskRow.goal}`,
+              JSON.stringify({ taskId, stepId: b.id }),
+              b.id,
+            ],
+          );
+        }
         return { taskId, status: 'awaiting_approval', awaiting: barriers.map((b) => ({ stepId: b.id, title: b.title ?? b.kind })) };
       }
       break; // nothing runnable → finalize below
@@ -335,5 +351,7 @@ export async function decideApproval(
      WHERE id=$1 AND task_id=$2 AND kind='approval'`,
     [stepId, taskId, decision, note ?? null],
   );
+  // The decision consumes its approval notification (M8) — wherever it was decided from.
+  await pool.query(`UPDATE notifications SET read=true WHERE meta->>'stepId' = $1 AND NOT read`, [stepId]);
   return runGraph(pool, taskId, opts);
 }

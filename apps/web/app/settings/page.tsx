@@ -9,16 +9,22 @@ interface Policy {
   trust_class: 'read' | 'write' | 'irreversible' | 'spend';
   auto_approve: boolean;
 }
+interface ModelChain {
+  pinned: string | null;
+  chain: Array<{ name: string; position: string; models: { routing: string; execution: string; planning: string } }>;
+}
 
 const CLASSES: Policy['trust_class'][] = ['read', 'write', 'irreversible', 'spend'];
 
 export default function SettingsPage() {
   const [policies, setPolicies] = useState<Policy[]>([]);
+  const [models, setModels] = useState<ModelChain | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const r = await fetch('/api/policies');
+      const [r, m] = await Promise.all([fetch('/api/policies'), fetch('/api/system/models')]);
       setPolicies(((await r.json()) as { policies: Policy[] }).policies);
+      setModels((await m.json()) as ModelChain);
     } catch { /* ignore */ }
   }, []);
   useEffect(() => { void refresh(); }, [refresh]);
@@ -61,6 +67,28 @@ export default function SettingsPage() {
             </label>
           </div>
         ))}
+      </div>
+
+      {/* M8: models & failover (ADR-0011) — which provider serves each role, in order */}
+      <header style={{ display: 'flex', alignItems: 'baseline', gap: 12, margin: '32px 0 4px' }}>
+        <h2 style={{ fontSize: 17, margin: 0 }}>Models &amp; failover</h2>
+        <span style={{ color: '#4b78ff', fontSize: 11, letterSpacing: 2 }}>M8 · ADR-0011</span>
+      </header>
+      <p style={{ color: '#9aa0b5', fontSize: 13, marginTop: 0 }}>
+        Calls try the primary first; on quota/rate-limit/network failures they fall over to the next provider immediately.
+        {models?.pinned && <strong style={{ color: '#e0a13a' }}> Pinned to {models.pinned} (MODEL_PROVIDER) — failover off.</strong>}
+      </p>
+      <div style={{ display: 'grid', gap: 6 }}>
+        {(models?.chain ?? []).map((p, i) => (
+          <div key={p.name} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderRadius: 10, background: '#12141f', border: `1px solid ${i === 0 ? '#2c3f75' : '#23263a'}`, fontSize: 13 }}>
+            <span style={{ fontWeight: 600, width: 80 }}>{p.name}</span>
+            <span style={{ fontSize: 11, color: i === 0 ? '#4b78ff' : '#9aa0b5', border: '1px solid #2a2e45', borderRadius: 6, padding: '1px 8px' }}>{p.position}</span>
+            <span style={{ marginLeft: 'auto', fontSize: 12, color: '#9aa0b5', fontFamily: 'ui-monospace, monospace' }}>
+              route {p.models.routing} · exec {p.models.execution} · plan {p.models.planning}
+            </span>
+          </div>
+        ))}
+        {models && models.chain.length === 0 && <p style={{ color: '#f87171', fontSize: 13 }}>No providers configured.</p>}
       </div>
     </main>
   );
