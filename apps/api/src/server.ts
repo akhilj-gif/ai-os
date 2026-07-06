@@ -355,6 +355,72 @@ app.post('/notifications/:id/read', async (req, reply) => {
 });
 
 // ---------------------------------------------------------------------------
+// M8 OS Interface: one aggregate powering the dashboard (live tasks, global
+// approvals inbox, spend, notifications, jobs) + the task-inspector depth
+// (trace timeline + tool-call audit). Read-only composition over existing data.
+// ---------------------------------------------------------------------------
+app.get('/dashboard', async () => {
+  const [approvals, active, recent, notifs, jobs, spend, counts] = await Promise.all([
+    pool.query(
+      `SELECT s.id AS step_id, s.title, s.tool, s.tool_args, s.created_at, t.id AS task_id, t.goal
+       FROM steps s JOIN tasks t ON t.id = s.task_id
+       WHERE s.kind = 'approval'
+         AND s.status NOT IN ('done','failed','skipped')
+         AND COALESCE(s.approval->>'status','pending') NOT IN ('approved','rejected')
+         AND t.status IN ('planning','running','paused','awaiting_approval')
+       ORDER BY s.created_at`,
+    ),
+    pool.query(
+      `SELECT id, goal, status, spent, updated_at FROM tasks
+       WHERE status IN ('planning','running','paused','awaiting_approval')
+       ORDER BY updated_at DESC LIMIT 20`,
+    ),
+    pool.query(`SELECT id, goal, status, spent, created_at, updated_at FROM tasks ORDER BY updated_at DESC LIMIT 12`),
+    pool.query(
+      `SELECT (SELECT count(*) FROM notifications WHERE NOT read) AS unread,
+              COALESCE((SELECT jsonb_agg(n) FROM (SELECT id, kind, title, read, created_at FROM notifications ORDER BY created_at DESC LIMIT 5) n), '[]'::jsonb) AS latest`,
+    ),
+    pool.query(
+      `SELECT j.id, j.name, j.kind, j.enabled, j.next_run_at,
+              (SELECT to_jsonb(r) FROM (SELECT status, started_at FROM job_runs WHERE job_id = j.id ORDER BY started_at DESC LIMIT 1) r) AS last_run
+       FROM jobs j ORDER BY j.next_run_at NULLS LAST`,
+    ),
+    pool.query(
+      `SELECT COALESCE(SUM((spent->>'tokens')::bigint) FILTER (WHERE updated_at >= date_trunc('day', now())), 0) AS today,
+              COALESCE(SUM((spent->>'tokens')::bigint), 0) AS total
+       FROM tasks`,
+    ),
+    pool.query(`SELECT status, count(*)::int AS n FROM tasks GROUP BY status`),
+  ]);
+  return {
+    approvals: approvals.rows,
+    activeTasks: active.rows,
+    recentTasks: recent.rows,
+    notifications: { unread: Number(notifs.rows[0]!.unread), latest: notifs.rows[0]!.latest },
+    jobs: jobs.rows,
+    spend: { todayTokens: Number(spend.rows[0]!.today), totalTokens: Number(spend.rows[0]!.total) },
+    taskCounts: Object.fromEntries(counts.rows.map((r: { status: string; n: number }) => [r.status, r.n])),
+  };
+});
+
+app.get('/tasks/:id/trace', async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const task = (await pool.query(`SELECT id, goal, status, spent, trace_id, created_at, updated_at FROM tasks WHERE id=$1`, [id])).rows[0];
+  if (!task) return reply.code(404).send({ error: 'no such task' });
+  const [toolCalls, events] = await Promise.all([
+    pool.query(
+      `SELECT tc.id, tc.tool, tc.args, tc.result, tc.trust_class, tc.approved_by, tc.duration_ms, tc.created_at,
+              s.title AS step_title, s.local_id
+       FROM tool_calls tc JOIN steps s ON s.id = tc.step_id
+       WHERE s.task_id = $1 ORDER BY tc.created_at`,
+      [id],
+    ),
+    pool.query(`SELECT ts, component, event, payload FROM trace_events WHERE task_id=$1 ORDER BY ts LIMIT 500`, [id]),
+  ]);
+  return { task, toolCalls: toolCalls.rows, events: events.rows };
+});
+
+// ---------------------------------------------------------------------------
 // Trust policies (M5 §8.1): policies are data — the user can tighten/loosen per tool.
 // ---------------------------------------------------------------------------
 app.get('/policies', async () => {

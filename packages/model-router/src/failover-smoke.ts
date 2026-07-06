@@ -72,7 +72,7 @@ console.log('\n— end-to-end loop with a stubbed network (Gemini 429 → Groq s
 const realFetch = globalThis.fetch;
 const hits: string[] = [];
 const stub = (geminiStatus: number) =>
-  (async (url: RequestInfo | URL) => {
+  (async (url: unknown) => {
     const u = String(url);
     if (u.includes('generativelanguage.googleapis.com')) {
       hits.push('gemini');

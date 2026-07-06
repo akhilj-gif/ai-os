@@ -73,6 +73,7 @@ export default function Home() {
     <main style={{ maxWidth: 760, margin: '0 auto', padding: '24px 16px 120px' }}>
       <header style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginBottom: 8 }}>
         <h1 style={{ fontSize: 22, margin: 0 }}>AI OS</h1>
+        <a href="/dashboard" style={{ fontSize: 13, color: '#e0a13a' }}>dashboard</a>
         <a href="/tasks" style={{ fontSize: 13, color: '#9aa0b5' }}>tasks</a>
         <a href="/research" style={{ fontSize: 13, color: '#9aa0b5' }}>research</a>
         <a href="/automations" style={{ fontSize: 13, color: '#9aa0b5' }}>automations</a>
