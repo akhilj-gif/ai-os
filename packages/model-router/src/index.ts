@@ -86,6 +86,35 @@ function resolveProvider(): Provider {
   throw new Error('No model provider configured — set ANTHROPIC_API_KEY, XAI_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY in .env');
 }
 
+/** Provider failover order (ADR-0011). Pinning MODEL_PROVIDER means PINNED —
+ *  a single-element chain, no failover — so evals and baselines stay
+ *  deterministic. Unpinned: every configured provider in priority order; when
+ *  the primary fails on INFRA (quota/rate-limit/network), the call falls
+ *  through to the next and execution continues immediately. */
+export function failoverChain(): Provider[] {
+  if (process.env.MODEL_PROVIDER) return [resolveProvider()];
+  const chain: Provider[] = [];
+  for (const name of PROVIDER_PRIORITY) {
+    const p = PROVIDERS[name]!();
+    if (p) chain.push(p);
+  }
+  if (chain.length === 0) {
+    throw new Error('No model provider configured — set ANTHROPIC_API_KEY, XAI_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY in .env');
+  }
+  return chain;
+}
+
+/** Failures that justify trying the NEXT provider: our INFRA_* markers, plus
+ *  SDK-thrown rate-limit/overload statuses (the Anthropic SDK throws typed
+ *  errors, not our markers). Anything else — bad request, auth, schema — would
+ *  fail identically everywhere and must surface, not failover. */
+export function isInfraFailure(err: unknown): boolean {
+  const status = (err as { status?: number })?.status;
+  if (status === 429 || status === 503 || status === 413 || status === 529) return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  return /^INFRA_(RATELIMIT|NETWORK)/.test(msg);
+}
+
 function routingTable(provider: Provider): Record<ModelRole, string> {
   return {
     routing: process.env.MODEL_ROUTING ?? provider.defaults.routing,
@@ -210,8 +239,9 @@ async function fetchWithRateLimitRetry(
   keys: string[],
   buildInit: (apiKey: string) => RequestInit,
   label: string,
+  maxRounds = 4,
 ): Promise<Response> {
-  const MAX_ROUNDS = 4;
+  const MAX_ROUNDS = maxRounds;
   const MAX_WAIT_MS = 70_000;
   let lastNetErr: unknown = null;
   for (let round = 1; round <= MAX_ROUNDS; round++) {
@@ -278,6 +308,7 @@ async function callOpenAIShape(
   provider: Provider,
   model: string,
   input: ModelCallInput,
+  retryRounds = 4,
 ): Promise<Omit<ModelCallResult, 'model'>> {
   const messages: Array<{ role: string; content: string }> = [];
   if (input.system) messages.push({ role: 'system', content: input.system });
@@ -295,6 +326,7 @@ async function callOpenAIShape(
       body: JSON.stringify({ model, max_tokens: input.maxTokens ?? 1024, messages }),
     }),
     `${provider.name}/${model}`,
+    retryRounds,
   );
   if (!res.ok) throwHttp(provider, res.status, await res.text());
   const data = (await res.json()) as {
@@ -310,9 +342,7 @@ async function callOpenAIShape(
   };
 }
 
-export async function callModel(input: ModelCallInput): Promise<ModelCallResult> {
-  const provider = resolveProvider();
-  const model = routingTable(provider)[input.role];
+async function callModelOn(provider: Provider, model: string, input: ModelCallInput, retryRounds: number): Promise<ModelCallResult> {
   const lf = getLangfuse();
   const trace = lf?.trace({
     id: input.traceId,
@@ -329,7 +359,7 @@ export async function callModel(input: ModelCallInput): Promise<ModelCallResult>
     const result =
       provider.kind === 'anthropic'
         ? await callAnthropicShape(provider, model, input)
-        : await callOpenAIShape(provider, model, input);
+        : await callOpenAIShape(provider, model, input, retryRounds);
     generation?.end({
       output: result.text,
       usage: { input: result.usage.inputTokens, output: result.usage.outputTokens },
@@ -339,6 +369,32 @@ export async function callModel(input: ModelCallInput): Promise<ModelCallResult>
     generation?.end({ level: 'ERROR', statusMessage: String(err) });
     throw err;
   }
+}
+
+export async function callModel(input: ModelCallInput): Promise<ModelCallResult> {
+  // Failover (ADR-0011): walk the provider chain; INFRA failures fall through to
+  // the next provider IMMEDIATELY (non-final providers get one fast retry round,
+  // only the last gets the full patient backoff). MODEL_* model-name overrides
+  // apply to the PRIMARY only — fallback providers use their own role defaults
+  // (a pinned model name belongs to one provider's catalog).
+  const chain = failoverChain();
+  let lastErr: unknown;
+  for (let i = 0; i < chain.length; i++) {
+    const provider = chain[i]!;
+    const model = i === 0 ? routingTable(provider)[input.role] : provider.defaults[input.role];
+    const retryRounds = i < chain.length - 1 ? 1 : 4;
+    try {
+      return await callModelOn(provider, model, input, retryRounds);
+    } catch (err) {
+      lastErr = err;
+      if (i < chain.length - 1 && isInfraFailure(err)) {
+        console.warn(`[model-router] ${provider.name} INFRA on ${input.name ?? input.role} — failing over to ${chain[i + 1]!.name}`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr; // unreachable (loop throws or returns), satisfies the type
 }
 
 /** Flush buffered Langfuse events — call before process exit. */
@@ -395,13 +451,35 @@ export interface ChatInput {
 }
 
 export async function chat(input: ChatInput): Promise<ChatResult> {
-  const provider = resolveProvider();
-  if (provider.kind !== 'openai') {
+  const chain = failoverChain();
+  if (chain[0]!.kind !== 'openai') {
     throw new Error(
-      `chat() with tools is OpenAI-shape only at M1 (provider "${provider.name}" is ${provider.kind}) — see ADR-0004`,
+      `chat() with tools is OpenAI-shape only at M1 (provider "${chain[0]!.name}" is ${chain[0]!.kind}) — see ADR-0004`,
     );
   }
-  const model = routingTable(provider)[input.role];
+  // Failover (ADR-0011), same semantics as callModel; only OpenAI-shape
+  // providers can serve the tool loop, so others are skipped in the chain.
+  const attempts = chain.filter((p) => p.kind === 'openai');
+  let lastErr: unknown;
+  for (let i = 0; i < attempts.length; i++) {
+    const provider = attempts[i]!;
+    const model = i === 0 ? routingTable(provider)[input.role] : provider.defaults[input.role];
+    const retryRounds = i < attempts.length - 1 ? 1 : 4;
+    try {
+      return await chatOn(provider, model, input, retryRounds);
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts.length - 1 && isInfraFailure(err)) {
+        console.warn(`[model-router] ${provider.name} INFRA on ${input.name ?? input.role} — failing over to ${attempts[i + 1]!.name}`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
+async function chatOn(provider: Provider, model: string, input: ChatInput, retryRounds: number): Promise<ChatResult> {
   const lf = getLangfuse();
   const trace = lf?.trace({
     id: input.traceId,
@@ -439,6 +517,7 @@ export async function chat(input: ChatInput): Promise<ChatResult> {
         }),
       }),
       `${provider.name}/${model}`,
+      retryRounds,
     );
     if (!res.ok) throwHttp(provider, res.status, await res.text());
     const data = (await res.json()) as {
