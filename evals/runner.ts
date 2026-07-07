@@ -319,7 +319,8 @@ async function main() {
 
   let hardFailure = false;
   for (const suite of suites) {
-    const r = results[suite.name]!;
+    const r = results[suite.name];
+    if (!r) continue; // empty suite (cases not collected yet) — nothing to gate on
     // Crash = harness/tool threw, always a hard failure.
     const crashed = r.failures.filter((f) => f.assertion === '(case crashed)');
     if (crashed.length) {
@@ -353,11 +354,16 @@ async function main() {
     process.exit(1);
   }
 
-  // No baseline yet: establish it on the first COMPLETE run (no skips), recording
-  // whatever the scores are — known gaps become part of the tripwire.
-  if (!haveBaseline) {
+  // Establish the baseline on the first COMPLETE run, OR deliberately REFRESH it
+  // with EVAL_REFRESH_BASELINE=1 (e.g. after adding suites — the committed
+  // baseline predates planning/research/whatsapp, so those have no tripwire yet).
+  // Refresh is gated on cleanliness: we reach here only past the hardFailure exit
+  // (no crash/gate/regression), and a run with skips can't establish a baseline.
+  const refresh = process.env.EVAL_REFRESH_BASELINE === '1';
+  if (!haveBaseline || refresh) {
     if (anySkipped) {
-      console.log('\nINCONCLUSIVE: no baseline exists and this run had skips — cannot establish a baseline from an incomplete run.');
+      const why = haveBaseline ? 'refresh requested' : 'no baseline exists';
+      console.log(`\nINCONCLUSIVE: ${why} but this run had skips — cannot ${haveBaseline ? 'refresh' : 'establish'} a baseline from an incomplete run.`);
       writeFileSync(join(reportsDir, `${stamp()}-inconclusive.json`), JSON.stringify({ model, results }, null, 2));
       await pool.end();
       process.exit(0);
@@ -377,7 +383,8 @@ async function main() {
       ),
     );
     const knownFails = Object.values(results).flatMap((r) => Object.entries(r.caseResults).filter(([, v]) => v === 'fail').map(([k]) => k));
-    console.log(`\nBASELINE ESTABLISHED → evals/baselines.json${knownFails.length ? ` (known-failing, baked in as the tripwire: ${knownFails.join(', ')})` : ' (all green)'}`);
+    const verb = haveBaseline ? 'BASELINE REFRESHED' : 'BASELINE ESTABLISHED';
+    console.log(`\n${verb} → evals/baselines.json (${Object.keys(results).length} suites)${knownFails.length ? ` (known-failing, baked in: ${knownFails.join(', ')})` : ' — all green'}`);
   } else if (anySkipped) {
     console.log('\nINCONCLUSIVE: no regression vs baseline, but some cases skipped for quota — baseline unchanged.');
   } else {

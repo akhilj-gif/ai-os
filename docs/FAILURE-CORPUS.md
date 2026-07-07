@@ -273,7 +273,16 @@
 - **Pass condition:** `tick()` takes an optional `namePrefix`; the smoke's wrapped `tick` always passes `smoketest-`, so an injected clock can only ever touch smoke-owned jobs. Verified: after the fix, a full smoke run leaves **0** future-dated or contaminated rows on real jobs (`SELECT count(*) … WHERE started_at > now() OR (name NOT LIKE 'smoketest-%' AND status='missed')` → 0), and the smoke still passes 31/31. General lesson: a test that shares the production DB must scope every mutating query to its own namespace — an injected clock is a mutation with blast radius.
 - **Eval suite:** the scheduler smoke itself (deterministic, no model).
 
-### FC-025 … FC-050 · *(to collect — copy the template below)*
+### FC-025 · A harness crash at the finish line silently discarded a clean, all-green run
+- **Date:** 2026-07-07 (M9.5, the first full-quota clean gym run in many sessions)
+- **Assistant:** AI OS eval gym (`evals/runner.ts`)
+- **Task (verbatim):** N/A — the whatsapp pack added a bundled `whatsapp` suite; support-ops's bundled `support-triage` suite is still empty (cases pending real tickets).
+- **What happened:** The runner skips empty suites when scoring (`if (cases.length===0) continue`) so they never land in `results`. But the downstream GATE loop iterated ALL suites and did `const r = results[suite.name]!; r.failures…` — for the empty support-triage suite `r` was `undefined`, throwing `TypeError: Cannot read properties of undefined (reading 'failures')`. The crash happened AFTER every suite scored 100% but BEFORE the baseline was written — so a rare clean, zero-skip, all-green run (the exact window needed to refresh a stale 3-suite baseline to the current 6 suites) produced no artifact at all. A measurement was completed and then thrown away by a bug in the reporting tail. Same lineage as FC-020: the gym can waste its own results.
+- **Failure mode:** `EVAL` · **Severity:** S2 (clean-quota window wasted; baseline left stale so 3 suites had no regression tripwire) · **Frequency:** F2 (every run once a bundled suite is empty)
+- **Pass condition:** The gate loop guards missing results (`const r = results[suite.name]; if (!r) continue`) so an empty bundled suite gates on nothing and can't crash the tail. Verified by the very next run: support-triage empty AND the run reached exit 0 with `BASELINE REFRESHED → 6 suites — all green`. General lesson: a completed measurement must survive the reporting code — the tail that writes/compares results must never be able to throw on a shape the scoring loop already tolerated. (Also added a deliberate `EVAL_REFRESH_BASELINE=1`, cleanliness-gated, so a stale baseline can be refreshed without hand-editing.)
+- **Eval suite:** the gym itself (`runner.ts`) — deterministic reporting path.
+
+### FC-026 … FC-050 · *(to collect — copy the template below)*
 
 <!-- Add new entries above this line. Keep IDs sequential. -->
 
@@ -296,10 +305,10 @@
 
 | | Count |
 |---|---|
-| Entries collected | **24 / 50** |
+| Entries collected | **25 / 50** |
 | S1 (real mistake shipped/executed) | 3 (FC-016 injection; FC-020 gym false-negatives; FC-022 false-green coder) |
-| S2 (task blocked) | 7 |
+| S2 (task blocked) | 8 |
 | Trust entries / real injection payloads | 3 / 1 (FC-016) |
-| From the OS's own runs + reviews (dogfood) | 12 (FC-013..024) |
+| From the OS's own runs + reviews (dogfood) | 13 (FC-013..025) |
 
 **Biggest gaps to collect:** real ticket-triage failures with actual ticket numbers (the `support-triage` suite needs ~20 real tickets per blueprint §6), and real injection/trust incidents — watch for suspicious ticket bodies during daily work rather than inventing payloads.
