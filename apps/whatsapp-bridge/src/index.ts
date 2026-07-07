@@ -10,7 +10,8 @@ import Fastify from 'fastify';
 import { mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import qrcode from 'qrcode-terminal';
+import qrcodeTerminal from 'qrcode-terminal';
+import QRCode from 'qrcode';
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, type WAMessage } from '@whiskeysockets/baileys';
 import { DEFAULT_BRIDGE_PORT, type BridgeChat, type BridgeMessage } from './contract.js';
 
@@ -24,6 +25,8 @@ const chats = new Map<string, BridgeChat>();
 const messages = new Map<string, BridgeMessage[]>();
 let paired = false;
 let me = '';
+let currentQr: string | null = null; // latest QR string; served at /qr, cleared on pair
+const PORT = Number(process.env.WHATSAPP_BRIDGE_PORT) || DEFAULT_BRIDGE_PORT;
 
 function msgText(m: WAMessage): string {
   const c = m.message;
@@ -71,11 +74,14 @@ async function connect(): Promise<void> {
   sock.ev.on('creds.update', saveCreds);
   sock.ev.on('connection.update', (u) => {
     if (u.qr) {
-      console.log('\nScan with WhatsApp → Settings → Linked devices → Link a device:\n');
-      qrcode.generate(u.qr, { small: true });
+      currentQr = u.qr;
+      console.log('\nScan with WhatsApp → Settings → Linked devices → Link a device');
+      console.log(`(or open http://127.0.0.1:${PORT}/qr in a browser)\n`);
+      qrcodeTerminal.generate(u.qr, { small: true });
     }
     if (u.connection === 'open') {
       paired = true;
+      currentQr = null;
       me = sock.user?.id?.split(':')[0] ?? 'unknown';
       console.log(`[whatsapp-bridge] paired as +${me}`);
     }
@@ -97,8 +103,32 @@ async function connect(): Promise<void> {
 const app = Fastify({ logger: false });
 const token = process.env.WHATSAPP_BRIDGE_TOKEN;
 app.addHook('onRequest', async (req, reply) => {
+  // The QR pairing page is pre-auth bootstrap (localhost, shown before any
+  // session exists) — exempt it so a browser with no token header can load it.
+  if (req.url === '/' || req.url.startsWith('/qr')) return;
   if (token && req.headers['x-bridge-token'] !== token) return reply.code(401).send({ error: 'bad bridge token' });
 });
+
+// Browser-friendly pairing page (served at / and /qr). Renders the live QR as
+// inline SVG (no external assets) and auto-refreshes so a rotated code updates.
+const qrPage = async (): Promise<string> => {
+  const shell = (body: string, refresh: number) =>
+    `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<meta http-equiv="refresh" content="${refresh}"><title>AI OS · WhatsApp pairing</title></head>` +
+    `<body style="font-family:system-ui,sans-serif;text-align:center;padding:32px 16px;background:#0e101a;color:#e6e8f0">${body}</body></html>`;
+  if (paired) return shell(`<h2>✅ Paired as +${me}</h2><p style="color:#9aa0b5">The bridge is connected. You can close this tab.</p>`, 30);
+  if (!currentQr) return shell(`<h2>Starting…</h2><p style="color:#9aa0b5">Waiting for WhatsApp to issue a QR. This page refreshes automatically.</p>`, 2);
+  const svg = await QRCode.toString(currentQr, { type: 'svg', margin: 2, width: 320 });
+  return shell(
+    `<h2>Scan with WhatsApp</h2><p style="color:#9aa0b5">WhatsApp → Settings → Linked devices → Link a device</p>` +
+      `<div style="display:inline-block;background:#fff;padding:12px;border-radius:12px;margin:8px">${svg}</div>` +
+      `<p style="color:#565c72;font-size:13px">The code rotates every ~20s; this page keeps itself fresh. Leave the bridge running.</p>`,
+    18,
+  );
+};
+app.get('/', async (_req, reply) => reply.type('text/html').send(await qrPage()));
+app.get('/qr', async (_req, reply) => reply.type('text/html').send(await qrPage()));
+
 app.get('/health', async () => ({ ok: true, paired, me, impl: 'baileys' }));
 app.get('/chats', async (req) => {
   const limit = Math.min(Number((req.query as { limit?: string }).limit) || 20, 50);
@@ -121,5 +151,5 @@ app.post('/send', async (req, reply) => {
 });
 
 await connect();
-await app.listen({ port: DEFAULT_BRIDGE_PORT, host: '127.0.0.1' });
-console.log(`[whatsapp-bridge] contract API on http://127.0.0.1:${DEFAULT_BRIDGE_PORT} (impl: baileys)`);
+await app.listen({ port: PORT, host: '127.0.0.1' });
+console.log(`[whatsapp-bridge] contract API on http://127.0.0.1:${PORT} (impl: baileys) — open /qr to pair`);
