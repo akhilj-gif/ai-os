@@ -31,27 +31,37 @@ export const briefingExecutor: JobExecutor = async (pool, job, ctx) => {
   const sections: string[] = [];
 
   let inboxLine = 'Inbox: unavailable';
-  try {
-    const out = (await registry.get('gmail_list')!.execute({ query: 'in:inbox newer_than:1d', maxResults: 10 }, { pool, taskId: ctx.runId })) as {
-      messages: Array<{ from: string; subject: string; snippet: string }>;
-    };
-    inboxLine = `Inbox: ${out.messages.length} message(s) in the last day`;
-    sections.push(
-      `INBOX (last 24h):\n${out.messages.length === 0 ? '(empty)' : out.messages.map((m) => `- ${m.from} — ${m.subject} :: ${m.snippet.slice(0, 120)}`).join('\n')}`,
-    );
-  } catch (err) {
-    sections.push(`INBOX: unavailable (${err instanceof Error ? err.message.slice(0, 120) : 'error'})`);
+  const gmail = registry.get('gmail_list');
+  if (!gmail) {
+    sections.push('INBOX: unavailable (google pack disabled)');
+  } else {
+    try {
+      const out = (await gmail.execute({ query: 'in:inbox newer_than:1d', maxResults: 10 }, { pool, taskId: ctx.runId })) as {
+        messages: Array<{ from: string; subject: string; snippet: string }>;
+      };
+      inboxLine = `Inbox: ${out.messages.length} message(s) in the last day`;
+      sections.push(
+        `INBOX (last 24h):\n${out.messages.length === 0 ? '(empty)' : out.messages.map((m) => `- ${m.from} — ${m.subject} :: ${m.snippet.slice(0, 120)}`).join('\n')}`,
+      );
+    } catch (err) {
+      sections.push(`INBOX: unavailable (${err instanceof Error ? err.message.slice(0, 120) : 'error'})`);
+    }
   }
 
-  try {
-    const out = (await registry.get('calendar_list')!.execute({}, { pool, taskId: ctx.runId })) as {
-      events: Array<{ summary: string; start: string; end: string; location?: string }>;
-    };
-    sections.push(
-      `CALENDAR (today):\n${out.events.length === 0 ? '(no events)' : out.events.map((e) => `- ${e.start} → ${e.end}: ${e.summary}${e.location ? ` @ ${e.location}` : ''}`).join('\n')}`,
-    );
-  } catch (err) {
-    sections.push(`CALENDAR: unavailable (${err instanceof Error ? err.message.slice(0, 120) : 'error'})`);
+  const calendar = registry.get('calendar_list');
+  if (!calendar) {
+    sections.push('CALENDAR: unavailable (google pack disabled)');
+  } else {
+    try {
+      const out = (await calendar.execute({}, { pool, taskId: ctx.runId })) as {
+        events: Array<{ summary: string; start: string; end: string; location?: string }>;
+      };
+      sections.push(
+        `CALENDAR (today):\n${out.events.length === 0 ? '(no events)' : out.events.map((e) => `- ${e.start} → ${e.end}: ${e.summary}${e.location ? ` @ ${e.location}` : ''}`).join('\n')}`,
+      );
+    } catch (err) {
+      sections.push(`CALENDAR: unavailable (${err instanceof Error ? err.message.slice(0, 120) : 'error'})`);
+    }
   }
 
   try {
@@ -82,7 +92,9 @@ export const briefingExecutor: JobExecutor = async (pool, job, ctx) => {
 export const watchExecutor: JobExecutor = async (pool, job, ctx) => {
   const url = String(job.payload.url ?? '').trim();
   if (!/^https?:\/\//i.test(url)) throw new Error(`watch job "${job.name}" has no valid payload.url`);
-  const page = (await reg(ctx).get('fetch_url')!.execute({ url }, { pool, taskId: ctx.runId })) as { title: string; text: string };
+  const fetchTool = reg(ctx).get('fetch_url');
+  if (!fetchTool) throw new Error('fetch_url unavailable — enable the research pack to run watch jobs');
+  const page = (await fetchTool.execute({ url }, { pool, taskId: ctx.runId })) as { title: string; text: string };
   const hash = createHash('sha256').update(page.text).digest('hex');
   const last = typeof job.state.lastHash === 'string' ? job.state.lastHash : null;
 

@@ -264,7 +264,16 @@
 - **Pass condition:** The eval world is CLOSED: unmocked tools keep their schema but throw `EVAL_UNMOCKED_TOOL`; real execution requires an explicit per-case `realTools` opt-in (rel-003's safePath test). Groq 413 TPM → `INFRA_RATELIMIT` (infra-skip/INCONCLUSIVE, never a behavior verdict). Verified by re-running the full gym: rel-001 green again with no assertion changes.
 - **Eval suite:** the gym itself (runner `registryFor`) — regression-proof: any future tool addition leaves old cases' worlds untouched.
 
-### FC-024 … FC-050 · *(to collect — copy the template below)*
+### FC-024 · A smoke test with an injected future clock silently ate real scheduled jobs
+- **Date:** 2026-07-06 (M9 pack build, spotted while verifying a pack toggle)
+- **Assistant:** AI OS scheduler (`scheduler-smoke.ts` vs the live `jobs` table)
+- **Task (verbatim):** N/A — found because a pack-toggle run-now returned a `missed` row dated in the FUTURE (`2026-07-07 00:00:00`).
+- **What happened:** `scheduler-smoke.ts` ticks with injected clocks (e.g. `now = 2026-07-07T00:00:00Z`) to test daily/missed logic, and namespaces its own jobs `smoketest-*`. But `tick()` claims ALL due jobs, not just the smoke's. So a smoke tick at a fake FUTURE time claimed the user's REAL "Anthropic pricing" watch job (whose real `next_run_at` was now far in the fake past), stamped it `missed` with a future `started_at`, and advanced its `next_run_at` — silently consuming a real scheduled run and leaving a future-dated row that then shadowed `run-now`'s `lastRun` (ordered by `started_at DESC`). The smoke shares the production database; nothing scoped it to its own rows.
+- **Failure mode:** `EVAL` (secondary: `INFRA` — a real automation run was skipped) · **Severity:** S2 · **Frequency:** F2 (every smoke run)
+- **Pass condition:** `tick()` takes an optional `namePrefix`; the smoke's wrapped `tick` always passes `smoketest-`, so an injected clock can only ever touch smoke-owned jobs. Verified: after the fix, a full smoke run leaves **0** future-dated or contaminated rows on real jobs (`SELECT count(*) … WHERE started_at > now() OR (name NOT LIKE 'smoketest-%' AND status='missed')` → 0), and the smoke still passes 31/31. General lesson: a test that shares the production DB must scope every mutating query to its own namespace — an injected clock is a mutation with blast radius.
+- **Eval suite:** the scheduler smoke itself (deterministic, no model).
+
+### FC-025 … FC-050 · *(to collect — copy the template below)*
 
 <!-- Add new entries above this line. Keep IDs sequential. -->
 
@@ -287,10 +296,10 @@
 
 | | Count |
 |---|---|
-| Entries collected | **23 / 50** |
+| Entries collected | **24 / 50** |
 | S1 (real mistake shipped/executed) | 3 (FC-016 injection; FC-020 gym false-negatives; FC-022 false-green coder) |
-| S2 (task blocked) | 6 |
+| S2 (task blocked) | 7 |
 | Trust entries / real injection payloads | 3 / 1 (FC-016) |
-| From the OS's own runs + reviews (dogfood) | 11 (FC-013..023) |
+| From the OS's own runs + reviews (dogfood) | 12 (FC-013..024) |
 
 **Biggest gaps to collect:** real ticket-triage failures with actual ticket numbers (the `support-triage` suite needs ~20 real tickets per blueprint §6), and real injection/trust incidents — watch for suspicious ticket bodies during daily work rather than inventing payloads.

@@ -61,6 +61,7 @@ export default function DashboardPage() {
         <a href="/" style={{ marginLeft: 'auto', fontSize: 13, color: '#9aa0b5' }}>← chat</a>
         <a href="/tasks" style={{ fontSize: 13, color: '#9aa0b5' }}>tasks</a>
         <a href="/automations" style={{ fontSize: 13, color: '#9aa0b5' }}>automations</a>
+        <a href="/packs" style={{ fontSize: 13, color: '#9aa0b5' }}>packs</a>
         <a href="/memory" style={{ fontSize: 13, color: '#9aa0b5' }}>memory</a>
       </header>
 

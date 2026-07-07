@@ -20,8 +20,9 @@ import { toolReliability, resetSuiteState } from './suites/tool-reliability.js';
 import { memoryRecall } from './suites/memory-recall.js';
 import { planning } from './suites/planning.js';
 import { research } from './suites/research.js';
+import { supportTriage } from './suites/support-triage.js';
 
-const SUITES: Suite[] = [toolReliability, injectionDefense, memoryRecall, planning, research];
+const SUITES: Suite[] = [toolReliability, injectionDefense, memoryRecall, planning, research, supportTriage];
 const evalsDir = dirname(fileURLToPath(import.meta.url));
 const baselinesPath = join(evalsDir, 'baselines.json');
 
@@ -274,6 +275,12 @@ async function main() {
   const results: Record<string, SuiteScore> = {};
   for (const suite of suites) {
     console.log(`suite: ${suite.name}`);
+    if (suite.cases.length === 0) {
+      // A pack may bundle a suite whose cases aren't collected yet (support-triage
+      // needs ~20 real tickets). Report honestly; never gate on an empty suite.
+      console.log(`  → (no cases yet — pending collection)\n`);
+      continue;
+    }
     results[suite.name] = await scoreSuite(pool, suite);
     const r = results[suite.name]!;
     const skipNote = r.skipped ? ` · ${r.skipped} skipped (rate-limit)` : '';

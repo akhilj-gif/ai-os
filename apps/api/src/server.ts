@@ -34,9 +34,15 @@ import {
 } from '@ai-os/kernel';
 import { MemoryService } from '@ai-os/memory';
 import { failoverChain } from '@ai-os/model-router';
+import { composeRegistry, packPrompts, loadEnabledPacks, installPack, setPackEnabled, listPacks, PACKS } from '@ai-os/packs';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const memory = new MemoryService(pool);
+// M9: the runtime tool surface is composed from ENABLED capability packs (loaded
+// at boot, refreshed on install/toggle). Kernel-core = workspace only.
+let enabledPacks = new Set<string>();
+const packRegistry = () => composeRegistry(enabledPacks);
+const packPrompt = () => packPrompts(enabledPacks);
 const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', {
   maxRetriesPerRequest: 1,
   lazyConnect: true,
@@ -215,7 +221,8 @@ app.get('/oauth/google/status', async () => {
 // Chat
 // ---------------------------------------------------------------------------
 async function completeChatTask(taskId: string): Promise<void> {
-  const result = await runTask(pool, taskId);
+  // Pack-composed tools + pack prompt fragments; memory stays ON (M9 note in RunTaskOptions).
+  const result = await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true });
   const { rows } = await pool.query<{ session_id: string }>(
     `SELECT session_id FROM messages WHERE task_id = $1 AND role = 'user' LIMIT 1`,
     [taskId],
@@ -290,7 +297,7 @@ app.get('/memory/search', async (req) => {
 app.post('/research', async (req) => {
   const { question } = (req.body ?? {}) as { question?: string };
   if (!question?.trim()) return { error: 'question is required' };
-  return runResearch(pool, { question: question.trim() });
+  return runResearch(pool, { question: question.trim(), registry: packRegistry() });
 });
 
 app.get('/research', async () => {
@@ -379,7 +386,7 @@ app.post('/jobs/:id/run-now', async (req, reply) => {
   const { id } = req.params as { id: string };
   const { rowCount } = await pool.query(`UPDATE jobs SET next_run_at=now(), updated_at=now() WHERE id=$1 AND enabled`, [id]);
   if (!rowCount) return reply.code(404).send({ error: 'no such enabled job' });
-  const report = await tick(pool, { executors: defaultExecutors() });
+  const report = await tick(pool, { executors: defaultExecutors(), registry: packRegistry() });
   const { rows } = await pool.query(`SELECT status, error, output FROM job_runs WHERE job_id=$1 ORDER BY started_at DESC LIMIT 1`, [id]);
   return { report, lastRun: rows[0] ?? null };
 });
@@ -446,6 +453,33 @@ app.get('/dashboard', async () => {
   };
 });
 
+// ---------------------------------------------------------------------------
+// M9 Capability Packs (ADR-0012): manifests live in code; install state in DB.
+// Install applies bundled policies + seeds procedural memories (provenance = the
+// install task); enable/disable changes the composed tool surface immediately.
+// ---------------------------------------------------------------------------
+app.get('/packs', async () => ({ packs: await listPacks(pool) }));
+
+app.post('/packs/:name/install', async (req, reply) => {
+  const { name } = req.params as { name: string };
+  if (!PACKS[name]) return reply.code(404).send({ error: `unknown pack "${name}"` });
+  const result = await installPack(pool, name);
+  enabledPacks = await loadEnabledPacks(pool);
+  trace.recordSafe({ traceId: req.traceId, taskId: result.installTaskId, component: 'packs', event: 'pack.installed', payload: { name, version: result.version } });
+  return result;
+});
+
+app.put('/packs/:name', async (req, reply) => {
+  const { name } = req.params as { name: string };
+  const { enabled } = (req.body ?? {}) as { enabled?: boolean };
+  if (typeof enabled !== 'boolean') return reply.code(400).send({ error: 'enabled (boolean) is required' });
+  const ok = await setPackEnabled(pool, name, enabled);
+  if (!ok) return reply.code(404).send({ error: 'pack not installed' });
+  enabledPacks = await loadEnabledPacks(pool);
+  trace.recordSafe({ traceId: req.traceId, component: 'packs', event: enabled ? 'pack.enabled' : 'pack.disabled', payload: { name } });
+  return { name, enabled };
+});
+
 app.get('/tasks/:id/trace', async (req, reply) => {
   const { id } = req.params as { id: string };
   const task = (await pool.query(`SELECT id, goal, status, spent, trace_id, created_at, updated_at FROM tasks WHERE id=$1`, [id])).rows[0];
@@ -495,7 +529,7 @@ app.put('/policies/:tool', async (req, reply) => {
 app.post('/plan', async (req) => {
   const { text } = (req.body ?? {}) as { text?: string };
   if (!text?.trim()) return { error: 'text is required' };
-  return planAndStart(pool, { goal: text.trim() });
+  return planAndStart(pool, { goal: text.trim(), registry: packRegistry() });
 });
 
 app.get('/tasks', async () => {
@@ -527,7 +561,7 @@ app.post('/tasks/:id/pause', async (req) => {
 
 app.post('/tasks/:id/resume', async (req) => {
   const { id } = req.params as { id: string };
-  return resumeTask(pool, id);
+  return resumeTask(pool, id, { registry: packRegistry() });
 });
 
 app.post('/tasks/:id/redirect', async (req) => {
@@ -544,13 +578,15 @@ app.post('/tasks/:id/approve', async (req) => {
   if (!stepId || (decision !== 'approved' && decision !== 'rejected')) {
     return { error: 'stepId and decision (approved|rejected) are required' };
   }
-  return decideApproval(pool, id, stepId, decision, note);
+  return decideApproval(pool, id, stepId, decision, note, { registry: packRegistry() });
 });
 
 // ---------------------------------------------------------------------------
 // Boot: resume tasks orphaned by a mid-run kill (M1 exit criterion)
 // ---------------------------------------------------------------------------
 const port = Number(process.env.API_PORT ?? 4000);
+enabledPacks = await loadEnabledPacks(pool); // before listen: routes + resume + scheduler all compose from it
+app.log.info({ packs: [...enabledPacks] }, 'capability packs enabled');
 await app.listen({ port, host: '127.0.0.1' });
 
 void (async () => {
@@ -562,7 +598,7 @@ void (async () => {
     const isGraph = (await pool.query(`SELECT 1 FROM steps WHERE task_id=$1 AND local_id IS NOT NULL LIMIT 1`, [taskId])).rowCount ?? 0;
     app.log.info({ taskId, isGraph: !!isGraph }, 'resuming orphaned task');
     trace.recordSafe({ traceId: newTraceId(), taskId, component: 'api', event: 'task.resume_on_boot', payload: { graph: !!isGraph } });
-    const p = isGraph ? runGraph(pool, taskId) : completeChatTask(taskId);
+    const p = isGraph ? runGraph(pool, taskId, { registry: packRegistry() }) : completeChatTask(taskId);
     Promise.resolve(p).catch((err) => app.log.error({ err, taskId }, 'orphan resume failed'));
   }
 })();
@@ -572,5 +608,6 @@ void (async () => {
 // first tick (the jobs analog of the orphan-resume above).
 startScheduler(pool, {
   executors: defaultExecutors(),
+  registry: packRegistry, // factory — pack toggles apply to future ticks without restart
   onTick: (r) => app.log.info({ claimed: r.claimed, reaped: r.reaped, missed: r.missed, ran: r.ran }, 'scheduler tick'),
 });

@@ -8,7 +8,7 @@ import pg from 'pg';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'node:url';
 dotenv.config({ path: fileURLToPath(new URL('../../../.env', import.meta.url)) });
-import { computeNextRun, createJob, tick, type JobExecutor } from './scheduler.js';
+import { computeNextRun, createJob, tick as rawTick, type JobExecutor } from './scheduler.js';
 import { watchExecutor } from './jobs.js';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
@@ -18,6 +18,10 @@ const check = (name: string, ok: boolean, extra = '') => {
   if (!ok) fail++;
 };
 const P = 'smoketest-'; // all rows namespaced for cleanup
+// FC-024: every tick here is scoped to smoketest- jobs. An injected FUTURE clock
+// (e.g. 2026-07-07) would otherwise claim the user's REAL jobs, stamp them
+// `missed` with a future timestamp, and silently skip their real runs.
+const tick: typeof rawTick = (poolArg, opts = {}) => rawTick(poolArg, { namePrefix: P, ...opts });
 await pool.query(`DELETE FROM jobs WHERE name LIKE $1`, [P + '%']); // stale runs cascade
 
 // ---------------------------------------------------------------- computeNextRun

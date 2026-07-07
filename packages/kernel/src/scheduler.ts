@@ -103,6 +103,11 @@ export interface TickOptions {
   now?: Date;
   executors?: Record<string, JobExecutor>;
   registry?: unknown;
+  /** Test isolation (FC-024): when set, this tick sees ONLY jobs whose name starts
+   *  with the prefix. Smokes tick with injected clocks against the shared jobs
+   *  table — without this scoping, a fake future `now` claims REAL jobs, marks
+   *  them missed with future timestamps, and silently skips their real runs. */
+  namePrefix?: string;
 }
 
 const isInfra = (msg: string) => /INFRA_RATELIMIT|INFRA_NETWORK|quota|rate.?limit|\b429\b/i.test(msg);
@@ -113,11 +118,13 @@ export async function tick(pool: pg.Pool, opts: TickOptions = {}): Promise<TickR
   const trace = new TraceStore(pool);
   const report: TickReport = { reaped: 0, claimed: 0, ran: [], missed: [], skippedRunning: [] };
 
+  const prefix = opts.namePrefix ? `${opts.namePrefix}%` : '%';
+
   // 1. Reap zombie runs so a crashed process can't wedge its job forever.
   const reaped = await pool.query(
-    `UPDATE job_runs SET status='failed', finished_at=$1, error='zombie: process died mid-run (reaped by scheduler)'
-     WHERE status='running' AND started_at < $2 RETURNING job_id`,
-    [now, new Date(now.getTime() - ZOMBIE_MS)],
+    `UPDATE job_runs r SET status='failed', finished_at=$1, error='zombie: process died mid-run (reaped by scheduler)'
+     FROM jobs j WHERE j.id = r.job_id AND j.name LIKE $3 AND r.status='running' AND r.started_at < $2 RETURNING r.job_id`,
+    [now, new Date(now.getTime() - ZOMBIE_MS), prefix],
   );
   report.reaped = reaped.rowCount ?? 0;
 
@@ -130,10 +137,10 @@ export async function tick(pool: pg.Pool, opts: TickOptions = {}): Promise<TickR
     const due = await client.query<JobRow & { running_count: string }>(
       `SELECT j.*, (SELECT count(*) FROM job_runs r WHERE r.job_id = j.id AND r.status='running') AS running_count
        FROM jobs j
-       WHERE j.enabled AND j.next_run_at IS NOT NULL AND j.next_run_at <= $1
+       WHERE j.enabled AND j.next_run_at IS NOT NULL AND j.next_run_at <= $1 AND j.name LIKE $2
        ORDER BY j.next_run_at
        FOR UPDATE OF j SKIP LOCKED`,
-      [now],
+      [now, prefix],
     );
     for (const job of due.rows) {
       if (Number(job.running_count) > 0) {
@@ -222,17 +229,19 @@ export async function tick(pool: pg.Pool, opts: TickOptions = {}): Promise<TickR
   return report;
 }
 
-/** Production entry: poll-tick forever. Returns a stop function. */
+/** Production entry: poll-tick forever. Returns a stop function. `registry` may be
+ *  a FACTORY — resolved fresh each tick, so pack enable/disable (M9) applies to
+ *  future runs without a restart. */
 export function startScheduler(
   pool: pg.Pool,
-  opts: { intervalMs?: number; executors: Record<string, JobExecutor>; registry?: unknown; onTick?: (r: TickReport) => void },
+  opts: { intervalMs?: number; executors: Record<string, JobExecutor>; registry?: unknown | (() => unknown); onTick?: (r: TickReport) => void },
 ): () => void {
   const intervalMs = opts.intervalMs ?? Number(process.env.SCHEDULER_POLL_MS ?? 30_000);
   let running = false;
   const timer = setInterval(() => {
     if (running) return; // a slow tick must not stack another on top
     running = true;
-    tick(pool, { executors: opts.executors, registry: opts.registry })
+    tick(pool, { executors: opts.executors, registry: typeof opts.registry === 'function' ? (opts.registry as () => unknown)() : opts.registry })
       .then((r) => {
         if (r.claimed || r.reaped || r.missed.length) opts.onTick?.(r);
       })

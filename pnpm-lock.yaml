@@ -39,6 +39,9 @@ importers:
       '@ai-os/model-router':
         specifier: workspace:*
         version: link:../../packages/model-router
+      '@ai-os/packs':
+        specifier: workspace:*
+        version: link:../../packages/packs
       '@ai-os/shared':
         specifier: workspace:*
         version: link:../../packages/shared
@@ -151,6 +154,21 @@ importers:
       langfuse:
         specifier: ^3.38.20
         version: 3.38.20
+
+  packages/packs:
+    dependencies:
+      '@ai-os/memory':
+        specifier: workspace:*
+        version: link:../memory
+      '@ai-os/shared':
+        specifier: workspace:*
+        version: link:../shared
+      '@ai-os/tools':
+        specifier: workspace:*
+        version: link:../tools
+      pg:
+        specifier: ^8.22.0
+        version: 8.22.0
 
   packages/scheduler:
     dependencies:

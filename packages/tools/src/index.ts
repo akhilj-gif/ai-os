@@ -14,6 +14,15 @@ export { GoogleNotConnectedError, getGoogleAccessToken, googleApi } from './goog
 export { todayRange } from './tools/calendar.js';
 export { type SandboxRunner, type SandboxSpec, type SandboxResult, notImplementedSandbox } from './sandbox.js';
 export { DockerSandbox, dockerSandbox } from './docker-sandbox.js';
+// Individual tool defs — capability packs (M9, @ai-os/packs) group these into
+// installable manifests; buildRegistry() below remains the ALL-tools builder
+// (used by the eval gym, whose closed world stubs whatever a case doesn't mock).
+export { webSearch } from './tools/web-search.js';
+export { fetchUrl } from './tools/fetch-url.js';
+export { workspaceList, workspaceRead, workspaceWrite } from './tools/workspace.js';
+export { gmailList, gmailRead, gmailCreateDraft } from './tools/gmail.js';
+export { calendarList } from './tools/calendar.js';
+export { codeExec } from './tools/code-exec.js';
 
 export function buildRegistry(): ToolRegistry {
   const registry = new ToolRegistry();

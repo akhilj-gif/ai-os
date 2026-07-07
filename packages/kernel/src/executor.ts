@@ -59,11 +59,18 @@ export interface TaskRunResult {
 }
 
 export interface RunTaskOptions {
-  /** Override the tool registry — used by the eval gym to inject mocked tools. */
+  /** Override the tool registry — the eval gym injects mocked tools; the API
+   *  passes the pack-composed registry (M9). NOTE: passing a registry disables
+   *  memory injection unless enableMemory is also set — runtime callers must
+   *  pass enableMemory: true. */
   registry?: ToolRegistry;
-  /** Force memory-context injection even under a mocked registry — the
-   *  memory-recall eval suite needs it (normally injection is off during evals). */
+  /** Force memory-context injection even under a passed registry — the
+   *  memory-recall eval suite needs it, and so does the runtime API (M9). */
   enableMemory?: boolean;
+  /** Extra system-prompt fragment appended after the kernel prompt — enabled
+   *  capability packs contribute theirs here (M9). Domain text stays out of
+   *  the kernel; this is just the seam. */
+  extraSystem?: string;
 }
 
 /** Run (or resume) a task to completion. Idempotent on restart. */
@@ -101,7 +108,7 @@ export async function runTask(
       }
     }
     messages = [
-      { role: 'system', content: memoryBlock ? `${systemPrompt()}\n\n${memoryBlock}` : systemPrompt() },
+      { role: 'system', content: [systemPrompt(), opts.extraSystem, memoryBlock].filter(Boolean).join('\n\n') },
       { role: 'user', content: task.goal },
     ];
     await trace.record({ traceId, taskId, component: 'kernel', event: 'task.started', payload: { memoryInjected: memoryBlock.length > 0 } });
