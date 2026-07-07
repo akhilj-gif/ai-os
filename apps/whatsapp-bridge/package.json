@@ -1,0 +1,23 @@
+{
+  "name": "@ai-os/whatsapp-bridge",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "mock": "tsx src/mock.ts"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc13",
+    "fastify": "^5.9.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@ai-os/packs": "workspace:*",
+    "@ai-os/tools": "workspace:*",
+    "@ai-os/trust": "workspace:*",
+    "@types/qrcode-terminal": "^0.12.2",
+    "dotenv": "^17.4.2",
+    "pg": "^8.22.0"
+  }
+}

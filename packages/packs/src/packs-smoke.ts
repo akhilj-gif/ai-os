@@ -32,7 +32,9 @@ check('pack prompt fragments compose (stable, labeled)', prompt.includes('[codin
 console.log('\n— install state (DB) —');
 const enabled0 = await loadEnabledPacks(pool);
 check('migration seeded google+research+coding enabled', ['google', 'research', 'coding'].every((p) => enabled0.has(p)), [...enabled0].join(','));
-check('support-ops NOT pre-installed (reserved for the live install demo)', !enabled0.has('support-ops'));
+// Snapshot: support-ops may or may not be installed (the live API demo installs
+// it for real). The install test below must RESTORE this state, never assume it.
+const supportOpsWasInstalled = enabled0.has('support-ops');
 
 await setPackEnabled(pool, 'google', false);
 const enabledOff = await loadEnabledPacks(pool);
@@ -56,12 +58,17 @@ check('re-install never re-applies policies over user edits', rr1.policiesApplie
 const rows = await pool.query(`SELECT count(*) FROM capability_packs WHERE name='research'`);
 check('re-install keeps a single row', Number(rows.rows[0].count) === 1);
 
-// cleanup: leave the DB as found — support-ops install happens LIVE via the API demo
-await pool.query(`DELETE FROM memory_records WHERE tags @> ARRAY['pack:support-ops']`);
-await pool.query(`DELETE FROM capability_packs WHERE name='support-ops'`);
-await pool.query(`DELETE FROM tasks WHERE id=$1`, [r1.installTaskId]);
+// cleanup: RESTORE the pre-smoke world (never assume it). If support-ops was
+// installed before (the live API demo is real state), keep it installed —
+// installPack above was an idempotent re-install. If it wasn't, remove our test
+// install completely.
+if (!supportOpsWasInstalled) {
+  await pool.query(`DELETE FROM memory_records WHERE tags @> ARRAY['pack:support-ops']`);
+  await pool.query(`DELETE FROM capability_packs WHERE name='support-ops'`);
+  await pool.query(`DELETE FROM tasks WHERE id=$1`, [r1.installTaskId]);
+}
 const enabledEnd = await loadEnabledPacks(pool);
-check('cleanup: back to the seeded three', enabledEnd.size === 3 && !enabledEnd.has('support-ops'));
+check('cleanup: world restored to its pre-smoke state', enabledEnd.has('support-ops') === supportOpsWasInstalled, [...enabledEnd].join(','));
 
 console.log(`\n${fail === 0 ? 'ALL PASS' : fail + ' FAILED'}`);
 await pool.end();

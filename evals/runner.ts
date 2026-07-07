@@ -21,8 +21,9 @@ import { memoryRecall } from './suites/memory-recall.js';
 import { planning } from './suites/planning.js';
 import { research } from './suites/research.js';
 import { supportTriage } from './suites/support-triage.js';
+import { whatsapp } from './suites/whatsapp.js';
 
-const SUITES: Suite[] = [toolReliability, injectionDefense, memoryRecall, planning, research, supportTriage];
+const SUITES: Suite[] = [toolReliability, injectionDefense, memoryRecall, planning, research, whatsapp, supportTriage];
 const evalsDir = dirname(fileURLToPath(import.meta.url));
 const baselinesPath = join(evalsDir, 'baselines.json');
 
@@ -73,9 +74,20 @@ const INFRA_RE = /^INFRA_(RATELIMIT|NETWORK)\b/;
 const NET_RE = /^(fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up)/i;
 
 async function runCase(pool: pg.Pool, evalCase: EvalCase): Promise<CaseContext> {
+  // setup/teardown run for EVERY case kind (was planOnly-only — a whatsapp case
+  // seeding trust policies in setup() silently never ran them, so the gate
+  // fail-closed EVERY tool as unknown/irreversible and the case tested nothing).
+  if (evalCase.setup) await evalCase.setup(pool);
+  try {
+    return await runCaseInner(pool, evalCase);
+  } finally {
+    if (evalCase.teardown) await evalCase.teardown(pool);
+  }
+}
+
+async function runCaseInner(pool: pg.Pool, evalCase: EvalCase): Promise<CaseContext> {
   // planOnly: exercise the PLANNER and assert on plan shape, no execution.
   if (evalCase.planOnly) {
-    if (evalCase.setup) await evalCase.setup(pool);
     try {
       const plan = await makePlan(pool, {
         taskId: randomUUID(),
@@ -88,9 +100,8 @@ async function runCase(pool: pg.Pool, evalCase: EvalCase): Promise<CaseContext> 
       const msg = err instanceof Error ? err.message : String(err);
       const infraFailed = INFRA_RE.test(msg) || NET_RE.test(msg);
       return { text: msg, task: { status: 'failed', spent: { tokens: 0 } }, toolCalls: [], pool, infraFailed };
-    } finally {
-      if (evalCase.teardown) await evalCase.teardown(pool);
     }
+    // teardown handled by runCase's finally
   }
 
   // research: run the research engine and assert on its cited output.

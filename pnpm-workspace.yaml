@@ -3,6 +3,10 @@ packages:
   - apps/*
   - evals
 allowBuilds:
+  # false = never run their install scripts. The WhatsApp bridge boots and
+  # reaches the QR pairing step without them (verified 2026-07-07).
+  '@whiskeysockets/baileys': false
   esbuild: true
+  protobufjs: false
   sharp: true
   unrs-resolver: true

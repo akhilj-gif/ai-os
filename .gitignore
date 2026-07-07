@@ -5,3 +5,4 @@ dist/
 *.tsbuildinfo
 evals/reports/
 workspaces/
+apps/whatsapp-bridge/.auth/
