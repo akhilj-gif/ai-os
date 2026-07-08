@@ -6,6 +6,10 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm --parallel --filter @ai-os/api --filter @ai-os/web dev",
+    "os:up": "tsx scripts/up.ts",
+    "os:down": "tsx scripts/down.ts",
+    "os:status": "tsx scripts/status.ts",
+    "os:logs": "pm2 logs",
     "db:migrate": "tsx infra/migrate.ts",
     "eval": "tsx evals/runner.ts",
     "reflect": "tsx packages/memory/src/reflect-job.ts",
@@ -13,9 +17,10 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@types/node": "^26.0.1",
+    "@types/node": "^26.1.0",
     "@types/pg": "^8.20.0",
-    "tsx": "^4.22.4",
+    "pm2": "^7.0.3",
+    "tsx": "^4.23.0",
     "typescript": "^6.0.3"
   },
   "dependencies": {

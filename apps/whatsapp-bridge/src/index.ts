@@ -142,6 +142,7 @@ function loadStore(): void {
 let paired = false;
 let me = '';
 let currentQr: string | null = null; // latest QR string; served at /qr, cleared on pair
+let needsRepair = false; // WhatsApp invalidated the session (logout) — a human must re-scan
 const PORT = Number(process.env.WHATSAPP_BRIDGE_PORT) || DEFAULT_BRIDGE_PORT;
 
 function msgText(m: WAMessage): string {
@@ -213,6 +214,7 @@ async function connect(): Promise<void> {
     }
     if (u.connection === 'open') {
       paired = true;
+      needsRepair = false; // a good connection clears any prior logout flag
       currentQr = null;
       me = sock.user?.id?.split(':')[0] ?? 'unknown';
       console.log(`[whatsapp-bridge] paired as +${me}`);
@@ -221,8 +223,12 @@ async function connect(): Promise<void> {
       paired = false;
       const code = (u.lastDisconnect?.error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode;
       if (code === DisconnectReason.loggedOut) {
-        console.error('[whatsapp-bridge] logged out — delete .auth/ and re-pair');
-        return; // reconnecting would only loop on an invalid session
+        // WhatsApp invalidated the session. Do NOT die and do NOT reconnect-loop:
+        // stay up, keep serving CACHED chats from the store, and flag needsRepair so
+        // `pnpm status` / the dashboard surfaces "re-pair needed" instead of silence.
+        needsRepair = true;
+        console.error('[whatsapp-bridge] logged out — RE-PAIR NEEDED: open /qr and re-scan (cached reads still served)');
+        return;
       }
       // Everything else — including 515 restart-required, which Baileys ALWAYS
       // emits right after a successful pairing — means reconnect. Use the saved
@@ -279,7 +285,7 @@ const qrPage = async (): Promise<string> => {
 app.get('/', async (_req, reply) => reply.type('text/html').send(await qrPage()));
 app.get('/qr', async (_req, reply) => reply.type('text/html').send(await qrPage()));
 
-app.get('/health', async () => ({ ok: true, paired, me, impl: 'baileys' }));
+app.get('/health', async () => ({ ok: true, paired, needsRepair, me, impl: 'baileys' }));
 app.get('/chats', async (req) => {
   const { limit: limitRaw, search } = req.query as { limit?: string; search?: string };
   const limit = Math.min(Number(limitRaw) || 20, 200);

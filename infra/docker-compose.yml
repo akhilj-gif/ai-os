@@ -3,6 +3,7 @@ name: ai-os
 services:
   postgres:
     image: pgvector/pgvector:pg16
+    restart: unless-stopped
     ports:
       - "5432:5432"
     environment:
@@ -19,6 +20,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
       - "6379:6379"
     healthcheck:
@@ -31,6 +33,7 @@ services:
   # Dev-only credentials — headless-initialized so SDK keys work with zero UI setup.
   langfuse:
     image: langfuse/langfuse:2
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy

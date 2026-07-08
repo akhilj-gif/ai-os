@@ -94,7 +94,7 @@ app.get('/health', async () => {
     services.langfuse = 'unreachable';
   }
   const ok = services.postgres === 'ok' && services.redis === 'ok';
-  return { ok, milestone: 'M8', services };
+  return { ok, milestone: 'M10', services };
 });
 
 // M8 settings: which providers/models the router will use, in failover order
