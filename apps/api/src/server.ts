@@ -123,7 +123,7 @@ app.get('/system/models', async () => {
 app.post('/hello', async () => runHelloWorldTask(pool));
 
 // ---------------------------------------------------------------------------
-// Google OAuth (Gmail readonly + compose(drafts) + Calendar readonly)
+// Google OAuth (Gmail readonly + compose(drafts) + Calendar readonly + events write)
 // ---------------------------------------------------------------------------
 const GOOGLE_SCOPES = [
   'openid',
@@ -131,6 +131,11 @@ const GOOGLE_SCOPES = [
   'https://www.googleapis.com/auth/gmail.readonly',
   'https://www.googleapis.com/auth/gmail.compose',
   'https://www.googleapis.com/auth/calendar.readonly',
+  // calendar.events (not the broader 'calendar' scope) — least privilege for
+  // calendar_create_event: can create/edit/delete events, cannot touch calendar
+  // settings/sharing. A refresh token issued under the OLD scope list does NOT
+  // gain this automatically — the user must re-run /oauth/google to re-consent.
+  'https://www.googleapis.com/auth/calendar.events',
 ];
 const pendingOAuthStates = new Set<string>();
 

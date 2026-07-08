@@ -493,32 +493,47 @@ async function chatOn(provider: Provider, model: string, input: ChatInput, retry
   });
 
   try {
-    const res = await fetchWithRateLimitRetry(
-      `${provider.baseURL}/chat/completions`,
-      provider.apiKeys,
-      (apiKey) => ({
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          max_tokens: input.maxTokens ?? 2048,
-          messages: input.messages,
-          ...(input.tools?.length
-            ? {
-                tools: input.tools.map((t) => ({
-                  type: 'function',
-                  function: { name: t.name, description: t.description, parameters: t.inputSchema },
-                })),
-              }
-            : {}),
+    const doFetch = () =>
+      fetchWithRateLimitRetry(
+        `${provider.baseURL}/chat/completions`,
+        provider.apiKeys,
+        (apiKey) => ({
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model,
+            max_tokens: input.maxTokens ?? 2048,
+            messages: input.messages,
+            ...(input.tools?.length
+              ? {
+                  tools: input.tools.map((t) => ({
+                    type: 'function',
+                    function: { name: t.name, description: t.description, parameters: t.inputSchema },
+                  })),
+                }
+              : {}),
+          }),
         }),
-      }),
-      `${provider.name}/${model}`,
-      retryRounds,
-    );
+        `${provider.name}/${model}`,
+        retryRounds,
+      );
+
+    let res = await doFetch();
+    // Groq/gpt-oss occasionally emits its tool call as inline pseudo-syntax
+    // (`<function=name{...}>`) instead of a proper tool_calls entry, which Groq's
+    // own API then rejects as a 400 "tool_use_failed" — a generation-formatting
+    // flake, not a real error: confirmed non-deterministic (retrying the identical
+    // request succeeds). Costs one extra call, only when tools were offered.
+    if (!res.ok && res.status === 400 && input.tools?.length) {
+      const body = await res.clone().text();
+      if (/tool_use_failed/i.test(body)) {
+        console.warn(`[model-router] ${provider.name}/${model}: tool_use_failed (malformed tool-call generation) — retrying once`);
+        res = await doFetch();
+      }
+    }
     if (!res.ok) throwHttp(provider, res.status, await res.text());
     const data = (await res.json()) as {
       choices?: Array<{ message?: ChatMessage }>;

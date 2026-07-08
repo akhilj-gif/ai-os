@@ -85,3 +85,53 @@ export const calendarList: ToolDef = {
     };
   },
 };
+
+// Creates a REAL event on the user's calendar — undoable (delete/edit in Google
+// Calendar) but visible to anyone invited, so it is approval-gated (trust_policies:
+// write, auto_approve=false — see migration 0012). Non-auto tools are queued for the
+// user's one-click approval by the executor BEFORE the structural untrusted-content
+// gate is ever consulted, so this reliably fires even in a task that already read
+// calendar_list/gmail_list (which is the normal, expected order of operations).
+export const calendarCreateEvent: ToolDef = {
+  name: 'calendar_create_event',
+  description:
+    "Propose a new event on the user's primary Google Calendar. This is NOT auto-approved — it is queued for the user's explicit one-click approval and only actually created once they approve.",
+  inputSchema: {
+    type: 'object',
+    properties: {
+      summary: { type: 'string', description: 'Event title' },
+      start: { type: 'string', description: 'ISO 8601 start datetime, e.g. 2026-07-10T09:45:00+05:30' },
+      end: { type: 'string', description: 'ISO 8601 end datetime. If omitted, defaults to 30 minutes after start.' },
+      attendees: { type: 'array', items: { type: 'string' }, description: 'Attendee email addresses (optional)' },
+      location: { type: 'string' },
+      description: { type: 'string' },
+    },
+    required: ['summary', 'start'],
+  },
+  async execute(args, ctx) {
+    const tz = process.env.AIOS_TZ ?? 'Asia/Kolkata';
+    const summary = String(args.summary ?? '').trim();
+    const start = String(args.start ?? '').trim();
+    if (!summary || !start) throw new Error('summary and start are required');
+    const startMs = Date.parse(start);
+    if (Number.isNaN(startMs)) throw new Error(`start is not a valid ISO datetime: "${start}"`);
+    const end = typeof args.end === 'string' && args.end ? args.end : new Date(startMs + 30 * 60_000).toISOString();
+    const attendees = Array.isArray(args.attendees)
+      ? (args.attendees as unknown[]).filter((a): a is string => typeof a === 'string').map((email) => ({ email }))
+      : undefined;
+
+    const created = await googleApi<{ id: string; htmlLink?: string }>(ctx.pool, CAL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        summary,
+        start: { dateTime: start, timeZone: tz },
+        end: { dateTime: end, timeZone: tz },
+        ...(attendees ? { attendees } : {}),
+        ...(typeof args.location === 'string' ? { location: args.location } : {}),
+        ...(typeof args.description === 'string' ? { description: args.description } : {}),
+      }),
+    });
+    return { eventId: created.id, htmlLink: created.htmlLink, summary, start, end };
+  },
+};

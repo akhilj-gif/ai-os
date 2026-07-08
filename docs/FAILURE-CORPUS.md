@@ -282,7 +282,25 @@
 - **Pass condition:** The gate loop guards missing results (`const r = results[suite.name]; if (!r) continue`) so an empty bundled suite gates on nothing and can't crash the tail. Verified by the very next run: support-triage empty AND the run reached exit 0 with `BASELINE REFRESHED → 6 suites — all green`. General lesson: a completed measurement must survive the reporting code — the tail that writes/compares results must never be able to throw on a shape the scoring loop already tolerated. (Also added a deliberate `EVAL_REFRESH_BASELINE=1`, cleanliness-gated, so a stale baseline can be refreshed without hand-editing.)
 - **Eval suite:** the gym itself (`runner.ts`) — deterministic reporting path.
 
-### FC-026 … FC-050 · *(to collect — copy the template below)*
+### FC-026 · No tool existed to actually schedule a meeting
+- **Date:** 2026-07-09 (Akhil: "when i tried to schedule meeting, it is not working")
+- **Assistant:** AI OS chat (google pack)
+- **Task (verbatim):** "there is a meeting with mukundh at 9.45 fix that" / "i am giving you full access and full powers to you schedule the meeting as i dont want to do it on my own"
+- **What happened:** The google pack only ever shipped `calendar_list` (read) — no write tool existed at all, so no request could ever create a real event. The model correctly refused but described the reason as "trust restrictions" / "safety measure", which is misleading — the true reason was a missing capability, not a policy decision. Separately, while attempting simple date arithmetic ("tomorrow"), the model repeatedly called `code_exec` (also auto-write-class) purely to compute a date, and every attempt was refused by the structural gate because untrusted content (the just-read inbox/calendar) was already in context — wasting several iterations before giving up, even though the current date was already provided in the system prompt.
+- **Failure mode:** `TOOL-GAP` (secondary: `PLAN`) · **Severity:** S2 · **Frequency:** F2
+- **Pass condition:** A real `calendar_create_event` tool exists, is reachable even after reading calendar/inbox content in the same task, and the model does date arithmetic itself instead of reaching for a sandboxed tool.
+- **Eval suite:** `tool-reliability` (a future case: "propose then approve a calendar event without a false capability excuse")
+
+### FC-027 · A tool-call failure in history biased a later, unrelated tool call
+- **Date:** 2026-07-09 (found while verifying the FC-026 fix, immediately after adding chat conversation memory)
+- **Assistant:** AI OS chat (multi-turn, post chat-memory fix)
+- **Task (verbatim):** "Check my calendar for tomorrow and list events." — asked in the SAME session shortly after an earlier `calendar_create_event` approval had failed with a real Google 403 (missing OAuth scope).
+- **What happened:** The model answered "I am unable to access your Google Calendar... re-authenticate" WITHOUT calling `calendar_list` at all (confirmed: zero tool_calls recorded for that task). `calendar_list` was independently verified working during this same investigation. The model over-generalized from the EARLIER failure's text (which mentioned "insufficient authentication scopes") now sitting in its own conversation history, and assumed all calendar access was broken rather than just retrying the read. Separately and non-deterministically, the same class of question also triggered `tool_use_failed` (Groq/gpt-oss emitting a malformed `<function=...>` pseudo-call instead of a real tool_calls entry) on two of three attempts — confirmed non-deterministic, since retrying the identical request succeeded.
+- **Failure mode:** `MEM` (secondary: `TOOL-REL`) · **Severity:** S3 · **Frequency:** F3 (needs a prior real tool failure in the same thread)
+- **Pass condition:** A past tool failure in history should not stop the model from re-attempting the SAME tool later absent a new signal that it's still broken. `tool_use_failed` should not surface as a task failure when a same-request retry would succeed.
+- **Eval suite:** `memory-recall` (new case needed) / `tool-reliability` (`tool_use_failed` retry)
+
+### FC-028 … FC-050 · *(to collect — copy the template below)*
 
 <!-- Add new entries above this line. Keep IDs sequential. -->
 
@@ -305,10 +323,10 @@
 
 | | Count |
 |---|---|
-| Entries collected | **25 / 50** |
+| Entries collected | **27 / 50** |
 | S1 (real mistake shipped/executed) | 3 (FC-016 injection; FC-020 gym false-negatives; FC-022 false-green coder) |
-| S2 (task blocked) | 8 |
+| S2 (task blocked) | 9 |
 | Trust entries / real injection payloads | 3 / 1 (FC-016) |
-| From the OS's own runs + reviews (dogfood) | 13 (FC-013..025) |
+| From the OS's own runs + reviews (dogfood) | 15 (FC-013..027) |
 
 **Biggest gaps to collect:** real ticket-triage failures with actual ticket numbers (the `support-triage` suite needs ~20 real tickets per blueprint §6), and real injection/trust incidents — watch for suspicious ticket bodies during daily work rather than inventing payloads.

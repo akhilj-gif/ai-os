@@ -19,6 +19,7 @@ import {
   gmailRead,
   gmailCreateDraft,
   calendarList,
+  calendarCreateEvent,
   codeExec,
   whatsappListChats,
   whatsappReadMessages,
@@ -52,21 +53,32 @@ export const PACKS: Record<string, CapabilityPack> = {
   google: {
     name: 'google',
     version: '1.0.0',
-    description: 'Gmail (read + draft-only) and Google Calendar (read). The morning briefing reads through this pack.',
-    tools: [gmailList, gmailRead, gmailCreateDraft, calendarList],
+    description: 'Gmail (read + draft-only) and Google Calendar (read + propose-event). The morning briefing reads through this pack.',
+    tools: [gmailList, gmailRead, gmailCreateDraft, calendarList, calendarCreateEvent],
     prompt:
-      'Gmail and Calendar are connected. Email drafts are created with gmail_create_draft and are NEVER sent automatically — the user reviews and sends them in Gmail.',
+      'Gmail and Calendar are connected. Email drafts are created with gmail_create_draft and are NEVER sent automatically — the user reviews and sends them in Gmail. To schedule a meeting, CALL calendar_create_event with summary/start/end — do not just describe the event in prose or ask the user to create it themselves. The system automatically QUEUES every calendar_create_event call for the user\'s one-click approval before it is actually created, so make the tool call, then tell the user it is awaiting their approval.',
     policies: [
       { tool: 'gmail_list', trustClass: 'read', autoApprove: true },
       { tool: 'gmail_read', trustClass: 'read', autoApprove: true },
       { tool: 'gmail_create_draft', trustClass: 'write', autoApprove: true },
       { tool: 'calendar_list', trustClass: 'read', autoApprove: true },
+      // Undoable (blueprint's own action-classes table: "add calendar event" = write),
+      // but approval-required: creating it is visible to real attendees, and a
+      // pending human approval is what lets this tool fire reliably even in a task
+      // that already read calendar_list/gmail_list (untrusted content) beforehand —
+      // non-auto tools are queued for approval BEFORE the structural gate is checked.
+      { tool: 'calendar_create_event', trustClass: 'write', autoApprove: false },
     ],
     memories: [
       {
         type: 'procedural',
         subject: 'email-drafting',
         content: 'Email drafts are created via gmail_create_draft and never sent automatically; the user sends them from Gmail after review.',
+      },
+      {
+        type: 'procedural',
+        subject: 'calendar-scheduling',
+        content: 'To schedule a meeting, call calendar_create_event directly (never just describe it in prose) — it is always queued for the user\'s approval before the event is actually created.',
       },
     ],
     evalSuites: [],
