@@ -1,7 +1,8 @@
 'use client';
-// M1 chat shell: one persistent session against the kernel API. Polling keeps the
-// thread current even if the server was killed mid-task and resumed (exit test).
-// The real OS interface (dashboard, task inspector, approvals) is M8.
+// M1 chat shell, now with multiple sessions ("New chat", like ChatGPT/Claude) —
+// sessions.ts always had the concept, the UI just never exposed it, so every
+// message piled into one endless thread. Polling keeps the thread current even
+// if the server was killed mid-task and resumed (exit test).
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 interface Msg {
@@ -16,7 +17,23 @@ interface GoogleStatus {
   email?: string | null;
 }
 
+interface SessionSummary {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+  first_message: string | null;
+}
+
+const LAST_SESSION_KEY = 'aios-last-session-id';
+const sessionLabel = (s: SessionSummary): string =>
+  (s.first_message || (s.title !== 'main' && s.title !== 'New chat' ? s.title : '') || 'New chat').slice(0, 46);
+
 export default function Home() {
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
@@ -24,9 +41,44 @@ export default function Home() {
   const [apiOk, setApiOk] = useState<boolean | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  const refreshSessions = useCallback(async (): Promise<SessionSummary[]> => {
+    const res = await fetch('/api/sessions');
+    const data = (await res.json()) as { sessions: SessionSummary[] };
+    setSessions(data.sessions);
+    return data.sessions;
+  }, []);
+
+  // Resolve which session to show on first load: localStorage's last-used one,
+  // else the most recently active session, else create a fresh one.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const list = await refreshSessions();
+        const saved = localStorage.getItem(LAST_SESSION_KEY);
+        if (saved && list.some((s) => s.id === saved)) {
+          setSessionId(saved);
+        } else if (list.length > 0) {
+          setSessionId(list[0]!.id);
+        } else {
+          const created = await fetch('/api/sessions', { method: 'POST' }).then((r) => r.json() as Promise<SessionSummary>);
+          setSessionId(created.id);
+          void refreshSessions();
+        }
+      } catch {
+        setApiOk(false);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (sessionId) localStorage.setItem(LAST_SESSION_KEY, sessionId);
+  }, [sessionId]);
+
   const refresh = useCallback(async () => {
+    if (!sessionId) return;
     try {
-      const res = await fetch('/api/messages');
+      const res = await fetch(`/api/messages?sessionId=${sessionId}`);
       const data = (await res.json()) as { messages: Msg[] };
       setMessages(data.messages);
       setApiOk(true);
@@ -35,7 +87,7 @@ export default function Home() {
     } catch {
       setApiOk(false);
     }
-  }, []);
+  }, [sessionId]);
 
   useEffect(() => {
     void refresh();
@@ -47,9 +99,34 @@ export default function Home() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages.length, busy]);
 
+  async function newChat() {
+    const created = (await fetch('/api/sessions', { method: 'POST' }).then((r) => r.json())) as SessionSummary;
+    setMessages([]);
+    setSessionId(created.id);
+    setShowHistory(false);
+    void refreshSessions();
+  }
+
+  function switchTo(id: string) {
+    if (id === sessionId) return setShowHistory(false);
+    setMessages([]);
+    setSessionId(id);
+    setShowHistory(false);
+  }
+
+  async function deleteSession(id: string, e: React.MouseEvent) {
+    e.stopPropagation();
+    await fetch(`/api/sessions/${id}`, { method: 'DELETE' });
+    const list = await refreshSessions();
+    if (id === sessionId) {
+      if (list.length > 0) switchTo(list[0]!.id);
+      else void newChat();
+    }
+  }
+
   async function send() {
     const text = input.trim();
-    if (!text || busy) return;
+    if (!text || busy || !sessionId) return;
     setInput('');
     setBusy(true);
     setMessages((m) => [
@@ -60,12 +137,13 @@ export default function Home() {
       await fetch('/api/chat', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, sessionId }),
       });
     } catch {
       /* the poller will pick up whatever state the server reached */
     }
     await refresh();
+    void refreshSessions(); // updated_at / preview changed
     setBusy(false);
   }
 
@@ -84,6 +162,55 @@ export default function Home() {
           {apiOk === null ? '…' : apiOk ? '● kernel online' : '● kernel unreachable'}
         </span>
       </header>
+
+      <div style={{ position: 'relative', display: 'flex', gap: 8, marginBottom: 16 }}>
+        <button
+          onClick={() => void newChat()}
+          style={{ padding: '6px 14px', borderRadius: 8, border: 'none', background: '#4b78ff', color: '#fff', fontSize: 13, cursor: 'pointer' }}
+        >
+          + New chat
+        </button>
+        <button
+          onClick={() => setShowHistory((v) => !v)}
+          style={{ padding: '6px 14px', borderRadius: 8, border: '1px solid #2a2e45', background: 'transparent', color: '#9aa0b5', fontSize: 13, cursor: 'pointer' }}
+        >
+          {showHistory ? '✕ close' : `🕘 chats (${sessions.length})`}
+        </button>
+
+        {showHistory && (
+          <div
+            style={{
+              position: 'absolute', top: '110%', left: 0, right: 0, zIndex: 10,
+              maxHeight: 340, overflowY: 'auto', background: '#12141f',
+              border: '1px solid #2a2e45', borderRadius: 10, padding: 6,
+            }}
+          >
+            {sessions.length === 0 && <p style={{ color: '#565c72', fontSize: 13, margin: 8 }}>No past chats yet.</p>}
+            {sessions.map((s) => (
+              <div
+                key={s.id}
+                onClick={() => switchTo(s.id)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', borderRadius: 8,
+                  cursor: 'pointer', background: s.id === sessionId ? '#1d2c55' : 'transparent',
+                }}
+              >
+                <span style={{ flex: 1, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {sessionLabel(s)}
+                </span>
+                <span style={{ fontSize: 11, color: '#565c72', flexShrink: 0 }}>{s.message_count} msgs</span>
+                <button
+                  onClick={(e) => void deleteSession(s.id, e)}
+                  title="Delete chat"
+                  style={{ fontSize: 12, padding: '2px 7px', borderRadius: 6, border: '1px solid #3a2430', background: 'transparent', color: '#f87171', cursor: 'pointer', flexShrink: 0 }}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
 
       {google && !google.connected && (
         <div
@@ -171,15 +298,15 @@ export default function Home() {
           />
           <button
             type="submit"
-            disabled={busy}
+            disabled={busy || !sessionId}
             style={{
               padding: '0 22px',
               borderRadius: 10,
               border: 'none',
-              background: busy ? '#2a2e45' : '#4b78ff',
+              background: busy || !sessionId ? '#2a2e45' : '#4b78ff',
               color: 'white',
               fontSize: 14,
-              cursor: busy ? 'default' : 'pointer',
+              cursor: busy || !sessionId ? 'default' : 'pointer',
             }}
           >
             {busy ? '…' : 'Send'}

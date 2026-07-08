@@ -279,6 +279,39 @@ app.get('/messages', async (req) => {
 });
 
 // ---------------------------------------------------------------------------
+// Chat sessions: "New chat" support (M1's sessions.ts only ever had ONE default
+// session — every message piled into it forever). Title is never asked for up
+// front; the UI shows each session's first user message as its label instead.
+// ---------------------------------------------------------------------------
+app.post('/sessions', async (req) => {
+  const { title } = (req.body ?? {}) as { title?: string };
+  const { rows } = await pool.query(
+    `INSERT INTO sessions (title) VALUES ($1) RETURNING id, title, created_at, updated_at`,
+    [title?.trim() || 'New chat'],
+  );
+  trace.recordSafe({ traceId: req.traceId, component: 'sessions', event: 'session.created', payload: { id: rows[0]!.id } });
+  return rows[0];
+});
+
+app.get('/sessions', async () => {
+  const { rows } = await pool.query(
+    `SELECT s.id, s.title, s.created_at, s.updated_at,
+            (SELECT count(*) FROM messages m WHERE m.session_id = s.id)::int AS message_count,
+            (SELECT content FROM messages m WHERE m.session_id = s.id AND m.role = 'user' ORDER BY m.created_at ASC LIMIT 1) AS first_message
+     FROM sessions s
+     ORDER BY s.updated_at DESC
+     LIMIT 100`,
+  );
+  return { sessions: rows };
+});
+
+app.delete('/sessions/:id', async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const { rowCount } = await pool.query(`DELETE FROM sessions WHERE id=$1`, [id]); // messages cascade
+  return rowCount ? { ok: true } : reply.code(404).send({ error: 'no such session' });
+});
+
+// ---------------------------------------------------------------------------
 // Memory (blueprint §7.2: user-visible, with source + delete = trust via inspectability)
 // ---------------------------------------------------------------------------
 app.get('/memory', async (req) => {
