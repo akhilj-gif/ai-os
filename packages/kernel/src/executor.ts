@@ -54,8 +54,31 @@ async function saveCheckpoint(
 
 export interface TaskRunResult {
   taskId: string;
-  status: 'done' | 'failed';
+  status: 'done' | 'failed' | 'awaiting_approval';
   text: string;
+}
+
+/** Queue an approval-required tool call for the user's one-click approval (chat
+ *  flow). Records the EXACT call in pending_actions and raises an approval
+ *  notification. The API executes the exact args when the user approves. */
+async function queuePendingAction(
+  pool: pg.Pool,
+  q: { taskId: string; tool: string; args: Record<string, unknown>; trustClass: string; untrusted: boolean },
+): Promise<string> {
+  const sess = (await pool.query<{ session_id: string }>(`SELECT session_id FROM messages WHERE task_id=$1 AND role='user' LIMIT 1`, [q.taskId])).rows[0]?.session_id ?? null;
+  const pa = await pool.query<{ id: string }>(
+    `INSERT INTO pending_actions (task_id, session_id, tool, args, trust_class, untrusted_context) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+    [q.taskId, sess, q.tool, JSON.stringify(q.args), q.trustClass, q.untrusted],
+  );
+  const id = pa.rows[0]!.id;
+  const argStr = JSON.stringify(q.args);
+  const body = `${q.tool}(${argStr.length > 400 ? argStr.slice(0, 400) + '…' : argStr})` + (q.untrusted ? '\n⚠ Prepared while external/untrusted content was in context — verify the recipient before approving.' : '');
+  await pool.query(`INSERT INTO notifications (kind, title, body, meta) VALUES ('approval', $1, $2, $3::jsonb)`, [
+    `Approve: ${q.tool}`,
+    body,
+    JSON.stringify({ pendingActionId: id, taskId: q.taskId, tool: q.tool }),
+  ]);
+  return id;
 }
 
 export interface RunTaskOptions {
@@ -71,6 +94,10 @@ export interface RunTaskOptions {
    *  capability packs contribute theirs here (M9). Domain text stays out of
    *  the kernel; this is just the seam. */
   extraSystem?: string;
+  /** Prior conversation turns (user/assistant) to seed the context so chat has
+   *  MEMORY across messages instead of treating each as a brand-new task. The
+   *  chat API passes the session's recent history here. */
+  history?: ChatMessage[];
 }
 
 /** Run (or resume) a task to completion. Idempotent on restart. */
@@ -109,9 +136,10 @@ export async function runTask(
     }
     messages = [
       { role: 'system', content: [systemPrompt(), opts.extraSystem, memoryBlock].filter(Boolean).join('\n\n') },
+      ...(opts.history ?? []), // prior conversation turns → chat has memory across messages
       { role: 'user', content: task.goal },
     ];
-    await trace.record({ traceId, taskId, component: 'kernel', event: 'task.started', payload: { memoryInjected: memoryBlock.length > 0 } });
+    await trace.record({ traceId, taskId, component: 'kernel', event: 'task.started', payload: { memoryInjected: memoryBlock.length > 0, history: opts.history?.length ?? 0 } });
   }
   await pool.query(`UPDATE tasks SET status = 'running', updated_at = now() WHERE id = $1`, [taskId]);
 
@@ -122,6 +150,7 @@ export async function runTask(
   // Structural injection defense (§8.3): once untrusted content is in context,
   // the trust gate blocks mutating actions. Persists across iterations.
   let untrustedInContext = false;
+  let queuedApproval = false; // an irreversible tool got queued for the user's approval this run
   let totalTokens = 0;
 
   for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
@@ -161,21 +190,24 @@ export async function runTask(
 
     if (!resp.toolCalls.length) {
       const text = resp.message.content ?? '';
+      // If an irreversible action was queued this run, the task isn't "done" — it's
+      // waiting on the user's approval. Reflect that honestly in the status.
+      const finalStatus = queuedApproval ? 'awaiting_approval' : 'done';
       await saveCheckpoint(pool, taskId, stepId, 'final', messages);
       await pool.query(
-        `UPDATE tasks SET status='done',
+        `UPDATE tasks SET status=$3,
            spent = jsonb_set(spent, '{tokens}', to_jsonb((spent->>'tokens')::int + $2::int)),
            updated_at = now() WHERE id = $1`,
-        [taskId, totalTokens],
+        [taskId, totalTokens, finalStatus],
       );
-      await trace.record({ traceId, taskId, component: 'kernel', event: 'task.done', payload: { iterations: iter + 1, tokens: totalTokens } });
-      // Learn from the exchange: extract durable memories (best-effort; skipped
-      // for eval runs to keep them deterministic and quota-light).
-      if (!opts.registry) {
+      await trace.record({ traceId, taskId, component: 'kernel', event: queuedApproval ? 'task.awaiting_approval' : 'task.done', payload: { iterations: iter + 1, tokens: totalTokens } });
+      // Learn from the exchange (best-effort; skipped for eval runs and for
+      // awaiting-approval turns — the exchange isn't complete yet).
+      if (!opts.registry && !queuedApproval) {
         const stored = await extractAndStore(pool, { taskId, traceId, userText: task.goal, assistantText: text });
         if (stored) await trace.record({ traceId, taskId, component: 'memory', event: 'memory.extracted', payload: { count: stored } });
       }
-      return { taskId, status: 'done', text };
+      return { taskId, status: finalStatus, text };
     }
 
     for (const tc of resp.toolCalls) {
@@ -184,18 +216,36 @@ export async function runTask(
       let result: unknown;
       let approvedBy: 'policy' | null = null;
       let blocked = false;
+      let queued = false;
 
-      if (blockedByUntrustedContext(decision.trustClass, untrustedInContext)) {
-        // STRUCTURAL injection defense (§8.3 rule 2): untrusted content is in
-        // context, so it cannot trigger a mutating action — regardless of what
-        // the model decided. This is architectural, not prompt-dependent.
+      if (!decision.autoApprove) {
+        // Approval-required (irreversible/spend, e.g. whatsapp_send_message): chat
+        // can't run it and can't collect approval mid-loop → QUEUE the exact call
+        // for the user's one-click approval. The human seeing the exact args IS the
+        // injection check, so we queue even under untrusted context. (AUTO mutating
+        // tools are still hard-blocked below, so injected content can NEVER
+        // auto-trigger a mutation — the deterministic §8.3 guarantee is unchanged.)
+        queued = true;
+        if (queuedApproval) {
+          result = { queued_for_approval: true, note: 'Already queued — do not call it again; just tell the user it awaits their approval.' };
+        } else {
+          const paId = await queuePendingAction(pool, { taskId, tool: tc.name, args: tc.args, trustClass: decision.trustClass, untrusted: untrustedInContext });
+          queuedApproval = true;
+          result = {
+            queued_for_approval: true,
+            pendingActionId: paId,
+            note: "This irreversible action needs the user's explicit approval and has been QUEUED. In your final reply, tell the user EXACTLY what you prepared (recipient + the exact text) and that it awaits their one-click approval. Do NOT call the tool again.",
+          };
+        }
+      } else if (blockedByUntrustedContext(decision.trustClass, untrustedInContext)) {
+        // STRUCTURAL injection defense (§8.3): an AUTO mutating tool cannot be
+        // triggered while untrusted content is in context — architectural, not
+        // prompt-dependent. (Approval-required tools took the human-gated path above.)
         blocked = true;
         result = {
           blocked: true,
-          reason: `Refused by the trust gate: untrusted content is in this task's context, so a "${decision.trustClass}" (mutating) action cannot be triggered by it (§8.3). Only the user's own request can authorize this — surface it to them.`,
+          reason: `Refused by the trust gate: untrusted content is in this task's context, so a "${decision.trustClass}" (mutating) auto-action cannot be triggered by it (§8.3). Surface it to the user instead.`,
         };
-      } else if (!decision.autoApprove) {
-        result = { error: `Tool "${tc.name}" is ${decision.trustClass} class and requires approval.` };
       } else {
         approvedBy = 'policy';
         const tool = registry.get(tc.name);
@@ -224,9 +274,9 @@ export async function runTask(
       await trace.record({
         traceId,
         taskId,
-        component: blocked ? 'trust' : 'executor',
-        event: blocked ? 'tool.blocked_untrusted' : 'tool.executed',
-        payload: { tool: tc.name, trustClass: decision.trustClass, durationMs, blocked },
+        component: blocked ? 'trust' : queued ? 'trust' : 'executor',
+        event: blocked ? 'tool.blocked_untrusted' : queued ? 'tool.queued_for_approval' : 'tool.executed',
+        payload: { tool: tc.name, trustClass: decision.trustClass, durationMs, blocked, queued },
       });
       // Provenance tagging (§8.3 rule 1): label untrusted output in-band so the
       // model treats it as data, never instructions.

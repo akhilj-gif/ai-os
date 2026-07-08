@@ -5,10 +5,12 @@
 import { useCallback, useEffect, useState } from 'react';
 
 interface Approval { step_id: string; task_id: string; title: string | null; tool: string | null; tool_args: Record<string, unknown> | null; goal: string; created_at: string }
+interface PendingAction { id: string; task_id: string; tool: string; args: Record<string, unknown>; untrusted_context: boolean; created_at: string }
 interface TaskRow { id: string; goal: string; status: string; spent: { tokens?: number }; updated_at: string }
 interface JobRow { id: string; name: string; kind: string; enabled: boolean; next_run_at: string | null; last_run: { status: string; started_at: string } | null }
 interface Dash {
   approvals: Approval[];
+  pendingActions: PendingAction[];
   activeTasks: TaskRow[];
   recentTasks: TaskRow[];
   notifications: { unread: number; latest: Array<{ id: string; kind: string; title: string; read: boolean; created_at: string; meta?: { taskId?: string; stepId?: string } }> };
@@ -51,6 +53,19 @@ export default function DashboardPage() {
     } finally { setBusy(null); }
   }
 
+  // Chat-queued irreversible action (e.g. whatsapp_send_message) — approve to run
+  // the EXACT call you see, or reject to cancel.
+  async function decidePending(p: PendingAction, decision: 'approved' | 'rejected') {
+    setBusy(p.id);
+    try {
+      await fetch(`/api/pending/${p.id}/decide`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ decision }),
+      });
+      await refresh();
+    } finally { setBusy(null); }
+  }
+
   if (!d) return <main style={{ maxWidth: 1100, margin: '0 auto', padding: 24 }}><p style={{ color: '#565c72' }}>loading dashboard…</p></main>;
 
   return (
@@ -68,8 +83,8 @@ export default function DashboardPage() {
       {/* status strip */}
       <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 16, fontSize: 13 }}>
         <span style={{ ...card, padding: '8px 14px' }}>⚡ active: <strong>{d.activeTasks.length}</strong></span>
-        <span style={{ ...card, padding: '8px 14px', borderColor: d.approvals.length ? '#7a5a1e' : '#23263a' }}>
-          ⏳ approvals: <strong style={{ color: d.approvals.length ? '#e0a13a' : undefined }}>{d.approvals.length}</strong>
+        <span style={{ ...card, padding: '8px 14px', borderColor: d.approvals.length + d.pendingActions.length ? '#7a5a1e' : '#23263a' }}>
+          ⏳ approvals: <strong style={{ color: d.approvals.length + d.pendingActions.length ? '#e0a13a' : undefined }}>{d.approvals.length + d.pendingActions.length}</strong>
         </span>
         <span style={{ ...card, padding: '8px 14px' }}>🔔 unread: <strong>{d.notifications.unread}</strong></span>
         <span style={{ ...card, padding: '8px 14px' }}>🪙 tokens today: <strong>{d.spend.todayTokens.toLocaleString()}</strong> · total {d.spend.totalTokens.toLocaleString()}</span>
@@ -77,9 +92,28 @@ export default function DashboardPage() {
       </div>
 
       {/* approvals inbox — the M8 <30s round-trip */}
-      <section style={{ ...card, marginBottom: 16, borderColor: d.approvals.length ? '#7a5a1e' : '#23263a' }}>
+      <section style={{ ...card, marginBottom: 16, borderColor: d.approvals.length + d.pendingActions.length ? '#7a5a1e' : '#23263a' }}>
         <h2 style={h2}>Approvals inbox</h2>
-        {d.approvals.length === 0 && <p style={{ color: '#565c72', fontSize: 13, margin: 0 }}>Nothing waiting on you.</p>}
+        {d.approvals.length + d.pendingActions.length === 0 && <p style={{ color: '#565c72', fontSize: 13, margin: 0 }}>Nothing waiting on you.</p>}
+
+        {/* chat-queued irreversible actions (e.g. WhatsApp send) — approve to run the exact call */}
+        {d.pendingActions.map((p) => (
+          <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderTop: '1px solid #1a1d2e' }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 14 }}>Send <code style={{ fontFamily: 'ui-monospace, monospace' }}>{p.tool}</code>{p.untrusted_context && <span style={{ color: '#e0a13a', fontSize: 12 }}> ⚠ verify recipient</span>}</div>
+              <div style={{ fontSize: 12, color: '#9aa0b5', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{JSON.stringify(p.args)}</div>
+            </div>
+            <button onClick={() => void decidePending(p, 'approved')} disabled={busy === p.id}
+              style={{ padding: '6px 16px', borderRadius: 8, border: 'none', background: '#1f7a4d', color: '#fff', fontSize: 13, cursor: 'pointer' }}>
+              ✓ approve &amp; send
+            </button>
+            <button onClick={() => void decidePending(p, 'rejected')} disabled={busy === p.id}
+              style={{ padding: '6px 16px', borderRadius: 8, border: '1px solid #5a2430', background: 'transparent', color: '#f87171', fontSize: 13, cursor: 'pointer' }}>
+              ✕ cancel
+            </button>
+          </div>
+        ))}
+
         {d.approvals.map((a) => (
           <div key={a.step_id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderTop: '1px solid #1a1d2e' }}>
             <div style={{ flex: 1, minWidth: 0 }}>

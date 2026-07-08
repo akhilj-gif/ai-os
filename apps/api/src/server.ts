@@ -222,21 +222,37 @@ app.get('/oauth/google/status', async () => {
 // ---------------------------------------------------------------------------
 // Chat
 // ---------------------------------------------------------------------------
+const CHAT_HISTORY_TURNS = 12; // recent turns fed back so chat has memory across messages
+
 async function completeChatTask(taskId: string): Promise<void> {
-  // Pack-composed tools + pack prompt fragments; memory stays ON (M9 note in RunTaskOptions).
-  const result = await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true });
   const { rows } = await pool.query<{ session_id: string }>(
     `SELECT session_id FROM messages WHERE task_id = $1 AND role = 'user' LIMIT 1`,
     [taskId],
   );
   const sessionId = rows[0]?.session_id ?? (await ensureDefaultSession(pool));
+
+  // Conversation MEMORY: replay the session's recent user/assistant turns (excluding
+  // this task's own just-added message) so the model sees the ongoing chat, not a
+  // cold start. Without this every message was a brand-new amnesiac task.
+  const prior = (await listMessages(pool, sessionId))
+    .filter((m) => m.task_id !== taskId && (m.role === 'user' || m.role === 'assistant') && m.content?.trim())
+    .slice(-CHAT_HISTORY_TURNS)
+    .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+
+  const result = await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true, history: prior });
   await addMessage(pool, { sessionId, role: 'assistant', content: result.text, taskId });
 }
 
 app.post('/chat', async (req) => {
   const { text, sessionId } = (req.body ?? {}) as { text?: string; sessionId?: string };
   if (!text?.trim()) return { error: 'text is required' };
-  const session = sessionId ?? (await ensureDefaultSession(pool));
+  // Robustness: a passed sessionId must be a real session, else fall back to the
+  // default — a bad/unknown id used to FK-violate on addMessage and silently 500.
+  let session = await ensureDefaultSession(pool);
+  if (sessionId) {
+    const ok = await pool.query('SELECT 1 FROM sessions WHERE id = $1', [sessionId]).catch(() => ({ rowCount: 0 }));
+    if (ok.rowCount) session = sessionId;
+  }
 
   const { rows } = await pool.query<{ id: string }>(
     `INSERT INTO tasks (goal, status, created_by, trace_id) VALUES ($1, 'draft', 'user', $2) RETURNING id`,
@@ -406,13 +422,54 @@ app.post('/notifications/:id/read', async (req, reply) => {
   return rowCount ? { ok: true } : reply.code(404).send({ error: 'no such notification' });
 });
 
+// Chat approval: decide a queued irreversible action. On approve, execute the
+// EXACT call the user saw (via the pack registry); on reject, cancel. Either way
+// post a confirmation into the chat and resolve the task. Fail-closed: only a
+// still-'pending' action can be acted on (no double-send).
+app.post('/pending/:id/decide', async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const { decision } = (req.body ?? {}) as { decision?: 'approved' | 'rejected' };
+  if (decision !== 'approved' && decision !== 'rejected') return reply.code(400).send({ error: 'decision must be approved|rejected' });
+  const pa = (await pool.query(`SELECT task_id, session_id, tool, args, status FROM pending_actions WHERE id=$1`, [id])).rows[0] as
+    | { task_id: string; session_id: string | null; tool: string; args: Record<string, unknown>; status: string }
+    | undefined;
+  if (!pa) return reply.code(404).send({ error: 'no such pending action' });
+  if (pa.status !== 'pending') return reply.code(409).send({ error: `already ${pa.status}` }); // no double-send
+  await pool.query(`UPDATE notifications SET read=true WHERE meta->>'pendingActionId' = $1`, [id]);
+
+  const say = async (content: string) => {
+    if (pa.session_id) await addMessage(pool, { sessionId: pa.session_id, role: 'assistant', content, taskId: pa.task_id });
+  };
+
+  if (decision === 'rejected') {
+    await pool.query(`UPDATE pending_actions SET status='rejected', decided_at=now() WHERE id=$1`, [id]);
+    await pool.query(`UPDATE tasks SET status='done', updated_at=now() WHERE id=$1`, [pa.task_id]);
+    await say(`❌ Cancelled — I did not run ${pa.tool}.`);
+    trace.recordSafe({ traceId: req.traceId, taskId: pa.task_id, component: 'trust', event: 'pending.rejected', payload: { tool: pa.tool } });
+    return { ok: true, executed: false, rejected: true };
+  }
+
+  const tool = packRegistry().get(pa.tool);
+  let result: unknown = { error: `tool ${pa.tool} unavailable (pack disabled?)` };
+  if (tool) {
+    try { result = await tool.execute(pa.args, { pool, taskId: pa.task_id }); }
+    catch (e) { result = { error: e instanceof Error ? e.message : String(e) }; }
+  }
+  const success = !(result && typeof result === 'object' && 'error' in (result as object));
+  await pool.query(`UPDATE pending_actions SET status=$2, result=$3, decided_at=now() WHERE id=$1`, [id, success ? 'executed' : 'failed', JSON.stringify(result)]);
+  await pool.query(`UPDATE tasks SET status='done', updated_at=now() WHERE id=$1`, [pa.task_id]);
+  await say(success ? `✅ Done — ${pa.tool} executed.` : `⚠ ${pa.tool} failed: ${JSON.stringify(result).slice(0, 200)}`);
+  trace.recordSafe({ traceId: req.traceId, taskId: pa.task_id, component: 'trust', event: success ? 'pending.executed' : 'pending.failed', payload: { tool: pa.tool } });
+  return { ok: success, executed: success, result };
+});
+
 // ---------------------------------------------------------------------------
 // M8 OS Interface: one aggregate powering the dashboard (live tasks, global
 // approvals inbox, spend, notifications, jobs) + the task-inspector depth
 // (trace timeline + tool-call audit). Read-only composition over existing data.
 // ---------------------------------------------------------------------------
 app.get('/dashboard', async () => {
-  const [approvals, active, recent, notifs, jobs, spend, counts] = await Promise.all([
+  const [approvals, active, recent, notifs, jobs, spend, counts, pending] = await Promise.all([
     pool.query(
       `SELECT s.id AS step_id, s.title, s.tool, s.tool_args, s.created_at, t.id AS task_id, t.goal
        FROM steps s JOIN tasks t ON t.id = s.task_id
@@ -443,9 +500,11 @@ app.get('/dashboard', async () => {
        FROM tasks`,
     ),
     pool.query(`SELECT status, count(*)::int AS n FROM tasks GROUP BY status`),
+    pool.query(`SELECT id, task_id, tool, args, untrusted_context, created_at FROM pending_actions WHERE status='pending' ORDER BY created_at`),
   ]);
   return {
     approvals: approvals.rows,
+    pendingActions: pending.rows, // chat-queued irreversible actions awaiting one-click approval
     activeTasks: active.rows,
     recentTasks: recent.rows,
     notifications: { unread: Number(notifs.rows[0]!.unread), latest: notifs.rows[0]!.latest },
