@@ -50,7 +50,13 @@ export interface LearningResult {
   improvements: string[]; // improvement row ids
 }
 
-/** Gather what to learn FROM: recent failed tasks + their recorded error. Pure DB. */
+// Learning must target BEHAVIORAL failures, not environment noise. A rate-limit /
+// quota / network error is the world's fault, not a mistake the agent can learn to
+// avoid — feeding those in just produces "manage your rate limits" playbooks.
+const INFRA_ERR = /INFRA_(RATELIMIT|NETWORK)|rate.?limit|quota|\b429\b|\b503\b/i;
+
+/** Gather what to learn FROM: recent failed tasks + their error, EXCLUDING infra
+ *  failures (quota/rate-limit/network) — those aren't learnable behavior. Pure DB. */
 export async function gatherFailureSignals(pool: pg.Pool, limit = 15): Promise<FailureSignal> {
   const { rows } = await pool.query<{ goal: string; error: string | null }>(
     `SELECT t.goal, (te.payload->>'error') AS error
@@ -63,12 +69,13 @@ export async function gatherFailureSignals(pool: pg.Pool, limit = 15): Promise<F
      WHERE t.status = 'failed'
      ORDER BY t.updated_at DESC
      LIMIT $1`,
-    [limit],
+    [limit * 4], // over-fetch, then drop infra noise below
   );
-  const total = (await pool.query<{ n: string }>(`SELECT count(*) AS n FROM tasks WHERE status='failed'`)).rows[0]!;
+  const behavioral = rows.filter((r) => !INFRA_ERR.test(r.error ?? '')).slice(0, limit);
   return {
-    failedTasks: rows.map((r) => ({ goal: r.goal, error: r.error ?? '(no recorded error)' })),
-    totalFailed: Number(total.n),
+    failedTasks: behavioral.map((r) => ({ goal: r.goal, error: r.error ?? '(no recorded error)' })),
+    // "totalFailed" reflects the learnable population, not quota casualties.
+    totalFailed: rows.filter((r) => !INFRA_ERR.test(r.error ?? '')).length,
   };
 }
 
