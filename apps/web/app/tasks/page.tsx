@@ -110,13 +110,13 @@ export default function TasksPage() {
         </button>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '260px 1fr', gap: 16 }}>
-        <div style={{ display: 'grid', gap: 6, alignContent: 'start' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '260px minmax(0, 1fr)', gap: 16 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 6, alignContent: 'start', minWidth: 0 }}>
           {tasks.map((t) => (
             <button
               key={t.id}
               onClick={() => { setSelected(t.id); void loadTask(t.id); }}
-              style={{ textAlign: 'left', padding: '8px 10px', borderRadius: 8, background: selected === t.id ? '#1d2c55' : '#12141f', border: `1px solid ${selected === t.id ? '#2c3f75' : '#23263a'}`, color: '#e6e8f0', cursor: 'pointer' }}
+              style={{ textAlign: 'left', padding: '8px 10px', borderRadius: 8, background: selected === t.id ? '#1d2c55' : '#12141f', border: `1px solid ${selected === t.id ? '#2c3f75' : '#23263a'}`, color: '#e6e8f0', cursor: 'pointer', minWidth: 0, maxWidth: '100%', overflow: 'hidden' }}
             >
               <div style={{ fontSize: 12, color: STATUS_COLOR[t.status] ?? '#9aa0b5' }}>● {t.status}</div>
               <div style={{ fontSize: 13, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.goal}</div>
@@ -162,7 +162,7 @@ export default function TasksPage() {
                       <span style={{ fontSize: 13, flex: 1 }}>{s.title}</span>
                       <span style={{ fontSize: 11, color: STATUS_COLOR[s.status] ?? '#9aa0b5' }}>{s.status}</span>
                     </div>
-                    {s.output?.text && <div style={{ fontSize: 12, color: '#9aa0b5', marginTop: 6, whiteSpace: 'pre-wrap' }}>{s.output.text.slice(0, 400)}</div>}
+                    {s.output?.text && <div style={{ fontSize: 12, color: '#9aa0b5', marginTop: 6, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{s.output.text.slice(0, 400)}</div>}
                     {s.output?.clarify && <div style={{ fontSize: 12, color: '#f2c14e', marginTop: 6 }}>❓ {s.output.clarify}</div>}
                     {s.error && <div style={{ fontSize: 12, color: '#f87171', marginTop: 6 }}>{s.error.slice(0, 200)}</div>}
                   </div>
