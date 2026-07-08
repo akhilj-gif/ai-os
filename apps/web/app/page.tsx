@@ -17,6 +17,24 @@ interface GoogleStatus {
   email?: string | null;
 }
 
+interface PendingAction {
+  id: string;
+  task_id: string;
+  tool: string;
+  args: Record<string, unknown>;
+  untrusted_context: boolean;
+  created_at: string;
+}
+
+// Human-friendly one-liner for an approval card, per tool.
+function describeAction(p: PendingAction): string {
+  const a = p.args;
+  if (p.tool === 'calendar_create_event') return `Create calendar event: “${a.summary as string}” at ${a.start as string}`;
+  if (p.tool === 'whatsapp_send_message') return `Send WhatsApp to ${a.chatId as string}: “${a.text as string}”`;
+  if (p.tool === 'gmail_create_draft') return `Draft email to ${a.to as string}: “${a.subject as string}”`;
+  return `${p.tool}(${JSON.stringify(a).slice(0, 120)})`;
+}
+
 interface SessionSummary {
   id: string;
   title: string;
@@ -35,6 +53,8 @@ export default function Home() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [showHistory, setShowHistory] = useState(false);
   const [messages, setMessages] = useState<Msg[]>([]);
+  const [pending, setPending] = useState<PendingAction[]>([]);
+  const [deciding, setDeciding] = useState<string | null>(null);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [google, setGoogle] = useState<GoogleStatus | null>(null);
@@ -79,8 +99,9 @@ export default function Home() {
     if (!sessionId) return;
     try {
       const res = await fetch(`/api/messages?sessionId=${sessionId}`);
-      const data = (await res.json()) as { messages: Msg[] };
+      const data = (await res.json()) as { messages: Msg[]; pendingActions?: PendingAction[] };
       setMessages(data.messages);
+      setPending(data.pendingActions ?? []);
       setApiOk(true);
       const g = await fetch('/api/oauth/google/status');
       setGoogle((await g.json()) as GoogleStatus);
@@ -97,11 +118,30 @@ export default function Home() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages.length, busy]);
+  }, [messages.length, pending.length, busy]);
+
+  // Approve / reject an action in-chat — no dashboard trip. The server runs the
+  // exact queued call on approve and posts the result back into the thread.
+  async function decide(id: string, decision: 'approved' | 'rejected') {
+    setDeciding(id);
+    setPending((ps) => ps.filter((p) => p.id !== id)); // optimistic: drop the card
+    try {
+      await fetch(`/api/pending/${id}/decide`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ decision }),
+      });
+    } catch {
+      /* the poller re-surfaces it if the call failed */
+    }
+    await refresh();
+    setDeciding(null);
+  }
 
   async function newChat() {
     const created = (await fetch('/api/sessions', { method: 'POST' }).then((r) => r.json())) as SessionSummary;
     setMessages([]);
+    setPending([]);
     setSessionId(created.id);
     setShowHistory(false);
     void refreshSessions();
@@ -110,6 +150,7 @@ export default function Home() {
   function switchTo(id: string) {
     if (id === sessionId) return setShowHistory(false);
     setMessages([]);
+    setPending([]);
     setSessionId(id);
     setShowHistory(false);
   }
@@ -260,6 +301,61 @@ export default function Home() {
             {m.content}
           </div>
         ))}
+
+        {pending.map((p) => (
+          <div
+            key={p.id}
+            style={{
+              justifySelf: 'start',
+              maxWidth: '92%',
+              width: '92%',
+              padding: '12px 14px',
+              borderRadius: 10,
+              fontSize: 14,
+              lineHeight: 1.5,
+              background: '#231b0c',
+              border: '1px solid #6b551f',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+              <span style={{ fontSize: 15 }}>⏳</span>
+              <strong style={{ color: '#f2c14e', fontSize: 13, letterSpacing: 0.2 }}>
+                Waiting for your approval — nothing has happened yet
+              </strong>
+            </div>
+            <div style={{ color: '#e7e3d4', marginBottom: 4 }}>{describeAction(p)}</div>
+            {p.untrusted_context && (
+              <div style={{ fontSize: 12, color: '#c99', marginBottom: 8 }}>
+                ⚠ This task read untrusted content (email/web) before proposing this — review carefully.
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+              <button
+                disabled={deciding === p.id}
+                onClick={() => void decide(p.id, 'approved')}
+                style={{
+                  padding: '7px 16px', borderRadius: 8, border: 'none', cursor: 'pointer',
+                  background: '#2f9e44', color: '#fff', fontSize: 13, fontWeight: 600,
+                  opacity: deciding === p.id ? 0.6 : 1,
+                }}
+              >
+                ✓ Approve &amp; run
+              </button>
+              <button
+                disabled={deciding === p.id}
+                onClick={() => void decide(p.id, 'rejected')}
+                style={{
+                  padding: '7px 16px', borderRadius: 8, border: '1px solid #3a2430', cursor: 'pointer',
+                  background: 'transparent', color: '#f87171', fontSize: 13,
+                  opacity: deciding === p.id ? 0.6 : 1,
+                }}
+              >
+                ✕ Cancel
+              </button>
+            </div>
+          </div>
+        ))}
+
         {busy && (
           <div style={{ color: '#9aa0b5', fontSize: 13 }}>⏳ kernel working — tools may take a moment…</div>
         )}

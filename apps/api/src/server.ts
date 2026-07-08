@@ -275,7 +275,16 @@ app.post('/chat', async (req) => {
 app.get('/messages', async (req) => {
   const q = req.query as { sessionId?: string };
   const sessionId = q.sessionId ?? (await ensureDefaultSession(pool));
-  return { sessionId, messages: await listMessages(pool, sessionId) };
+  // Pending approvals for THIS session are returned alongside the thread so the
+  // chat can render them inline (approve/reject in-chat, no trip to the dashboard).
+  const pending = (
+    await pool.query(
+      `SELECT id, task_id, tool, args, untrusted_context, created_at
+       FROM pending_actions WHERE session_id=$1 AND status='pending' ORDER BY created_at`,
+      [sessionId],
+    )
+  ).rows;
+  return { sessionId, messages: await listMessages(pool, sessionId), pendingActions: pending };
 });
 
 // ---------------------------------------------------------------------------
