@@ -6,3 +6,4 @@ dist/
 evals/reports/
 workspaces/
 apps/whatsapp-bridge/.auth/
+apps/whatsapp-bridge/store.json

@@ -33,14 +33,19 @@ async function bridge<T>(path: string, init?: RequestInit): Promise<T> {
 export const whatsappListChats: ToolDef = {
   name: 'whatsapp_list_chats',
   untrustedOutput: true, // chat names / previews are attacker-controllable content
-  description: "List the user's WhatsApp chats (most recent first): id, name, group?, unread count, last activity.",
+  description:
+    "List or SEARCH the user's WhatsApp chats (most recent first): id, name, group?, unread count, last activity. Pass `search` to find a contact by name before sending (e.g. search='Anish').",
   inputSchema: {
     type: 'object',
-    properties: { limit: { type: 'number', description: 'Max chats (1-50). Default 20.' } },
+    properties: {
+      limit: { type: 'number', description: 'Max chats (1-200). Default 20.' },
+      search: { type: 'string', description: 'Filter chats whose name or id contains this text (case-insensitive).' },
+    },
   },
   async execute(args) {
-    const limit = Math.min(Math.max(Number(args.limit) || 20, 1), 50);
-    return bridge(`/chats?limit=${limit}`);
+    const limit = Math.min(Math.max(Number(args.limit) || 20, 1), 200);
+    const search = typeof args.search === 'string' && args.search.trim() ? `&search=${encodeURIComponent(args.search.trim())}` : '';
+    return bridge(`/chats?limit=${limit}${search}`);
   },
 };
 

@@ -7,7 +7,7 @@
 // gate holds the policy (send = irreversible + approval).
 // NOTE: UNVERIFIED until first paired — the mock (mock.ts) is the verified twin.
 import Fastify from 'fastify';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import qrcodeTerminal from 'qrcode-terminal';
@@ -17,12 +17,128 @@ import { DEFAULT_BRIDGE_PORT, type BridgeChat, type BridgeMessage } from './cont
 
 const AUTH_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '.auth');
 mkdirSync(AUTH_DIR, { recursive: true });
+// The synced view persists here so a restart reloads instantly — WhatsApp only
+// pushes full history at LINK time, so without this every restart would need a
+// re-scan. Holds message content → gitignored.
+const STORE_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'store.json');
 
-// Local view of chats/messages, fed by history sync + live upserts. Baileys v7
-// has no built-in store; a bounded ring buffer per chat is all the OS needs.
+// Local view of chats/messages/contacts, fed by history sync + live upserts.
 const MAX_PER_CHAT = 50;
 const chats = new Map<string, BridgeChat>();
 const messages = new Map<string, BridgeMessage[]>();
+// Name resolution (full sync): WhatsApp addresses chats by phone-JID or @lid, but
+// the human name lives in the CONTACTS/CHATS sync. The address book is keyed by
+// phone-JID, while many chats are keyed by @lid — so we ALSO keep a lid↔phone map
+// and bridge across it when resolving a name.
+const contactNames = new Map<string, string>(); // jid/lid -> addressbook / notify name
+const chatNames = new Map<string, string>(); // jid -> group subject or chat title
+const lidToPn = new Map<string, string>(); // @lid -> @s.whatsapp.net
+const pnToLid = new Map<string, string>(); // @s.whatsapp.net -> @lid
+let historyChats = 0; // progress counter for the initial full-history burst
+
+/** Record a bidirectional lid↔phone link (the key to naming @lid chats). */
+function linkLidPn(lid?: string | null, pn?: string | null): void {
+  if (!lid || !pn || !lid.endsWith('@lid') || !pn.endsWith('@s.whatsapp.net')) return;
+  if (lidToPn.get(lid) !== pn) { lidToPn.set(lid, pn); pnToLid.set(pn, lid); scheduleSave(); }
+}
+
+// A REAL display name has at least one letter. WhatsApp also sends masked-number
+// "notify" strings (e.g. "+91••••••39") for contacts you haven't saved — those are
+// NOT names, and storing them shadows the real addressbook name reachable via the
+// lid↔phone bridge (this was the "Anish shows as a number" bug).
+const hasLetter = (s: string | undefined | null): s is string => !!s && /\p{L}/u.test(s);
+
+type NamedContact = { id?: string; lid?: string; name?: string; notify?: string; verifiedName?: string };
+function rememberContact(c: NamedContact): void {
+  // A contact entry that carries both a phone id and a lid is a mapping goldmine.
+  if (c.id?.endsWith('@s.whatsapp.net') && c.lid) linkLidPn(c.lid, c.id);
+  const name = c.name || c.verifiedName || c.notify;
+  if (!hasLetter(name)) return; // masked/number "names" are not names
+  if (c.id) contactNames.set(c.id, name);
+  if (c.lid) contactNames.set(c.lid, name); // same human under their @lid alias
+  scheduleSave();
+}
+function rememberChat(c: { id?: string; name?: string; subject?: string }): void {
+  const name = c.name || c.subject;
+  if (c.id && name) { chatNames.set(c.id, name); scheduleSave(); }
+}
+
+/** Resolve @lid → phone JID: our accumulated map first, then Baileys' own signal
+ *  repository if it exposes one (defensive — API differs across versions). */
+function pnForLid(lid: string): string | undefined {
+  const known = lidToPn.get(lid);
+  if (known) return known;
+  try {
+    const pn = (sock as unknown as { signalRepository?: { lidMapping?: { getPNForLID?: (l: string) => string | undefined } } })
+      ?.signalRepository?.lidMapping?.getPNForLID?.(lid);
+    if (pn?.endsWith('@s.whatsapp.net')) { linkLidPn(lid, pn); return pn; }
+  } catch {
+    /* no mapping available */
+  }
+  return undefined;
+}
+
+/** Best display name for a chat id. Priority matters: an ADDRESSBOOK name (direct
+ *  or via the lid↔phone bridge) must beat a chat "title", because WhatsApp often
+ *  sets a DM's title to the bare phone number — which would otherwise shadow the
+ *  real saved name (this was the "Anish shows as a number" bug). */
+function resolveName(jid: string, fallback: string): string {
+  // Only accept LETTER-bearing names; skip masked-number junk already in the store
+  // (loaded from an older sync) so it can't shadow the real bridged name.
+  const direct = contactNames.get(jid);
+  if (hasLetter(direct)) return direct;
+  if (jid.endsWith('@lid')) {
+    const pn = pnForLid(jid);
+    if (pn && hasLetter(contactNames.get(pn))) return contactNames.get(pn)!;
+  } else if (jid.endsWith('@s.whatsapp.net')) {
+    const lid = pnToLid.get(jid);
+    if (lid && hasLetter(contactNames.get(lid))) return contactNames.get(lid)!;
+  }
+  const title = chatNames.get(jid);
+  return hasLetter(title) ? title : fallback; // group subject / chat title, else the number
+}
+
+// ---- persistence (debounced; atomic write) --------------------------------
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleSave(): void {
+  if (saveTimer) return; // coalesce the history burst into one write per 2s
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    try {
+      const data = {
+        v: 1,
+        chats: [...chats.entries()],
+        messages: [...messages.entries()],
+        contactNames: [...contactNames.entries()],
+        chatNames: [...chatNames.entries()],
+        lidToPn: [...lidToPn.entries()],
+      };
+      const tmp = `${STORE_FILE}.tmp`;
+      writeFileSync(tmp, JSON.stringify(data));
+      renameSync(tmp, STORE_FILE); // atomic swap — a crash never leaves a half file
+    } catch (e) {
+      console.error('[whatsapp-bridge] store save failed:', e instanceof Error ? e.message : e);
+    }
+  }, 2000);
+  saveTimer.unref?.();
+}
+function loadStore(): void {
+  if (!existsSync(STORE_FILE)) return;
+  try {
+    const d = JSON.parse(readFileSync(STORE_FILE, 'utf8')) as {
+      chats?: [string, BridgeChat][]; messages?: [string, BridgeMessage[]][];
+      contactNames?: [string, string][]; chatNames?: [string, string][]; lidToPn?: [string, string][];
+    };
+    for (const [k, v] of d.chats ?? []) chats.set(k, v);
+    for (const [k, v] of d.messages ?? []) messages.set(k, v);
+    for (const [k, v] of d.contactNames ?? []) contactNames.set(k, v);
+    for (const [k, v] of d.chatNames ?? []) chatNames.set(k, v);
+    for (const [lid, pn] of d.lidToPn ?? []) { lidToPn.set(lid, pn); pnToLid.set(pn, lid); }
+    console.log(`[whatsapp-bridge] store loaded: ${chats.size} chats, ${contactNames.size} contacts, ${lidToPn.size} lid maps`);
+  } catch (e) {
+    console.error('[whatsapp-bridge] store load failed (starting empty):', e instanceof Error ? e.message : e);
+  }
+}
 let paired = false;
 let me = '';
 let currentQr: string | null = null; // latest QR string; served at /qr, cleared on pair
@@ -40,9 +156,21 @@ function msgText(m: WAMessage): string {
 }
 
 function ingest(m: WAMessage): void {
+ try {
   const chatId = m.key.remoteJid;
   const text = msgText(m);
   if (!chatId || chatId === 'status@broadcast' || !text) return;
+  // Baileys 7 carries the alternate address on the key — the reliable per-chat
+  // lid↔phone link. Capture whichever direction is present.
+  const k = m.key as { remoteJid?: string; remoteJidAlt?: string; participant?: string; participantAlt?: string };
+  if (k.remoteJidAlt) {
+    if (chatId.endsWith('@lid')) linkLidPn(chatId, k.remoteJidAlt);
+    else linkLidPn(k.remoteJidAlt, chatId);
+  }
+  if (k.participant && k.participantAlt) {
+    if (k.participant.endsWith('@lid')) linkLidPn(k.participant, k.participantAlt);
+    else linkLidPn(k.participantAlt, k.participant);
+  }
   const ts = new Date(Number(m.messageTimestamp ?? 0) * 1000).toISOString();
   const entry: BridgeMessage = {
     id: m.key.id ?? `${chatId}-${ts}`,
@@ -65,12 +193,16 @@ function ingest(m: WAMessage): void {
     unread: m.key.fromMe ? 0 : (prev?.unread ?? 0) + 1,
     lastMessageAt: ts,
   });
+  scheduleSave();
+ } catch {
+  /* one malformed history/live message must never crash the bridge */
+ }
 }
 
 let sock: ReturnType<typeof makeWASocket>;
 async function connect(): Promise<void> {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  sock = makeWASocket({ auth: state, syncFullHistory: false });
+  sock = makeWASocket({ auth: state, syncFullHistory: true });
   sock.ev.on('creds.update', saveCreds);
   sock.ev.on('connection.update', (u) => {
     if (u.qr) {
@@ -90,13 +222,31 @@ async function connect(): Promise<void> {
       const code = (u.lastDisconnect?.error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode;
       if (code === DisconnectReason.loggedOut) {
         console.error('[whatsapp-bridge] logged out — delete .auth/ and re-pair');
-      } else {
-        console.warn(`[whatsapp-bridge] connection closed (${code}) — reconnecting…`);
-        void connect();
+        return; // reconnecting would only loop on an invalid session
       }
+      // Everything else — including 515 restart-required, which Baileys ALWAYS
+      // emits right after a successful pairing — means reconnect. Use the saved
+      // creds (no new QR); catch the reconnect promise so a transient failure
+      // can never become an unhandledRejection that kills the process.
+      const delay = code === DisconnectReason.restartRequired ? 250 : 2000;
+      console.warn(`[whatsapp-bridge] connection closed (code ${code ?? '?'}) — reconnecting in ${delay}ms`);
+      setTimeout(() => {
+        connect().catch((e) => console.error('[whatsapp-bridge] reconnect failed (will retry on next close):', e instanceof Error ? e.message : e));
+      }, delay);
     }
   });
-  sock.ev.on('messaging-history.set', ({ messages: hist }) => hist.forEach(ingest));
+  // Full-history burst: chats + contacts + messages arrive here in batches.
+  sock.ev.on('messaging-history.set', ({ chats: hChats, contacts: hContacts, messages: hist }) => {
+    (hContacts ?? []).forEach((c) => rememberContact(c as NamedContact));
+    (hChats ?? []).forEach((c) => rememberChat(c as { id?: string; name?: string }));
+    (hist ?? []).forEach(ingest);
+    historyChats += hChats?.length ?? 0;
+    console.log(`[whatsapp-bridge] history batch: +${hChats?.length ?? 0} chats, +${hContacts?.length ?? 0} contacts (total chats seen: ${chats.size})`);
+  });
+  // Live updates keep names fresh after the initial sync.
+  sock.ev.on('contacts.upsert', (cs) => cs.forEach((c) => rememberContact(c as NamedContact)));
+  sock.ev.on('contacts.update', (cs) => cs.forEach((c) => rememberContact(c as NamedContact)));
+  sock.ev.on('chats.upsert', (cs) => cs.forEach((c) => rememberChat(c as { id?: string; name?: string })));
   sock.ev.on('messages.upsert', ({ messages: ms }) => ms.forEach(ingest));
 }
 
@@ -131,9 +281,27 @@ app.get('/qr', async (_req, reply) => reply.type('text/html').send(await qrPage(
 
 app.get('/health', async () => ({ ok: true, paired, me, impl: 'baileys' }));
 app.get('/chats', async (req) => {
-  const limit = Math.min(Number((req.query as { limit?: string }).limit) || 20, 50);
-  const list = [...chats.values()].sort((a, b) => (b.lastMessageAt ?? '').localeCompare(a.lastMessageAt ?? ''));
-  return { chats: list.slice(0, limit) };
+  const { limit: limitRaw, search } = req.query as { limit?: string; search?: string };
+  const limit = Math.min(Number(limitRaw) || 20, 200);
+  const q = (search ?? '').trim().toLowerCase();
+  let list = [...chats.values()]
+    .map((c) => ({ ...c, name: resolveName(c.id, c.name) })) // apply addressbook names
+    .sort((a, b) => (b.lastMessageAt ?? '').localeCompare(a.lastMessageAt ?? ''));
+  if (q) list = list.filter((c) => c.name.toLowerCase().includes(q) || c.id.toLowerCase().includes(q));
+  return { total: chats.size, chats: list.slice(0, limit) };
+});
+
+// Search the full ADDRESS BOOK (not just chats) — reach anyone by name and get a
+// sendable JID, even with no existing conversation. Phone JIDs only (messageable).
+app.get('/contacts', async (req) => {
+  const q = ((req.query as { search?: string }).search ?? '').trim().toLowerCase();
+  const seen = new Set<string>();
+  const all = [...contactNames.entries()]
+    .filter(([jid]) => jid.endsWith('@s.whatsapp.net'))
+    .map(([jid, name]) => ({ jid, name }))
+    .filter((c) => (seen.has(c.jid) ? false : seen.add(c.jid)));
+  const list = (q ? all.filter((c) => c.name.toLowerCase().includes(q)) : all).sort((a, b) => a.name.localeCompare(b.name));
+  return { total: all.length, contacts: list.slice(0, 50) };
 });
 app.get('/messages', async (req, reply) => {
   const { chatId, limit } = req.query as { chatId?: string; limit?: string };
@@ -150,6 +318,14 @@ app.post('/send', async (req, reply) => {
   return { ok: true, messageId: sent?.key?.id ?? 'unknown' };
 });
 
+// Backstop: an always-on personal bridge must OUTLIVE transient Baileys errors.
+// Baileys emits socket errors during the normal pair→restart→resync churn; an
+// unhandled one would otherwise exit the process (this is exactly what killed
+// the first pairing — exit 4). Log and stay up; the reconnect logic recovers.
+process.on('unhandledRejection', (r) => console.error('[whatsapp-bridge] unhandledRejection (staying up):', r instanceof Error ? r.message : r));
+process.on('uncaughtException', (e) => console.error('[whatsapp-bridge] uncaughtException (staying up):', e instanceof Error ? e.message : e));
+
+loadStore(); // reload the synced view before connecting — restarts need no re-scan
 await connect();
 await app.listen({ port: PORT, host: '127.0.0.1' });
 console.log(`[whatsapp-bridge] contract API on http://127.0.0.1:${PORT} (impl: baileys) — open /qr to pair`);
