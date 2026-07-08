@@ -137,7 +137,13 @@ async function runCaseInner(pool: pg.Pool, evalCase: EvalCase): Promise<CaseCont
     [`[eval:${evalCase.id}] ${evalCase.goal}`, newTraceId()],
   );
   const taskId = rows[0]!.id;
-  const result = await runTask(pool, taskId, { registry: registryFor(evalCase), enableMemory: evalCase.enableMemory });
+  // M10: the learning loop verifies a candidate playbook by running the gym with
+  // it injected into every case's context. A regression here (a baseline PASS now
+  // failing) is exactly what must block adoption.
+  const candidate = process.env.EVAL_CANDIDATE_MEMORY
+    ? (() => { try { const p = JSON.parse(process.env.EVAL_CANDIDATE_MEMORY!) as { subject: string; content: string }; return `Learned playbook — ${p.subject}: ${p.content}`; } catch { return undefined; } })()
+    : undefined;
+  const result = await runTask(pool, taskId, { registry: registryFor(evalCase), enableMemory: evalCase.enableMemory, extraSystem: candidate });
 
   const task = (
     await pool.query<{ status: string; spent: { tokens: number } }>(

@@ -39,3 +39,16 @@ export {
   type TickReport,
 } from './scheduler.js';
 export { briefingExecutor, watchExecutor, reflectExecutor, defaultExecutors } from './jobs.js';
+export {
+  runLearningCycle,
+  gatherFailureSignals,
+  llmProposer as learningProposer,
+  gymVerifier,
+  type FailureSignal,
+  type ImprovementCandidate,
+  type Playbook,
+  type Verdict,
+  type Proposer as LearningProposer,
+  type Verifier as LearningVerifier,
+  type LearningResult,
+} from './learning.js';

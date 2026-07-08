@@ -30,6 +30,8 @@ import {
   tick,
   startScheduler,
   defaultExecutors,
+  runLearningCycle,
+  gatherFailureSignals,
   type Schedule,
 } from '@ai-os/kernel';
 import { MemoryService } from '@ai-os/memory';
@@ -459,6 +461,45 @@ app.get('/dashboard', async () => {
 // install task); enable/disable changes the composed tool surface immediately.
 // ---------------------------------------------------------------------------
 app.get('/packs', async () => ({ packs: await listPacks(pool) }));
+
+// ---------------------------------------------------------------------------
+// M10 Learning Loop (ADR-0014): the audit trail of self-improvements, and a
+// manual trigger. A cycle proposes playbooks from recent failures and adopts one
+// ONLY if the gym proves no regression. POST /learning/run runs the real gym
+// (heavy + model-gated) — deliberately manual for now; a scheduled job comes next.
+// ---------------------------------------------------------------------------
+app.get('/improvements', async () => {
+  const { rows } = await pool.query(
+    `SELECT id, source, rationale, artifact, status, verdict, memory_id, created_at, decided_at
+     FROM improvements ORDER BY created_at DESC LIMIT 100`,
+  );
+  const signals = await gatherFailureSignals(pool, 5);
+  return { improvements: rows, failureSignals: { totalFailed: signals.totalFailed, recent: signals.failedTasks } };
+});
+
+app.post('/learning/run', async (req) => {
+  const { autoAdopt } = (req.body ?? {}) as { autoAdopt?: boolean };
+  // Runs the real LLM proposer + gym verifier. autoAdopt defaults to false here —
+  // over HTTP we propose+verify and QUEUE, leaving adoption an explicit choice.
+  return runLearningCycle(pool, { autoAdopt: autoAdopt ?? false });
+});
+
+app.post('/improvements/:id/adopt', async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const imp = (await pool.query(`SELECT artifact, status, task_id FROM improvements WHERE id=$1`, [id])).rows[0] as
+    | { artifact: { subject: string; content: string }; status: string; task_id: string }
+    | undefined;
+  if (!imp) return reply.code(404).send({ error: 'no such improvement' });
+  if (imp.status === 'adopted') return { ok: true, alreadyAdopted: true };
+  if (imp.status === 'rejected') return reply.code(409).send({ error: 'refusing to adopt a gym-rejected improvement' });
+  const mem = await memory.remember({
+    type: 'procedural', subject: imp.artifact.subject, content: imp.artifact.content,
+    tags: ['learned'], source: { task_id: imp.task_id },
+  });
+  await pool.query(`UPDATE improvements SET status='adopted', memory_id=$2, decided_at=now() WHERE id=$1`, [id, mem.id]);
+  trace.recordSafe({ traceId: req.traceId, component: 'learning', event: 'improvement.adopted', payload: { id, memoryId: mem.id } });
+  return { ok: true, memoryId: mem.id };
+});
 
 app.post('/packs/:name/install', async (req, reply) => {
   const { name } = req.params as { name: string };
