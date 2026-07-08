@@ -17,6 +17,24 @@ const MAX_ITERATIONS = 12;
 const KEEP_CHECKPOINTS = 3;
 const TOOL_RESULT_MAX_CHARS = 12000;
 
+// The raw provider error (e.g. "INFRA_RATELIMIT 429 (gemini): {…500 chars of JSON…}")
+// is kept verbatim in steps.error + the trace for debugging and stays visible on the
+// task-detail page. But dumping it into the CHAT reads as alarming and gives no next
+// step — so the chat gets a plain-language line instead. Falls through to a trimmed
+// raw message for anything we don't recognise (never a 500-char JSON blob).
+function humanizeFailure(msg: string): string {
+  if (/INFRA_RATELIMIT|\b429\b|\b503\b|quota|rate.?limit/i.test(msg)) {
+    return '⚠ I couldn’t finish that — the AI model provider is rate-limited right now. It usually clears within a minute, so please try again in a moment.';
+  }
+  if (/INFRA_NETWORK|fetch failed|ENOTFOUND|ECONNREFUSED|ETIMEDOUT/i.test(msg)) {
+    return '⚠ I couldn’t finish that — I had trouble reaching the AI model provider (network issue). Please try again.';
+  }
+  if (/tool_use_failed|malformed/i.test(msg)) {
+    return '⚠ The model produced a malformed tool call and the task stopped. Please try again — this is usually transient.';
+  }
+  return `⚠ Task failed: ${msg.slice(0, 200)}`;
+}
+
 interface CheckpointRecord {
   step_id: string | null;
   label: string;
@@ -172,7 +190,7 @@ export async function runTask(
       await pool.query(`UPDATE steps SET status='failed', error=$2, updated_at=now() WHERE id=$1`, [stepId, msg]);
       await pool.query(`UPDATE tasks SET status='failed', updated_at=now() WHERE id=$1`, [taskId]);
       await trace.record({ traceId, taskId, component: 'kernel', event: 'task.failed', payload: { error: msg } });
-      return { taskId, status: 'failed', text: `Task failed: ${msg}` };
+      return { taskId, status: 'failed', text: humanizeFailure(msg) };
     }
 
     totalTokens += resp.usage.inputTokens + resp.usage.outputTokens;
