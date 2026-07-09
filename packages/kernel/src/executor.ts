@@ -83,7 +83,22 @@ async function queuePendingAction(
   pool: pg.Pool,
   q: { taskId: string; tool: string; args: Record<string, unknown>; trustClass: string; untrusted: boolean },
 ): Promise<string> {
-  const sess = (await pool.query<{ session_id: string }>(`SELECT session_id FROM messages WHERE task_id=$1 AND role='user' LIMIT 1`, [q.taskId])).rows[0]?.session_id ?? null;
+  // Child agent tasks (M11) have no chat message of their own — walk up
+  // parent_task_id until a task with a session is found, so the approval card
+  // still lands in the conversation that spawned the orchestration.
+  const sess = (
+    await pool.query<{ session_id: string }>(
+      `WITH RECURSIVE lineage AS (
+         SELECT id, parent_task_id, 0 AS depth FROM tasks WHERE id = $1
+         UNION ALL
+         SELECT t.id, t.parent_task_id, l.depth + 1 FROM tasks t JOIN lineage l ON t.id = l.parent_task_id WHERE l.depth < 5
+       )
+       SELECT m.session_id FROM lineage l
+       JOIN messages m ON m.task_id = l.id AND m.role = 'user'
+       ORDER BY l.depth LIMIT 1`,
+      [q.taskId],
+    )
+  ).rows[0]?.session_id ?? null;
   const pa = await pool.query<{ id: string }>(
     `INSERT INTO pending_actions (task_id, session_id, tool, args, trust_class, untrusted_context) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
     [q.taskId, sess, q.tool, JSON.stringify(q.args), q.trustClass, q.untrusted],
@@ -116,6 +131,13 @@ export interface RunTaskOptions {
    *  MEMORY across messages instead of treating each as a brand-new task. The
    *  chat API passes the session's recent history here. */
   history?: ChatMessage[];
+  /** M11 agents: restrict this run to a named subset of the registry's tools —
+   *  a specialist sub-agent only SEES (and can only call) its own toolkit. */
+  allowedTools?: string[];
+  /** M11 agents: start with the §8.3 untrusted-content latch already ON —
+   *  set when a dependency subtask's output was untrusted-derived, so the
+   *  taint propagates ACROSS agents instead of resetting per child task. */
+  initialUntrusted?: boolean;
 }
 
 /** Run (or resume) a task to completion. Idempotent on restart. */
@@ -163,11 +185,13 @@ export async function runTask(
 
   const registry = opts.registry ?? buildRegistry();
   const gate = new TrustGate(pool);
-  const toolDefs = registry.list();
+  const allowed = opts.allowedTools?.length ? new Set(opts.allowedTools) : null;
+  const toolDefs = allowed ? registry.list().filter((t) => allowed.has(t.name)) : registry.list();
   const untrustedTools = new Set(toolDefs.filter((t) => t.untrustedOutput).map((t) => t.name));
   // Structural injection defense (§8.3): once untrusted content is in context,
   // the trust gate blocks mutating actions. Persists across iterations.
-  let untrustedInContext = false;
+  // M11: a child agent consuming an untrusted-derived dependency starts tainted.
+  let untrustedInContext = opts.initialUntrusted ?? false;
   let queuedApproval = false; // an irreversible tool got queued for the user's approval this run
   let totalTokens = 0;
 
@@ -229,8 +253,9 @@ export async function runTask(
            status = CASE WHEN $3::task_status = 'awaiting_approval' AND status = 'done'
                          THEN status ELSE $3::task_status END,
            spent = jsonb_set(spent, '{tokens}', to_jsonb((spent->>'tokens')::int + $2::int)),
+           untrusted = $4,
            updated_at = now() WHERE id = $1`,
-        [taskId, totalTokens, finalStatus],
+        [taskId, totalTokens, finalStatus, untrustedInContext],
       );
       await trace.record({ traceId, taskId, component: 'kernel', event: queuedApproval ? 'task.awaiting_approval' : 'task.done', payload: { iterations: iter + 1, tokens: totalTokens } });
       // Learn from the exchange (best-effort; skipped for eval runs and for
@@ -250,7 +275,12 @@ export async function runTask(
       let blocked = false;
       let queued = false;
 
-      if (!decision.autoApprove) {
+      if (allowed && !allowed.has(tc.name)) {
+        // M11 agent scoping: a specialist can only touch ITS toolkit. Checked
+        // before the approval-queue branch so an out-of-scope irreversible call
+        // can't even reach the user as a queued card.
+        result = { error: `tool ${tc.name} is not available to this agent (allowed: ${[...allowed].join(', ')})` };
+      } else if (!decision.autoApprove) {
         // Approval-required (irreversible/spend, e.g. whatsapp_send_message): chat
         // can't run it and can't collect approval mid-loop → QUEUE the exact call
         // for the user's one-click approval. The human seeing the exact args IS the
@@ -330,7 +360,7 @@ export async function runTask(
     await saveCheckpoint(pool, taskId, stepId, `iteration-${iter}`, messages);
   }
 
-  await pool.query(`UPDATE tasks SET status='failed', updated_at=now() WHERE id=$1`, [taskId]);
+  await pool.query(`UPDATE tasks SET status='failed', untrusted=$2, updated_at=now() WHERE id=$1`, [taskId, untrustedInContext]);
   await trace.record({ traceId, taskId, component: 'kernel', event: 'task.failed', payload: { error: 'iteration budget exceeded' } });
   return { taskId, status: 'failed', text: 'Task exceeded its iteration budget (12).' };
 }

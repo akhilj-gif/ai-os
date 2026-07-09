@@ -14,6 +14,8 @@ import { TraceStore, newTraceId } from '@ai-os/shared';
 import {
   runHelloWorldTask,
   runTask,
+  runAgentTask,
+  classifyGoal,
   findOrphanedTasks,
   ensureDefaultSession,
   addMessage,
@@ -235,7 +237,7 @@ const CHAT_HISTORY_TURNS = 12; // recent turns fed back so chat has memory acros
 // tail of a wall of text is rarely what the next turn depends on.
 const CHAT_HISTORY_MSG_CHARS = 500;
 
-async function completeChatTask(taskId: string): Promise<void> {
+async function completeChatTask(taskId: string, agentMode: 'auto' | 'force' | 'off' = 'auto'): Promise<void> {
   const { rows } = await pool.query<{ session_id: string }>(
     `SELECT session_id FROM messages WHERE task_id = $1 AND role = 'user' LIMIT 1`,
     [taskId],
@@ -253,12 +255,30 @@ async function completeChatTask(taskId: string): Promise<void> {
       content: m.content.length > CHAT_HISTORY_MSG_CHARS ? `${m.content.slice(0, CHAT_HISTORY_MSG_CHARS)} …[truncated]` : m.content,
     }));
 
-  const result = await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true, history: prior });
+  // M11 — the Brain: multi-domain goals get planned across specialist agents.
+  // 'auto' asks a routing-tier classifier (fail-safe → simple); AIOS_AGENTS=off
+  // is the kill switch. Orchestrated runs post progress lines into the chat.
+  let useAgents = false;
+  if (process.env.AIOS_AGENTS !== 'off' && agentMode !== 'off') {
+    if (agentMode === 'force') useAgents = true;
+    else {
+      const t = await pool.query<{ goal: string; trace_id: string }>(`SELECT goal, trace_id FROM tasks WHERE id=$1`, [taskId]);
+      useAgents = t.rows[0] ? (await classifyGoal(t.rows[0].goal, t.rows[0].trace_id)) === 'complex' : false;
+    }
+  }
+
+  const result = useAgents
+    ? await runAgentTask(pool, taskId, {
+        registry: packRegistry(),
+        extraSystem: packPrompt(),
+        say: async (content) => { await addMessage(pool, { sessionId, role: 'assistant', content, taskId }); },
+      })
+    : await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true, history: prior });
   await addMessage(pool, { sessionId, role: 'assistant', content: result.text, taskId });
 }
 
 app.post('/chat', async (req) => {
-  const { text, sessionId } = (req.body ?? {}) as { text?: string; sessionId?: string };
+  const { text, sessionId, agentMode } = (req.body ?? {}) as { text?: string; sessionId?: string; agentMode?: 'auto' | 'force' | 'off' };
   if (!text?.trim()) return { error: 'text is required' };
   // Robustness: a passed sessionId must be a real session, else fall back to the
   // default — a bad/unknown id used to FK-violate on addMessage and silently 500.
@@ -275,7 +295,7 @@ app.post('/chat', async (req) => {
   const taskId = rows[0]!.id;
   await addMessage(pool, { sessionId: session, role: 'user', content: text.trim(), taskId });
 
-  await completeChatTask(taskId);
+  await completeChatTask(taskId, agentMode ?? 'auto');
   const msgs = await listMessages(pool, session);
   const reply = msgs.filter((m) => m.task_id === taskId && m.role === 'assistant').at(-1);
   return { sessionId: session, taskId, reply: reply?.content ?? '' };
@@ -727,7 +747,7 @@ app.get('/tasks', async () => {
 
 app.get('/tasks/:id', async (req, reply) => {
   const { id } = req.params as { id: string };
-  const task = (await pool.query(`SELECT id, goal, status, spent, created_at, updated_at FROM tasks WHERE id=$1`, [id])).rows[0];
+  const task = (await pool.query(`SELECT id, goal, status, spent, parent_task_id, untrusted, created_at, updated_at FROM tasks WHERE id=$1`, [id])).rows[0];
   if (!task) return reply.code(404).send({ error: 'no such task' });
   const steps = (
     await pool.query(
@@ -736,7 +756,11 @@ app.get('/tasks/:id', async (req, reply) => {
       [id],
     )
   ).rows;
-  return { task, steps };
+  // M11: an orchestrated task's specialist subtasks, in creation order.
+  const children = (
+    await pool.query(`SELECT id, goal, status, untrusted, created_at FROM tasks WHERE parent_task_id=$1 ORDER BY created_at`, [id])
+  ).rows;
+  return { task, steps, children };
 });
 
 app.post('/tasks/:id/pause', async (req) => {
@@ -778,13 +802,35 @@ await app.listen({ port, host: '127.0.0.1' });
 void (async () => {
   const orphans = await findOrphanedTasks(pool);
   for (const taskId of orphans) {
+    // M11 guard: orchestrations are NOT blindly re-runnable. A parent that died
+    // mid-orchestration would re-plan from scratch (duplicate children + double
+    // token burn — happened live 2026-07-10); an agent CHILD's collector died
+    // with the parent, so resuming it is orphaned work. Both are marked failed
+    // honestly; the user just asks again. (Checkpointed orchestration resume is
+    // future work.)
+    const shape = (
+      await pool.query<{ created_by: string; has_children: boolean }>(
+        `SELECT created_by::text, EXISTS(SELECT 1 FROM tasks c WHERE c.parent_task_id = t.id) AS has_children
+         FROM tasks t WHERE t.id = $1`,
+        [taskId],
+      )
+    ).rows[0];
+    if (shape && (shape.created_by === 'agent' || shape.has_children)) {
+      await pool.query(`UPDATE tasks SET status='failed', updated_at=now() WHERE id=$1`, [taskId]);
+      const sess = (await pool.query<{ session_id: string }>(`SELECT session_id FROM messages WHERE task_id=$1 AND role='user' LIMIT 1`, [taskId])).rows[0]?.session_id;
+      if (sess) await addMessage(pool, { sessionId: sess, role: 'assistant', content: '⚠ A restart interrupted this multi-agent run — please ask again.', taskId });
+      app.log.warn({ taskId, agentChild: shape.created_by === 'agent' }, 'orphaned orchestration marked failed (not resumable)');
+      continue;
+    }
     // Route by shape: a task with planner-authored steps (local_id set) is a
     // graph task → resume via runGraph (skips done steps, exactly-once); a plain
-    // chat task → runTask. Both are durable-resumable.
+    // chat task → runTask. Both are durable-resumable. agentMode 'off': a resumed
+    // chat task continues from its checkpoint — re-classifying it into a fresh
+    // orchestration would discard that state.
     const isGraph = (await pool.query(`SELECT 1 FROM steps WHERE task_id=$1 AND local_id IS NOT NULL LIMIT 1`, [taskId])).rowCount ?? 0;
     app.log.info({ taskId, isGraph: !!isGraph }, 'resuming orphaned task');
     trace.recordSafe({ traceId: newTraceId(), taskId, component: 'api', event: 'task.resume_on_boot', payload: { graph: !!isGraph } });
-    const p = isGraph ? runGraph(pool, taskId, { registry: packRegistry() }) : completeChatTask(taskId);
+    const p = isGraph ? runGraph(pool, taskId, { registry: packRegistry() }) : completeChatTask(taskId, 'off');
     Promise.resolve(p).catch((err) => app.log.error({ err, taskId }, 'orphan resume failed'));
   }
 })();

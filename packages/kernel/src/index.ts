@@ -1,6 +1,18 @@
 // Kernel (blueprint §4.1) — M1: Session Manager (lite) + Executor Loop with
 // durable checkpoints and resume. Planner and full Task Graph arrive in M4.
 export { runTask, findOrphanedTasks, type TaskRunResult } from './executor.js';
+export {
+  runAgentTask,
+  classifyGoal,
+  orchestrate,
+  parsePlan,
+  topoWaves,
+  AGENTS,
+  type Subtask,
+  type ChildResult,
+  type AgentDef,
+  type AgentTaskOptions,
+} from './agents.js';
 export { ensureDefaultSession, addMessage, listMessages, type SessionMessage } from './sessions.js';
 export { systemPrompt } from './prompts.js';
 export { runHelloWorldTask, type HelloResult } from './hello-task.js';
