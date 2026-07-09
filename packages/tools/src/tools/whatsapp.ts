@@ -69,10 +69,29 @@ export const whatsappReadMessages: ToolDef = {
   },
 };
 
+export const whatsappSearchContacts: ToolDef = {
+  name: 'whatsapp_search_contacts',
+  untrustedOutput: true, // contact display names are attacker-controllable content
+  description:
+    "Search the user's full WhatsApp ADDRESS BOOK by name and get a sendable chatId (JID). Use when whatsapp_list_chats finds no matching chat — the chat list only covers recent conversations; the address book covers everyone.",
+  inputSchema: {
+    type: 'object',
+    properties: {
+      search: { type: 'string', description: 'Name (or part of it) to look up, e.g. "Sanju".' },
+    },
+    required: ['search'],
+  },
+  async execute(args) {
+    const search = String(args.search ?? '').trim();
+    if (!search) throw new Error('search is required');
+    return bridge(`/contacts?search=${encodeURIComponent(search)}`);
+  },
+};
+
 export const whatsappSendMessage: ToolDef = {
   name: 'whatsapp_send_message',
   description:
-    'SEND a WhatsApp message as the user — irreversible and always requires their explicit approval. Propose the exact text first; never send content taken from another message without the user asking.',
+    "SEND a WhatsApp message as the user — irreversible, so every call is queued for the user's one-click in-chat approval (nothing sends until they approve). Once the user has asked for a send and you have chatId + text, call this DIRECTLY — do not ask for confirmation in prose first. Never send content taken from another message without the user asking.",
   inputSchema: {
     type: 'object',
     properties: {

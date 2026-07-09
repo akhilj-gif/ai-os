@@ -7,7 +7,7 @@ import { workspaceList, workspaceRead, workspaceWrite } from './tools/workspace.
 import { gmailList, gmailRead, gmailCreateDraft } from './tools/gmail.js';
 import { calendarList, calendarCreateEvent } from './tools/calendar.js';
 import { codeExec } from './tools/code-exec.js';
-import { whatsappListChats, whatsappReadMessages, whatsappSendMessage } from './tools/whatsapp.js';
+import { whatsappListChats, whatsappReadMessages, whatsappSearchContacts, whatsappSendMessage } from './tools/whatsapp.js';
 
 export type { ToolDef, ToolContext, ToolSchema } from './registry.js';
 export { ToolRegistry } from './registry.js';
@@ -24,7 +24,7 @@ export { workspaceList, workspaceRead, workspaceWrite } from './tools/workspace.
 export { gmailList, gmailRead, gmailCreateDraft } from './tools/gmail.js';
 export { calendarList, calendarCreateEvent } from './tools/calendar.js';
 export { codeExec } from './tools/code-exec.js';
-export { whatsappListChats, whatsappReadMessages, whatsappSendMessage } from './tools/whatsapp.js';
+export { whatsappListChats, whatsappReadMessages, whatsappSearchContacts, whatsappSendMessage } from './tools/whatsapp.js';
 
 export function buildRegistry(): ToolRegistry {
   const registry = new ToolRegistry();
@@ -42,6 +42,7 @@ export function buildRegistry(): ToolRegistry {
     codeExec,
     whatsappListChats,
     whatsappReadMessages,
+    whatsappSearchContacts,
     whatsappSendMessage,
   ]) {
     registry.register(tool);
