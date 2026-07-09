@@ -184,7 +184,13 @@ export async function runTask(
 
     let resp;
     try {
-      resp = await chat({ role: 'execution', messages, tools: toolDefs, traceId, taskId });
+      // maxTokens 1024 (not the router's 2048 default): providers BOOK max_tokens
+      // against the tokens-per-minute window up front (Groq free tier: 12k TPM for
+      // llama-3.3-70b). At 2048, two concurrent tasks' bookings collided → both
+      // 429'd → synchronized 70s retries → minutes-long "hangs" (dogfooded
+      // 2026-07-09, voice testing). Replies don't need >1024 tokens (~750 words);
+      // halving the reservation lets two tasks fit the window side by side.
+      resp = await chat({ role: 'execution', messages, tools: toolDefs, traceId, taskId, maxTokens: 1024 });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await pool.query(`UPDATE steps SET status='failed', error=$2, updated_at=now() WHERE id=$1`, [stepId, msg]);

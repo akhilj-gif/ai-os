@@ -209,6 +209,14 @@ export async function transcribe(audio: Buffer, mime: string): Promise<string> {
       const fd = new FormData();
       fd.append('file', new Blob([new Uint8Array(audio)], { type: mime }), `audio.${ext}`);
       fd.append('model', STT_MODEL);
+      // Short accented clips make Whisper's language auto-detect misfire badly
+      // (real dogfooding result: English commands transcribed as Tamil and
+      // Icelandic gibberish). Commands are English — pin it, zero temperature,
+      // and bias with a domain prompt. AIOS_STT_LANGUAGE overrides if Akhil
+      // ever wants Telugu/Hindi commands.
+      fd.append('language', process.env.AIOS_STT_LANGUAGE ?? 'en');
+      fd.append('temperature', '0');
+      fd.append('prompt', 'Short spoken command to a personal AI assistant about calendar, email, WhatsApp, meetings, reminders, or web search.');
       return { method: 'POST', headers: { authorization: `Bearer ${apiKey}` }, body: fd };
     },
     `groq/${STT_MODEL}`,
@@ -305,9 +313,17 @@ async function fetchWithRateLimitRetry(
     const body = lastRes ? await lastRes.clone().text() : '';
     const headerWait = (lastRes && Number(lastRes.headers.get('retry-after')) * 1000) || 0;
     const bodyWait = (Number(body.match(/retry in (\d+(?:\.\d+)?)s/i)?.[1]) || 0) * 1000;
-    const waitMs = Math.min(Math.max(headerWait, bodyWait, round * 5_000) + 1_000, MAX_WAIT_MS);
+    // Jitter (0–4s): two callers that 429'd together would otherwise honor the
+    // SAME hint and re-collide every round in lockstep (observed as a minutes-
+    // long mutual livelock between a chat task and a background task).
+    const jitter = Math.random() * 4_000;
+    const waitMs = Math.min(Math.max(headerWait, bodyWait, round * 5_000) + 1_000 + jitter, MAX_WAIT_MS);
     const reason = lastRes ? `all ${keys.length} key(s) rate-limited` : 'network errors';
-    console.warn(`[model-router] ${label}: ${reason}, waiting ${Math.round(waitMs / 1000)}s (round ${round}/${MAX_ROUNDS})`);
+    // Surface the provider's own explanation (e.g. Groq's "on tokens per minute
+    // (TPM): Limit 12000, Requested 15406") — a Requested>Limit request can NEVER
+    // succeed by waiting, and without this line that failure mode is invisible.
+    const why = body.replace(/\s+/g, ' ').slice(0, 220);
+    console.warn(`[model-router] ${label}: ${reason}, waiting ${Math.round(waitMs / 1000)}s (round ${round}/${MAX_ROUNDS})${why ? ` — ${why}` : ''}`);
     await new Promise((r) => setTimeout(r, waitMs));
   }
   // Unreachable (loop returns/throws on MAX_ROUNDS), but satisfies the type.

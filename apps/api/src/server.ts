@@ -228,6 +228,12 @@ app.get('/oauth/google/status', async () => {
 // Chat
 // ---------------------------------------------------------------------------
 const CHAT_HISTORY_TURNS = 12; // recent turns fed back so chat has memory across messages
+// Each replayed turn is capped: one giant message (a pasted wall, an old raw error
+// dump) otherwise balloons the prompt past Groq's free-tier tokens-per-minute cap,
+// and the chat "hangs" for minutes inside the rate-limit retry loop before failing
+// (dogfooded on the 102-message main session). Memory quality loses little — the
+// tail of a wall of text is rarely what the next turn depends on.
+const CHAT_HISTORY_MSG_CHARS = 500;
 
 async function completeChatTask(taskId: string): Promise<void> {
   const { rows } = await pool.query<{ session_id: string }>(
@@ -242,7 +248,10 @@ async function completeChatTask(taskId: string): Promise<void> {
   const prior = (await listMessages(pool, sessionId))
     .filter((m) => m.task_id !== taskId && (m.role === 'user' || m.role === 'assistant') && m.content?.trim())
     .slice(-CHAT_HISTORY_TURNS)
-    .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+    .map((m) => ({
+      role: m.role as 'user' | 'assistant',
+      content: m.content.length > CHAT_HISTORY_MSG_CHARS ? `${m.content.slice(0, CHAT_HISTORY_MSG_CHARS)} …[truncated]` : m.content,
+    }));
 
   const result = await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true, history: prior });
   await addMessage(pool, { sessionId, role: 'assistant', content: result.text, taskId });

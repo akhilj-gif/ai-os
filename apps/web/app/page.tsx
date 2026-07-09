@@ -219,6 +219,12 @@ export default function Home() {
       setVoice('stt');
       try {
         const blob = new Blob(chunks, { type: mime });
+        // A sub-split-second blip (accidental double-click) makes Whisper
+        // hallucinate a phantom phrase — don't even upload it. ~1s ≈ 15KB opus.
+        if (blob.size < 3000) {
+          setVoiceErr("Didn't catch that — hold the mic a bit longer and speak clearly.");
+          return;
+        }
         const r = await fetch('/api/voice/transcribe', { method: 'POST', headers: { 'content-type': mime }, body: blob });
         const d = (await r.json()) as { text?: string; error?: string };
         if (d.text) await send(d.text);
