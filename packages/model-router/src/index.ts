@@ -492,6 +492,29 @@ async function chatOn(provider: Provider, model: string, input: ChatInput, retry
     input: { messages: input.messages.slice(-6), tools: input.tools?.map((t) => t.name) },
   });
 
+  const parseToolCalls = (msg: ChatMessage): ParsedToolCall[] =>
+    (msg.tool_calls ?? []).map((tc, i) => {
+      // Defensive: a provider may return a malformed tool_call with `function`
+      // missing/null. Read every field safely so one bad entry can't throw and
+      // abort the whole executor loop — an empty-named/arg call surfaces back to
+      // the model as a normal (rejected) tool result instead.
+      const fn = tc?.function ?? { name: '', arguments: '' };
+      let args: Record<string, unknown> = {};
+      try {
+        args = JSON.parse(fn.arguments || '{}') as Record<string, unknown>;
+      } catch {
+        // leave args empty; the tool will report missing params back to the model
+      }
+      return { id: tc?.id ?? `call_${i}`, name: fn.name ?? '', args };
+    });
+
+  // Groq/gpt-oss's inline pseudo tool-call flake (see the two call sites below)
+  // is confirmed non-deterministic but NOT reliably fixed by a single retry —
+  // observed two consecutive tool_use_failed generations for the same request
+  // during dogfooding (2026-07-09). Bounded, and only ever entered on this exact
+  // signature, so it can't turn a real error into a retry storm.
+  const MAX_TOOL_CALL_RETRIES = 2;
+
   try {
     const doFetch = () =>
       fetchWithRateLimitRetry(
@@ -525,35 +548,44 @@ async function chatOn(provider: Provider, model: string, input: ChatInput, retry
     // Groq/gpt-oss occasionally emits its tool call as inline pseudo-syntax
     // (`<function=name{...}>`) instead of a proper tool_calls entry, which Groq's
     // own API then rejects as a 400 "tool_use_failed" — a generation-formatting
-    // flake, not a real error: confirmed non-deterministic (retrying the identical
-    // request succeeds). Costs one extra call, only when tools were offered.
-    if (!res.ok && res.status === 400 && input.tools?.length) {
+    // flake, not a real error. Only when tools were offered.
+    for (let attempt = 1; !res.ok && res.status === 400 && input.tools?.length && attempt <= MAX_TOOL_CALL_RETRIES; attempt++) {
       const body = await res.clone().text();
-      if (/tool_use_failed/i.test(body)) {
-        console.warn(`[model-router] ${provider.name}/${model}: tool_use_failed (malformed tool-call generation) — retrying once`);
-        res = await doFetch();
-      }
+      if (!/tool_use_failed/i.test(body)) break;
+      console.warn(`[model-router] ${provider.name}/${model}: tool_use_failed (malformed tool-call generation) — retry ${attempt}/${MAX_TOOL_CALL_RETRIES}`);
+      res = await doFetch();
     }
     if (!res.ok) throwHttp(provider, res.status, await res.text());
-    const data = (await res.json()) as {
+    type ChatResponseBody = {
       choices?: Array<{ message?: ChatMessage }>;
       usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
-    const message = data.choices?.[0]?.message ?? { role: 'assistant' as const, content: '' };
-    const toolCalls: ParsedToolCall[] = (message.tool_calls ?? []).map((tc, i) => {
-      // Defensive: a provider may return a malformed tool_call with `function`
-      // missing/null. Read every field safely so one bad entry can't throw and
-      // abort the whole executor loop — an empty-named/arg call surfaces back to
-      // the model as a normal (rejected) tool result instead.
-      const fn = tc?.function ?? { name: '', arguments: '' };
-      let args: Record<string, unknown> = {};
-      try {
-        args = JSON.parse(fn.arguments || '{}') as Record<string, unknown>;
-      } catch {
-        // leave args empty; the tool will report missing params back to the model
-      }
-      return { id: tc?.id ?? `call_${i}`, name: fn.name ?? '', args };
-    });
+    let data = (await res.json()) as ChatResponseBody;
+    let message = data.choices?.[0]?.message ?? { role: 'assistant' as const, content: '' };
+    let toolCalls = parseToolCalls(message);
+
+    // Same underlying flake as the tool_use_failed retry above, different
+    // symptom: instead of Groq's own validator rejecting the generation with a
+    // 400, it lets a 200 OK through with the tool call written as inline pseudo-
+    // syntax in `content` (e.g. `<function=calendar_list{"timeMin":...}>`) and no
+    // structured tool_calls entry — which would otherwise reach the user
+    // verbatim as the "final answer".
+    for (
+      let attempt = 1;
+      toolCalls.length === 0 && input.tools?.length && /<function=\w+\{/.test(message.content ?? '') && attempt <= MAX_TOOL_CALL_RETRIES;
+      attempt++
+    ) {
+      console.warn(`[model-router] ${provider.name}/${model}: inline pseudo tool-call syntax in content (no structured tool_calls) — retry ${attempt}/${MAX_TOOL_CALL_RETRIES}`);
+      const retryRes = await doFetch();
+      if (!retryRes.ok) break; // fall through with the original (still garbled) message rather than throwing
+      const retryData = (await retryRes.json()) as ChatResponseBody;
+      const retryMessage = retryData.choices?.[0]?.message;
+      if (!retryMessage) break;
+      data = retryData;
+      message = retryMessage;
+      toolCalls = parseToolCalls(message);
+    }
+
     const usage = {
       inputTokens: data.usage?.prompt_tokens ?? 0,
       outputTokens: data.usage?.completion_tokens ?? 0,
