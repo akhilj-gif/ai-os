@@ -218,8 +218,16 @@ export async function runTask(
       // waiting on the user's approval. Reflect that honestly in the status.
       const finalStatus = queuedApproval ? 'awaiting_approval' : 'done';
       await saveCheckpoint(pool, taskId, stepId, 'final', messages);
+      // Race guard (dogfooded 2026-07-09): the user can Approve/Reject the queued
+      // action in chat BEFORE this loop finishes its final write — decide() has
+      // then already resolved the task to 'done', and blindly writing
+      // 'awaiting_approval' over it parked the task as "active" forever. The CASE
+      // makes the write atomic: never demote a decided ('done') task back to
+      // awaiting_approval. (Row lock in UPDATE = no check-then-write window.)
       await pool.query(
-        `UPDATE tasks SET status=$3,
+        `UPDATE tasks SET
+           status = CASE WHEN $3::task_status = 'awaiting_approval' AND status = 'done'
+                         THEN status ELSE $3::task_status END,
            spent = jsonb_set(spent, '{tokens}', to_jsonb((spent->>'tokens')::int + $2::int)),
            updated_at = now() WHERE id = $1`,
         [taskId, totalTokens, finalStatus],

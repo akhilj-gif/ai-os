@@ -44,7 +44,7 @@ module.exports = {
       ...common,
       name: 'ai-os-web',
       script: join(root, 'apps/web/node_modules/next/dist/bin/next'),
-      args: 'dev -p 3000',
+      args: 'dev -p 3000 -H 127.0.0.1',
       interpreter: 'node',
       cwd: join(root, 'apps/web'),
       out_file: join(root, 'logs/web.log'),

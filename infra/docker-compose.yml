@@ -5,7 +5,10 @@ services:
     image: pgvector/pgvector:pg16
     restart: unless-stopped
     ports:
-      - "5432:5432"
+      # 127.0.0.1 prefix: without it Docker publishes on 0.0.0.0 and the DB
+      # (dev password, holds cached email/WhatsApp content + oauth_tokens) is
+      # reachable from the LAN. Security-audit finding 2026-07-09.
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_PASSWORD: aios
       POSTGRES_DB: aios
@@ -22,7 +25,7 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379" # redis has no auth — never expose beyond loopback
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -38,7 +41,7 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "3030:3000"
+      - "127.0.0.1:3030:3000" # langfuse dev creds are public in this file — loopback only
     environment:
       DATABASE_URL: postgresql://postgres:aios@postgres:5432/langfuse
       NEXTAUTH_URL: http://localhost:3030
