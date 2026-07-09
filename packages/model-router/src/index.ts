@@ -189,6 +189,35 @@ export async function embedOne(text: string): Promise<number[]> {
   return (await embed(text))[0]!;
 }
 
+// ---------------------------------------------------------------------------
+// Speech-to-text (voice commands). Always Groq — the only configured provider
+// serving Whisper on the free tier (mirrors embed()'s Gemini-only rationale:
+// modality-specific engines ignore MODEL_PROVIDER). whisper-large-v3-turbo is
+// multilingual (handles Indian-English/Hinglish accents), fast, 25MB file cap.
+// ---------------------------------------------------------------------------
+const STT_MODEL = 'whisper-large-v3-turbo';
+
+export async function transcribe(audio: Buffer, mime: string): Promise<string> {
+  const key = process.env.GROQ_API_KEY;
+  if (!key) throw new Error('voice transcription requires GROQ_API_KEY');
+  const ext = mime.split('/')[1]?.split(';')[0] ?? 'webm';
+  const res = await fetchWithRateLimitRetry(
+    'https://api.groq.com/openai/v1/audio/transcriptions',
+    [key],
+    (apiKey) => {
+      // Rebuilt per attempt — a consumed multipart body can't be re-sent.
+      const fd = new FormData();
+      fd.append('file', new Blob([new Uint8Array(audio)], { type: mime }), `audio.${ext}`);
+      fd.append('model', STT_MODEL);
+      return { method: 'POST', headers: { authorization: `Bearer ${apiKey}` }, body: fd };
+    },
+    `groq/${STT_MODEL}`,
+  );
+  if (!res.ok) throwHttp({ name: 'groq' } as Provider, res.status, await res.text());
+  const data = (await res.json()) as { text?: string };
+  return (data.text ?? '').trim();
+}
+
 export interface ModelCallInput {
   role: ModelRole;
   prompt: string;

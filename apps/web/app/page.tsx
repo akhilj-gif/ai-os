@@ -59,6 +59,10 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [google, setGoogle] = useState<GoogleStatus | null>(null);
   const [apiOk, setApiOk] = useState<boolean | null>(null);
+  const [voice, setVoice] = useState<'idle' | 'rec' | 'stt'>('idle');
+  const [voiceErr, setVoiceErr] = useState<string | null>(null);
+  const recRef = useRef<MediaRecorder | null>(null);
+  const autoStopRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const refreshSessions = useCallback(async (): Promise<SessionSummary[]> => {
@@ -165,8 +169,8 @@ export default function Home() {
     }
   }
 
-  async function send() {
-    const text = input.trim();
+  async function send(textOverride?: string) {
+    const text = (textOverride ?? input).trim();
     if (!text || busy || !sessionId) return;
     setInput('');
     setBusy(true);
@@ -186,6 +190,50 @@ export default function Home() {
     await refresh();
     void refreshSessions(); // updated_at / preview changed
     setBusy(false);
+  }
+
+  // Voice commands: record mic audio → POST raw bytes to /voice/transcribe
+  // (Groq Whisper) → the transcript goes through send() exactly like typed
+  // text, so the user sees what was heard and the trust gate still applies.
+  async function toggleVoice() {
+    if (voice === 'rec') {
+      recRef.current?.stop(); // onstop below does the rest
+      return;
+    }
+    if (voice !== 'idle' || busy) return;
+    setVoiceErr(null);
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      setVoiceErr('Microphone blocked — allow mic access for this site and try again.');
+      return;
+    }
+    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
+    const rec = new MediaRecorder(stream, { mimeType: mime });
+    const chunks: Blob[] = [];
+    rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    rec.onstop = async () => {
+      clearTimeout(autoStopRef.current);
+      stream.getTracks().forEach((t) => t.stop()); // release the mic (tab indicator off)
+      setVoice('stt');
+      try {
+        const blob = new Blob(chunks, { type: mime });
+        const r = await fetch('/api/voice/transcribe', { method: 'POST', headers: { 'content-type': mime }, body: blob });
+        const d = (await r.json()) as { text?: string; error?: string };
+        if (d.text) await send(d.text);
+        else setVoiceErr(d.error ?? "Didn't catch that — try again closer to the mic.");
+      } catch {
+        setVoiceErr('Transcription failed — is the kernel online?');
+      } finally {
+        setVoice('idle');
+      }
+    };
+    rec.start();
+    recRef.current = rec;
+    // Commands are short; hard-stop at 60s so a forgotten mic can't upload forever.
+    autoStopRef.current = setTimeout(() => { if (rec.state === 'recording') rec.stop(); }, 60_000);
+    setVoice('rec');
   }
 
   return (
@@ -376,37 +424,59 @@ export default function Home() {
           background: 'linear-gradient(transparent, #0c0d14 30%)',
         }}
       >
-        <div style={{ maxWidth: 760, margin: '0 auto', display: 'flex', gap: 8 }}>
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask AI OS…"
-            style={{
-              flex: 1,
-              padding: '12px 16px',
-              borderRadius: 10,
-              border: '1px solid #2a2e45',
-              background: '#12141f',
-              color: '#e6e8f0',
-              fontSize: 14,
-              outline: 'none',
-            }}
-          />
-          <button
-            type="submit"
-            disabled={busy || !sessionId}
-            style={{
-              padding: '0 22px',
-              borderRadius: 10,
-              border: 'none',
-              background: busy || !sessionId ? '#2a2e45' : '#4b78ff',
-              color: 'white',
-              fontSize: 14,
-              cursor: busy || !sessionId ? 'default' : 'pointer',
-            }}
-          >
-            {busy ? '…' : 'Send'}
-          </button>
+        <div style={{ maxWidth: 760, margin: '0 auto' }}>
+          {voiceErr && (
+            <p style={{ margin: '0 0 6px', fontSize: 12, color: '#f87171' }}>{voiceErr}</p>
+          )}
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder={voice === 'rec' ? '🔴 listening — click ⏹ to run the command' : voice === 'stt' ? 'transcribing…' : 'Ask AI OS…'}
+              style={{
+                flex: 1,
+                padding: '12px 16px',
+                borderRadius: 10,
+                border: `1px solid ${voice === 'rec' ? '#7a2733' : '#2a2e45'}`,
+                background: '#12141f',
+                color: '#e6e8f0',
+                fontSize: 14,
+                outline: 'none',
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => void toggleVoice()}
+              disabled={(busy || !sessionId) && voice === 'idle'}
+              title={voice === 'rec' ? 'Stop & run the command' : 'Speak a command'}
+              style={{
+                padding: '0 16px',
+                borderRadius: 10,
+                border: `1px solid ${voice === 'rec' ? '#f87171' : '#2a2e45'}`,
+                background: voice === 'rec' ? '#3a1520' : 'transparent',
+                color: voice === 'rec' ? '#f87171' : '#9aa0b5',
+                fontSize: 16,
+                cursor: 'pointer',
+              }}
+            >
+              {voice === 'rec' ? '⏹' : voice === 'stt' ? '…' : '🎤'}
+            </button>
+            <button
+              type="submit"
+              disabled={busy || !sessionId}
+              style={{
+                padding: '0 22px',
+                borderRadius: 10,
+                border: 'none',
+                background: busy || !sessionId ? '#2a2e45' : '#4b78ff',
+                color: 'white',
+                fontSize: 14,
+                cursor: busy || !sessionId ? 'default' : 'pointer',
+              }}
+            >
+              {busy ? '…' : 'Send'}
+            </button>
+          </div>
         </div>
       </form>
     </main>

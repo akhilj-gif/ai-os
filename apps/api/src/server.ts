@@ -35,7 +35,7 @@ import {
   type Schedule,
 } from '@ai-os/kernel';
 import { MemoryService } from '@ai-os/memory';
-import { failoverChain } from '@ai-os/model-router';
+import { failoverChain, transcribe } from '@ai-os/model-router';
 import { composeRegistry, packPrompts, loadEnabledPacks, installPack, setPackEnabled, listPacks, PACKS } from '@ai-os/packs';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
@@ -270,6 +270,36 @@ app.post('/chat', async (req) => {
   const msgs = await listMessages(pool, session);
   const reply = msgs.filter((m) => m.task_id === taskId && m.role === 'assistant').at(-1);
   return { sessionId: session, taskId, reply: reply?.content ?? '' };
+});
+
+// ---------------------------------------------------------------------------
+// Voice commands (M11 seed): raw recorder audio in → Whisper text out.
+// Transcription is an INTERFACE concern — the kernel never sees audio, only the
+// resulting text, which the client then sends through the normal /chat trust
+// path (so approval-required tools still queue for in-chat approval; a
+// mis-heard command can at worst run read-class tools).
+// ---------------------------------------------------------------------------
+// Groq's Whisper endpoint caps files at 25MB; match it so the recorder can't
+// overflow us first. Parser body is the raw bytes — no multipart dependency.
+app.addContentTypeParser(/^audio\/.+/, { parseAs: 'buffer', bodyLimit: 25 * 1024 * 1024 }, (_req, body, done) =>
+  done(null, body),
+);
+
+app.post('/voice/transcribe', async (req, reply) => {
+  const audio = req.body as Buffer;
+  if (!Buffer.isBuffer(audio) || audio.length === 0) {
+    return reply.code(400).send({ error: 'send raw audio bytes with an audio/* content-type' });
+  }
+  const mime = req.headers['content-type'] ?? 'audio/webm';
+  try {
+    const text = await transcribe(audio, mime);
+    trace.recordSafe({ traceId: req.traceId, component: 'api', event: 'voice.transcribed', payload: { bytes: audio.length, chars: text.length } });
+    return { text };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    req.log.error({ err }, 'voice transcription failed');
+    return reply.code(502).send({ error: /INFRA_RATELIMIT/.test(msg) ? 'transcription rate-limited — try again in a moment' : 'transcription failed' });
+  }
 });
 
 app.get('/messages', async (req) => {
