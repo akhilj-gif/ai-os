@@ -17,7 +17,7 @@ export {
 export { ensureDefaultSession, addMessage, listMessages, type SessionMessage } from './sessions.js';
 export { systemPrompt } from './prompts.js';
 export { runHelloWorldTask, type HelloResult } from './hello-task.js';
-export { assembleMemoryContext, compactHistory } from './context.js';
+export { assembleMemoryContext, compactHistory, shrinkToolResults } from './context.js';
 export { makePlan, type Plan, type PlannedStep } from './planner.js';
 export {
   planAndStart,

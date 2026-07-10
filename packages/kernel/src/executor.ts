@@ -11,11 +11,15 @@ import { buildRegistry, type ToolRegistry } from '@ai-os/tools';
 import { TrustGate, blockedByUntrustedContext, redactForAudit } from '@ai-os/trust';
 import { extractAndStore } from '@ai-os/memory';
 import { systemPrompt } from './prompts.js';
-import { assembleMemoryContext, compactHistory } from './context.js';
+import { assembleMemoryContext, compactHistory, shrinkToolResults } from './context.js';
 
 const MAX_ITERATIONS = 12;
 const KEEP_CHECKPOINTS = 3;
 const TOOL_RESULT_MAX_CHARS = 12000;
+// Per-REQUEST input budget (approx tokens). Groq free tier rejects any single
+// request over 8k TPM — with maxTokens 1024 booked on top, ~6.4k input leaves
+// headroom for tool definitions. Raise via env when a paid provider is primary.
+const CONTEXT_TOKEN_BUDGET = Number(process.env.AIOS_CONTEXT_TOKEN_BUDGET) || 6400;
 
 // The raw provider error (e.g. "INFRA_RATELIMIT 429 (gemini): {…500 chars of JSON…}")
 // is kept verbatim in steps.error + the trace for debugging and stays visible on the
@@ -205,6 +209,10 @@ export async function runTask(
 
     // Keep long multi-iteration tasks under budget (§7.3 pt 5).
     messages = compactHistory(messages);
+    // Fit THIS request in the provider's per-request ceiling: truncate the
+    // oldest tool results first (an oversized request can never succeed by
+    // waiting — Requested > Limit is a shape problem, not a timing one).
+    messages = shrinkToolResults(messages, CONTEXT_TOKEN_BUDGET);
 
     let resp;
     try {

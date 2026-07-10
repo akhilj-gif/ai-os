@@ -68,6 +68,46 @@ export async function assembleMemoryContext(
  *  verbatim exchanges. Keeps assistant/tool_call pairing intact by only ever
  *  collapsing standalone tool-result content, never splitting a call/result pair.
  *  Returns a new array; caller decides when to invoke. */
+/** Fit the NEXT request inside a provider's per-request token ceiling by
+ *  truncating the OLDEST tool-result messages first (a web page the model
+ *  already extracted findings from rarely needs to ride along verbatim).
+ *  Groq free tier enforces 8k tokens per request: one oversized request can
+ *  NEVER succeed by waiting/retrying (Requested > Limit — dogfooded live
+ *  2026-07-10 when a researcher's 2nd fetch_url pushed the context to 8.9k).
+ *  Guarantees: never drops a message (tool_call/result pairing intact), never
+ *  touches non-tool messages, never touches the CURRENT round's results (the
+ *  model still needs what it just read), and preserves the [UNTRUSTED …]
+ *  provenance banner because truncation keeps the content head. No-op when
+ *  already under budget. */
+export function shrinkToolResults(messages: ChatMessage[], budgetTokens: number, keepChars = 400): ChatMessage[] {
+  const size = (m: ChatMessage): number =>
+    approxTokens(typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '')) +
+    (m.tool_calls?.length ? approxTokens(JSON.stringify(m.tool_calls)) : 0);
+  let total = messages.reduce((n, m) => n + size(m), 0);
+  if (total <= budgetTokens) return messages;
+
+  // The last assistant-with-tool-calls turn starts the current round — its
+  // results stay verbatim.
+  let currentRound = messages.length;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.role === 'assistant' && messages[i]!.tool_calls?.length) {
+      currentRound = i;
+      break;
+    }
+  }
+
+  const marker = '\n…[older tool output truncated to fit the model window; re-run the tool if the full content is needed]';
+  const out = messages.map((m) => ({ ...m }));
+  for (let i = 0; i < currentRound && total > budgetTokens; i++) {
+    const m = out[i]!;
+    if (m.role !== 'tool' || typeof m.content !== 'string' || m.content.length <= keepChars + marker.length) continue;
+    total -= approxTokens(m.content);
+    m.content = m.content.slice(0, keepChars) + marker;
+    total += approxTokens(m.content);
+  }
+  return out;
+}
+
 export function compactHistory(messages: ChatMessage[], maxMessages = 40, keepRecent = 12): ChatMessage[] {
   if (messages.length <= maxMessages) return messages;
   const system = messages[0]?.role === 'system' ? [messages[0]] : [];
