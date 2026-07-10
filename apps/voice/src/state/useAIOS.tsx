@@ -4,6 +4,7 @@
 // → chat → spoken reply), and approval decisions. Components stay presentational.
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api, type Msg, type PendingAction, type SessionSummary } from '../api/client';
+import { isSpeech, rmsFromByteTimeDomain, vadDecision } from '../lib/vad';
 
 export type VoiceState = 'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking';
 
@@ -18,6 +19,10 @@ interface AIOS {
   voiceErr: string | null;
   autoSpeak: boolean;
   setAutoSpeak: (v: boolean) => void;
+  /** M12d hands-free conversation mode: VAD ends each utterance; the mic
+   *  re-arms automatically after the spoken reply. */
+  conversation: boolean;
+  setConversation: (v: boolean) => void;
   send: (text: string) => Promise<void>;
   toggleVoice: () => Promise<void>;
   decide: (id: string, decision: 'approved' | 'rejected') => Promise<void>;
@@ -53,11 +58,35 @@ export function AIOSProvider({ children }: { children: ReactNode }) {
   const [online, setOnline] = useState<boolean | null>(null);
   const [voiceErr, setVoiceErr] = useState<string | null>(null);
   const [autoSpeak, setAutoSpeak] = useState(() => localStorage.getItem('aios-voice-autospeak') !== 'off');
+  const [conversation, setConversationState] = useState(() => localStorage.getItem('aios-voice-convo') === 'on');
   const recRef = useRef<MediaRecorder | null>(null);
   const autoStopRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const spokenRef = useRef<Set<string>>(new Set()); // message ids already spoken
+  // Long-lived callbacks (TTS onend, VAD poller) need CURRENT values, not the
+  // closure at definition time.
+  const conversationRef = useRef(conversation);
+  const voiceRef = useRef<VoiceState>('idle');
+  const busyRef = useRef(false);
+  const startListeningRef = useRef<(() => Promise<void>) | null>(null);
 
   useEffect(() => localStorage.setItem('aios-voice-autospeak', autoSpeak ? 'on' : 'off'), [autoSpeak]);
+  useEffect(() => {
+    conversationRef.current = conversation;
+    localStorage.setItem('aios-voice-convo', conversation ? 'on' : 'off');
+  }, [conversation]);
+  useEffect(() => {
+    voiceRef.current = voice;
+  }, [voice]);
+  useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
+
+  // Conversation mode rides on the spoken reply (the re-arm hooks its `onend`),
+  // so enabling it force-enables auto-speak.
+  const setConversation = useCallback((v: boolean) => {
+    setConversationState(v);
+    if (v) setAutoSpeak(true);
+  }, []);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -99,7 +128,19 @@ export function AIOSProvider({ children }: { children: ReactNode }) {
       const u = new SpeechSynthesisUtterance(text);
       u.rate = 1.04;
       u.onstart = () => setVoice((v) => (v === 'idle' || v === 'thinking' ? 'speaking' : v));
-      u.onend = () => setVoice((v) => (v === 'speaking' ? 'idle' : v));
+      u.onend = () => {
+        setVoice((v) => (v === 'speaking' ? 'idle' : v));
+        // M12d hands-free turn-taking: the reply finished → re-arm the mic.
+        // (Also fires after a barge-in cancel — the user interrupting to talk
+        // is exactly when they want the mic.) Never while the tab is hidden.
+        if (conversationRef.current && !document.hidden) {
+          setTimeout(() => {
+            if (conversationRef.current && voiceRef.current === 'idle' && !busyRef.current && !document.hidden) {
+              void startListeningRef.current?.();
+            }
+          }, 350);
+        }
+      };
       window.speechSynthesis.speak(u);
     } catch {
       /* no TTS voice available — stay silent */
@@ -173,17 +214,11 @@ export function AIOSProvider({ children }: { children: ReactNode }) {
   );
 
   // Voice: record (webm/opus) → /voice/transcribe → send. 60s hard cap;
-  // sub-3KB blips are dropped (Whisper hallucinates on them).
-  const toggleVoice = useCallback(async () => {
-    if (voice === 'speaking') {
-      stopSpeaking(); // barge-in: interrupting always wins
-      return;
-    }
-    if (voice === 'listening') {
-      recRef.current?.stop();
-      return;
-    }
-    if (voice !== 'idle' || busy) return;
+  // sub-3KB blips are dropped (Whisper hallucinates on them). In conversation
+  // mode a WebAudio VAD ends each utterance (trailing silence) and a silent
+  // arming ABORTS — discard-not-send is always the failure mode (ADR-0015).
+  const startListening = useCallback(async () => {
+    if (voiceRef.current !== 'idle' || busyRef.current) return;
     setVoiceErr(null);
     let stream: MediaStream;
     try {
@@ -195,12 +230,55 @@ export function AIOSProvider({ children }: { children: ReactNode }) {
     const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
     const rec = new MediaRecorder(stream, { mimeType: mime });
     const chunks: Blob[] = [];
+    let aborted = false; // VAD heard nothing → discard, never transcribe
     rec.ondataavailable = (e) => {
       if (e.data.size > 0) chunks.push(e.data);
     };
+
+    // VAD (conversation mode only): poll mic energy; end the utterance on
+    // trailing silence, abort a fully-silent arming. The manual button flow
+    // keeps its tap-to-stop behavior untouched.
+    let vadCleanup: (() => void) | null = null;
+    if (conversationRef.current && typeof AudioContext !== 'undefined') {
+      try {
+        const ac = new AudioContext();
+        const srcNode = ac.createMediaStreamSource(stream);
+        const an = ac.createAnalyser();
+        an.fftSize = 512;
+        srcNode.connect(an);
+        const buf = new Uint8Array(an.fftSize);
+        const t0 = Date.now();
+        let sawSpeech = false;
+        let lastSpeechAt = t0;
+        const iv = setInterval(() => {
+          an.getByteTimeDomainData(buf);
+          const now = Date.now();
+          if (isSpeech(rmsFromByteTimeDomain(buf))) {
+            sawSpeech = true;
+            lastSpeechAt = now;
+          }
+          const verdict = vadDecision({ sawSpeech, sinceSpeechMs: now - lastSpeechAt, sinceStartMs: now - t0 });
+          if (verdict === 'continue') return;
+          if (verdict === 'abort-silent') aborted = true;
+          if (rec.state === 'recording') rec.stop();
+        }, 100);
+        vadCleanup = () => {
+          clearInterval(iv);
+          void ac.close().catch(() => undefined);
+        };
+      } catch {
+        /* no AudioContext → fall back to tap-to-stop */
+      }
+    }
+
     rec.onstop = async () => {
+      vadCleanup?.();
       clearTimeout(autoStopRef.current);
       stream.getTracks().forEach((t) => t.stop());
+      if (aborted) {
+        setVoice('idle'); // heard nothing — silently stand down (no error, no send)
+        return;
+      }
       setVoice('transcribing');
       try {
         const blob = new Blob(chunks, { type: mime });
@@ -228,7 +306,24 @@ export function AIOSProvider({ children }: { children: ReactNode }) {
       if (rec.state === 'recording') rec.stop();
     }, 60_000);
     setVoice('listening');
-  }, [voice, busy, send, stopSpeaking]);
+  }, [send]);
+
+  useEffect(() => {
+    startListeningRef.current = startListening;
+  }, [startListening]);
+
+  const toggleVoice = useCallback(async () => {
+    if (voice === 'speaking') {
+      stopSpeaking(); // barge-in: interrupting always wins
+      return;
+    }
+    if (voice === 'listening') {
+      recRef.current?.stop();
+      return;
+    }
+    if (voice !== 'idle' || busy) return;
+    await startListening();
+  }, [voice, busy, startListening, stopSpeaking]);
 
   const decide = useCallback(
     async (id: string, decision: 'approved' | 'rejected') => {
@@ -280,6 +375,8 @@ export function AIOSProvider({ children }: { children: ReactNode }) {
       voiceErr,
       autoSpeak,
       setAutoSpeak,
+      conversation,
+      setConversation,
       send,
       toggleVoice,
       decide,
@@ -288,7 +385,7 @@ export function AIOSProvider({ children }: { children: ReactNode }) {
       deleteSession,
       stopSpeaking,
     }),
-    [sessionId, sessions, messages, pending, voice, busy, online, voiceErr, autoSpeak, send, toggleVoice, decide, newChat, switchTo, deleteSession, stopSpeaking],
+    [sessionId, sessions, messages, pending, voice, busy, online, voiceErr, autoSpeak, conversation, setConversation, send, toggleVoice, decide, newChat, switchTo, deleteSession, stopSpeaking],
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

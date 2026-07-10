@@ -6,7 +6,7 @@ import { api } from '../api/client';
 import { useAIOS } from '../state/useAIOS';
 
 export default function Settings() {
-  const { autoSpeak, setAutoSpeak, online } = useAIOS();
+  const { autoSpeak, setAutoSpeak, conversation, setConversation, online } = useAIOS();
   const [google, setGoogle] = useState<{ connected: boolean; email?: string | null } | null>(null);
   const [milestone, setMilestone] = useState<string>('');
 
@@ -31,6 +31,14 @@ export default function Settings() {
                 className={`w-12 h-7 rounded-full transition-colors relative ${autoSpeak ? 'bg-[#3B82F6]' : 'bg-[#1a2436]'}`}
               >
                 <motion.div layout className="absolute top-1 w-5 h-5 rounded-full bg-white shadow" style={{ left: autoSpeak ? 26 : 4 }} />
+              </button>
+            </Row>
+            <Row label="Conversation mode" desc="Hands-free: the mic re-arms after each spoken reply; silence ends your turn automatically (nothing is sent if you stay quiet)">
+              <button
+                onClick={() => setConversation(!conversation)}
+                className={`w-12 h-7 rounded-full transition-colors relative ${conversation ? 'bg-[#00D4FF]' : 'bg-[#1a2436]'}`}
+              >
+                <motion.div layout className="absolute top-1 w-5 h-5 rounded-full bg-white shadow" style={{ left: conversation ? 26 : 4 }} />
               </button>
             </Row>
             <Row label="Speech-to-text" desc="Groq Whisper (English-pinned) via the kernel — nothing leaves your machine except the audio to Groq" />

@@ -24,7 +24,7 @@ function greeting(): string {
 }
 
 export default function Home() {
-  const { voice, toggleVoice, messages, busy } = useAIOS();
+  const { voice, toggleVoice, messages, busy, conversation } = useAIOS();
   const navigate = useNavigate();
 
   // Space = push-to-talk toggle (when not typing in a field).
@@ -91,6 +91,12 @@ export default function Home() {
         </motion.div>
 
         <AIOrb state={voice} onClick={() => void toggleVoice()} />
+        {conversation && (
+          <div className="mt-4 flex items-center gap-2 text-[12.5px] text-[#00D4FF]/80">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#00D4FF] animate-pulse" />
+            Conversation mode — the mic re-arms after each reply
+          </div>
+        )}
 
         <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.8, duration: 1 }} className="mt-10 text-center min-h-[64px]">
           <AnimatePresence mode="wait">
