@@ -285,7 +285,21 @@ const qrPage = async (): Promise<string> => {
 app.get('/', async (_req, reply) => reply.type('text/html').send(await qrPage()));
 app.get('/qr', async (_req, reply) => reply.type('text/html').send(await qrPage()));
 
-app.get('/health', async () => ({ ok: true, paired, needsRepair, me, impl: 'baileys' }));
+app.get('/health', async () => {
+  // M12a: WhatsApp splits the user's own "message yourself" thread across TWO
+  // ids — the phone JID and a privacy @lid alias (dogfooded 2026-07-11: a
+  // command sent from the phone landed in the @lid twin and the remote poller
+  // never saw it). Report EVERY id the self-chat lives under so the poller
+  // can watch them all.
+  const selfChats: string[] = [];
+  if (me) {
+    const pn = `${me}@s.whatsapp.net`;
+    selfChats.push(pn);
+    const lid = pnToLid.get(pn);
+    if (lid) selfChats.push(lid);
+  }
+  return { ok: true, paired, needsRepair, me, selfChats, impl: 'baileys' };
+});
 app.get('/chats', async (req) => {
   const { limit: limitRaw, search } = req.query as { limit?: string; search?: string };
   const limit = Math.min(Number(limitRaw) || 20, 200);

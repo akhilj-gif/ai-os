@@ -124,7 +124,43 @@ const deps: RemoteDeps = {
   check('restart replays nothing', r.processed === 0 && ranCommands.length === before);
 }
 
-// 9. formatApprovalPrompt is phone-sized and self-describing.
+// 9. The LID split (live bug 2026-07-11): WhatsApp keeps the self-chat under
+//    BOTH the phone JID and a privacy @lid alias — a command arriving in the
+//    @lid twin must be seen, and the reply must land in that same alias.
+console.log('\n— multi-alias self-chat (@lid twin) —');
+{
+  let lidCursor: RemoteCursor = { lastTs: '2026-07-11T00:00:00.000Z', seenIds: [], announced: [] };
+  const ran2: string[] = [];
+  const sends2: Array<{ chatId: string; text: string }> = [];
+  const lidDeps: RemoteDeps = {
+    health: async () => ({ ok: true, paired: true, me: '9163@s.whatsapp.net', selfChats: ['9163@s.whatsapp.net', '37284@lid'] }),
+    messages: async (chatId) =>
+      chatId === '37284@lid'
+        ? [{ id: 'lid-1', fromMe: true, text: '@os send the poem', timestamp: '2026-07-11T01:00:00.000Z' }]
+        : [{ id: 'pn-1', fromMe: true, text: 'old note', timestamp: '2026-07-10T00:00:00.000Z' }],
+    send: async (chatId, text) => {
+      sends2.push({ chatId, text });
+      return { messageId: `sent-${sends2.length}` };
+    },
+    runCommand: async (text) => {
+      ran2.push(text);
+      return 'poem queued';
+    },
+    decidePending: async () => 'n/a',
+    listPending: async () => [],
+    loadCursor: async () => lidCursor,
+    saveCursor: async (c) => {
+      lidCursor = c;
+    },
+  };
+  const r = await tickRemote(lidDeps);
+  check('command in the @lid twin is seen', r.processed === 1 && ran2.join() === 'send the poem');
+  check('reply lands in the SAME alias it came from', sends2.length === 1 && sends2[0]!.chatId === '37284@lid');
+  const r2 = await tickRemote(lidDeps);
+  check('lid command not replayed next tick', r2.processed === 0 && ran2.length === 1);
+}
+
+// 10. formatApprovalPrompt is phone-sized and self-describing.
 {
   const p = formatApprovalPrompt({ id: 'aaaabbbb-0000-0000-0000-000000000000', tool: 'x_publish_post', args: { text: 'hello world' }, untrusted: false });
   check('prompt carries tool, args, and reply instructions', p.includes('x_publish_post') && p.includes('hello world') && p.includes('@os approve aaaabbbb'));

@@ -66,7 +66,7 @@ export async function startMockBridge(port = 0): Promise<MockBridge> {
     if (token && req.headers['x-bridge-token'] !== token) return reply.code(401).send({ error: 'bad bridge token' });
   });
 
-  app.get('/health', async () => ({ ok: true, paired: true, me: MOCK_ME, impl: 'mock' }));
+  app.get('/health', async () => ({ ok: true, paired: true, me: MOCK_ME, selfChats: [MOCK_ME], impl: 'mock' }));
   app.get('/chats', async (req) => {
     const limit = Math.min(Number((req.query as { limit?: string }).limit) || 20, 50);
     return { chats: CHATS.slice(0, limit) };

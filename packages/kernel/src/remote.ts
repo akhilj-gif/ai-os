@@ -37,7 +37,11 @@ export interface PendingSummary {
 }
 
 export interface RemoteDeps {
-  health(): Promise<{ ok: boolean; paired: boolean; me?: string }>;
+  /** selfChats: EVERY id the user's own chat lives under — WhatsApp splits
+   *  the message-yourself thread across the phone JID and a privacy @lid
+   *  alias (a phone-sent command landed in the @lid twin live 2026-07-11).
+   *  Absent → derived from `me`. */
+  health(): Promise<{ ok: boolean; paired: boolean; me?: string; selfChats?: string[] }>;
   messages(chatId: string, limit: number): Promise<RemoteMessage[]>;
   send(chatId: string, text: string): Promise<{ messageId?: string }>;
   /** Run a goal through the normal chat trust path; returns the reply text. */
@@ -102,13 +106,22 @@ export async function tickRemote(deps: RemoteDeps): Promise<RemoteTickResult> {
   const h = await deps.health();
   if (!h.ok || !h.paired) return { skipped: 'unpaired', processed: 0, replies: 0, announced: 0 };
   const me = h.me ?? '';
-  if (!me) return { skipped: 'no-self-chat', processed: 0, replies: 0, announced: 0 };
-  const selfChat = me.includes('@') ? me : `${me}@s.whatsapp.net`;
+  const selfChats = h.selfChats?.length ? h.selfChats : me ? [me.includes('@') ? me : `${me}@s.whatsapp.net`] : [];
+  if (selfChats.length === 0) return { skipped: 'no-self-chat', processed: 0, replies: 0, announced: 0 };
+  const primaryChat = selfChats[0]!; // announcements go here; replies go where the command arrived
 
   const cursor = await deps.loadCursor();
   const seen = new Set(cursor.seenIds ?? []);
   const announced = new Set(cursor.announced ?? []);
-  const msgs = await deps.messages(selfChat, 25);
+  // Merge every self-chat alias into one command stream.
+  const msgs: Array<RemoteMessage & { chatId: string }> = [];
+  for (const chatId of selfChats) {
+    try {
+      for (const m of await deps.messages(chatId, 25)) msgs.push({ ...m, chatId });
+    } catch {
+      /* an alias the bridge has no history for yet — skip it this tick */
+    }
+  }
   const maxTs = msgs.reduce<string | null>((m, x) => (m === null || x.timestamp > m ? x.timestamp : m), cursor.lastTs);
 
   // First run: initialize the watermark and process NOTHING — years of
@@ -136,7 +149,8 @@ export async function tickRemote(deps: RemoteDeps): Promise<RemoteTickResult> {
       reply = `⚠ That command failed: ${err instanceof Error ? err.message.slice(0, 200) : 'unknown error'}`;
     }
     try {
-      const sent = await deps.send(selfChat, reply);
+      // Reply into the alias the command arrived in (same visual thread on the phone).
+      const sent = await deps.send(m.chatId, reply);
       replies++;
       if (sent.messageId) seen.add(sent.messageId); // structural loop-prevention
     } catch {
@@ -150,7 +164,7 @@ export async function tickRemote(deps: RemoteDeps): Promise<RemoteTickResult> {
   for (const p of await deps.listPending()) {
     if (announced.has(p.id)) continue;
     try {
-      const sent = await deps.send(selfChat, formatApprovalPrompt(p, trigger));
+      const sent = await deps.send(primaryChat, formatApprovalPrompt(p, trigger));
       announced.add(p.id);
       announcedNow++;
       if (sent.messageId) seen.add(sent.messageId);

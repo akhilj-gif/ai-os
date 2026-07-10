@@ -226,6 +226,37 @@ export async function transcribe(audio: Buffer, mime: string): Promise<string> {
   return (data.text ?? '').trim();
 }
 
+// ---------------------------------------------------------------------------
+// Text-to-speech (spoken replies). Always Groq, like transcribe()/embed() —
+// Orpheus (Canopy Labs) gives a natural human voice instead of the browser's
+// robotic speechSynthesis default. Voice is env-tunable; default "tara" is a
+// realistic FEMALE voice (Akhil's ask, 2026-07-11). NB playai-tts was
+// DECOMMISSIONED on Groq (400 as of 2026-07-11) — orpheus is its successor;
+// any synth failure makes the UI fall back to the browser voice.
+// ---------------------------------------------------------------------------
+const TTS_MODEL = process.env.MODEL_TTS ?? 'canopylabs/orpheus-v1-english';
+const TTS_VOICE = process.env.AIOS_TTS_VOICE ?? 'tara';
+const TTS_MAX_CHARS = 900; // matches the UI's speakable() cap; PlayAI's own cap is 10k
+
+export async function synthesize(text: string): Promise<{ audio: Buffer; mime: string }> {
+  const key = process.env.GROQ_API_KEY;
+  if (!key) throw new Error('voice synthesis requires GROQ_API_KEY');
+  const input = text.trim().slice(0, TTS_MAX_CHARS);
+  if (!input) throw new Error('nothing to speak');
+  const res = await fetchWithRateLimitRetry(
+    'https://api.groq.com/openai/v1/audio/speech',
+    [key],
+    (apiKey) => ({
+      method: 'POST',
+      headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: TTS_MODEL, voice: TTS_VOICE, input, response_format: 'wav' }),
+    }),
+    `groq/${TTS_MODEL}`,
+  );
+  if (!res.ok) throwHttp({ name: 'groq' } as Provider, res.status, await res.text());
+  return { audio: Buffer.from(await res.arrayBuffer()), mime: 'audio/wav' };
+}
+
 export interface ModelCallInput {
   role: ModelRole;
   prompt: string;

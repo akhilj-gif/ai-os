@@ -25,7 +25,7 @@ export default function Settings() {
 
         <div className="space-y-4 overflow-y-auto scrollbar-hide pr-2">
           <Section icon={<Volume2 size={18} className="text-[#3B82F6]" />} title="Voice">
-            <Row label="Speak replies aloud" desc="Assistant responses are read with the browser's voice">
+            <Row label="Speak replies aloud" desc="Replies are spoken with a natural voice (Groq PlayAI, falls back to the browser voice)">
               <button
                 onClick={() => setAutoSpeak(!autoSpeak)}
                 className={`w-12 h-7 rounded-full transition-colors relative ${autoSpeak ? 'bg-[#3B82F6]' : 'bg-[#1a2436]'}`}

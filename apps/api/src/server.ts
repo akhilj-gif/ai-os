@@ -40,7 +40,7 @@ import {
   type Schedule,
 } from '@ai-os/kernel';
 import { MemoryService } from '@ai-os/memory';
-import { failoverChain, transcribe } from '@ai-os/model-router';
+import { failoverChain, transcribe, synthesize } from '@ai-os/model-router';
 import { composeRegistry, packPrompts, loadEnabledPacks, installPack, setPackEnabled, listPacks, PACKS } from '@ai-os/packs';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
@@ -331,6 +331,24 @@ app.post('/voice/transcribe', async (req, reply) => {
     const msg = err instanceof Error ? err.message : String(err);
     req.log.error({ err }, 'voice transcription failed');
     return reply.code(502).send({ error: /INFRA_RATELIMIT/.test(msg) ? 'transcription rate-limited — try again in a moment' : 'transcription failed' });
+  }
+});
+
+// M12d follow-up (2026-07-11): natural spoken replies. Groq Orpheus TTS renders
+// the reply as a realistic female voice ("tara"); any failure (quota, no key)
+// → 502 and the UI falls back to the browser's speechSynthesis. Interface
+// concern — the kernel never hears audio.
+app.post('/voice/speak', async (req, reply) => {
+  const { text } = (req.body ?? {}) as { text?: string };
+  if (!text?.trim()) return reply.code(400).send({ error: 'text is required' });
+  try {
+    const { audio, mime } = await synthesize(text);
+    trace.recordSafe({ traceId: req.traceId, component: 'api', event: 'voice.synthesized', payload: { chars: text.length, bytes: audio.length } });
+    return reply.type(mime).send(audio);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    req.log.warn({ err: msg.slice(0, 200) }, 'voice synthesis failed (UI falls back to browser TTS)');
+    return reply.code(502).send({ error: /terms/i.test(msg) ? 'the TTS model needs a one-time terms acceptance in the Groq console' : 'synthesis unavailable' });
   }
 });
 

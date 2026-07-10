@@ -58,7 +58,9 @@ export function AIOSProvider({ children }: { children: ReactNode }) {
   const [online, setOnline] = useState<boolean | null>(null);
   const [voiceErr, setVoiceErr] = useState<string | null>(null);
   const [autoSpeak, setAutoSpeak] = useState(() => localStorage.getItem('aios-voice-autospeak') !== 'off');
-  const [conversation, setConversationState] = useState(() => localStorage.getItem('aios-voice-convo') === 'on');
+  // Hands-free is the product's whole point — conversation mode defaults ON
+  // (Akhil's feedback 2026-07-11: "I have to manually press to speak").
+  const [conversation, setConversationState] = useState(() => localStorage.getItem('aios-voice-convo') !== 'off');
   const recRef = useRef<MediaRecorder | null>(null);
   const autoStopRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const spokenRef = useRef<Set<string>>(new Set()); // message ids already spoken
@@ -68,6 +70,7 @@ export function AIOSProvider({ children }: { children: ReactNode }) {
   const voiceRef = useRef<VoiceState>('idle');
   const busyRef = useRef(false);
   const startListeningRef = useRef<(() => Promise<void>) | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null); // server-TTS playback (barge-in target)
 
   useEffect(() => localStorage.setItem('aios-voice-autospeak', autoSpeak ? 'on' : 'off'), [autoSpeak]);
   useEffect(() => {
@@ -118,34 +121,88 @@ export function AIOSProvider({ children }: { children: ReactNode }) {
     if (sessionId) localStorage.setItem(LAST_SESSION_KEY, sessionId);
   }, [sessionId]);
 
-  const speak = useCallback((m: Msg) => {
-    if (spokenRef.current.has(m.id)) return;
-    spokenRef.current.add(m.id);
-    const text = speakable(m.content);
-    if (!text) return;
-    try {
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(text);
-      u.rate = 1.04;
-      u.onstart = () => setVoice((v) => (v === 'idle' || v === 'thinking' ? 'speaking' : v));
-      u.onend = () => {
-        setVoice((v) => (v === 'speaking' ? 'idle' : v));
-        // M12d hands-free turn-taking: the reply finished → re-arm the mic.
-        // (Also fires after a barge-in cancel — the user interrupting to talk
-        // is exactly when they want the mic.) Never while the tab is hidden.
-        if (conversationRef.current && !document.hidden) {
-          setTimeout(() => {
-            if (conversationRef.current && voiceRef.current === 'idle' && !busyRef.current && !document.hidden) {
-              void startListeningRef.current?.();
-            }
-          }, 350);
+  // M12d hands-free turn-taking: after the spoken reply ends (either TTS
+  // path), re-arm the mic. Also fires after a barge-in stop — interrupting to
+  // talk is exactly when the user wants the mic. Never while the tab is hidden.
+  const onReplyEnd = useCallback(() => {
+    setVoice((v) => (v === 'speaking' ? 'idle' : v));
+    if (conversationRef.current && !document.hidden) {
+      setTimeout(() => {
+        if (conversationRef.current && voiceRef.current === 'idle' && !busyRef.current && !document.hidden) {
+          void startListeningRef.current?.();
         }
-      };
-      window.speechSynthesis.speak(u);
-    } catch {
-      /* no TTS voice available — stay silent */
+      }, 350);
     }
   }, []);
+
+  /** Browser fallback voice: prefer a natural-sounding FEMALE voice over the
+   *  robotic default (Neerja = Indian English; Natural/Online = Edge neural). */
+  const pickBrowserVoice = useCallback((): SpeechSynthesisVoice | null => {
+    const voices = window.speechSynthesis.getVoices();
+    const prefs = [
+      /neerja/i,
+      /(jenny|aria|sonia|emma|michelle).*(natural|online)/i,
+      /(natural|online).*(jenny|aria|sonia|emma|michelle)/i,
+      /google uk english female/i,
+      /zira/i,
+      /heera/i,
+      /female/i,
+    ];
+    for (const p of prefs) {
+      const v = voices.find((v) => p.test(v.name));
+      if (v) return v;
+    }
+    return null;
+  }, []);
+
+  const speak = useCallback(
+    (m: Msg) => {
+      if (spokenRef.current.has(m.id)) return;
+      spokenRef.current.add(m.id);
+      const text = speakable(m.content);
+      if (!text) return;
+      void (async () => {
+        // Preferred path: the kernel's natural TTS (Groq PlayAI, female voice).
+        try {
+          const blob = await api.speakAudio(text);
+          if (blob && blob.size > 0) {
+            window.speechSynthesis.cancel();
+            audioRef.current?.pause();
+            const url = URL.createObjectURL(blob);
+            const audio = new Audio(url);
+            audioRef.current = audio;
+            audio.onplay = () => setVoice((v) => (v === 'idle' || v === 'thinking' ? 'speaking' : v));
+            audio.onended = () => {
+              URL.revokeObjectURL(url);
+              onReplyEnd();
+            };
+            audio.onerror = () => {
+              URL.revokeObjectURL(url);
+              onReplyEnd();
+            };
+            await audio.play();
+            return;
+          }
+        } catch {
+          /* server TTS unavailable → browser fallback below */
+        }
+        try {
+          window.speechSynthesis.cancel();
+          const u = new SpeechSynthesisUtterance(text);
+          const v = pickBrowserVoice();
+          if (v) u.voice = v;
+          u.rate = 1.04;
+          u.pitch = 1.03;
+          u.onstart = () => setVoice((vv) => (vv === 'idle' || vv === 'thinking' ? 'speaking' : vv));
+          u.onend = onReplyEnd;
+          window.speechSynthesis.speak(u);
+        } catch {
+          /* no TTS voice available — stay silent */
+        }
+      })();
+    },
+    [onReplyEnd, pickBrowserVoice],
+  );
 
   const stopSpeaking = useCallback(() => {
     try {
@@ -153,8 +210,13 @@ export function AIOSProvider({ children }: { children: ReactNode }) {
     } catch {
       /* ignore */
     }
-    setVoice((v) => (v === 'speaking' ? 'idle' : v));
-  }, []);
+    if (audioRef.current) {
+      audioRef.current.onended = null; // pausing must not double-fire the re-arm
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+    onReplyEnd(); // barge-in: interrupting = wanting to talk → re-arm applies
+  }, [onReplyEnd]);
 
   // The heartbeat: poll messages + pending for the active session.
   const refresh = useCallback(async () => {

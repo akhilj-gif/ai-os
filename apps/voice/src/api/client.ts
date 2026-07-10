@@ -97,6 +97,14 @@ export const api = {
     return (await res.json()) as { text?: string; error?: string };
   },
 
+  /** Natural TTS via the kernel (Groq PlayAI). Null = unavailable (quota /
+   *  terms not accepted / no key) — caller falls back to browser TTS. */
+  speakAudio: async (text: string): Promise<Blob | null> => {
+    const res = await fetch('/api/voice/speak', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }) });
+    if (!res.ok) return null;
+    return res.blob();
+  },
+
   tasks: () => j<{ tasks: TaskSummary[] }>('/tasks'),
   task: (id: string) => j<TaskDetail>(`/tasks/${id}`),
 
