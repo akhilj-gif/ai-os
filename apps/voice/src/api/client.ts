@@ -32,6 +32,8 @@ export interface TaskSummary {
   id: string;
   goal: string;
   status: 'draft' | 'planning' | 'running' | 'paused' | 'awaiting_approval' | 'done' | 'failed';
+  /** set on an orchestration's specialist children (M11) — the UI nests them under this parent */
+  parent_task_id?: string | null;
 }
 
 export interface TaskDetail {

@@ -57,11 +57,14 @@ export default function RightPanel() {
           {tasks.length === 0 && <div className="text-[13px] text-[#5B6575] px-1 py-3">No tasks yet — ask something.</div>}
           {tasks.map((t) => {
             const meta = STATUS_META[t.status] ?? STATUS_META.draft!;
+            // M11: a specialist child renders as an indented tree node under
+            // the flow of its orchestration, not as a full-width row.
+            const isChild = !!t.parent_task_id;
             return (
-              <div key={t.id} className="flex items-center gap-3 p-2.5 rounded-[14px] hover:bg-white/[0.03] transition-colors cursor-default">
-                <div className="w-9 h-9 rounded-xl bg-[#101722] border border-white/[0.06] flex items-center justify-center shrink-0">{meta.icon}</div>
+              <div key={t.id} className={`flex items-center gap-3 p-2.5 rounded-[14px] hover:bg-white/[0.03] transition-colors cursor-default ${isChild ? 'ml-6 border-l border-[#00D4FF]/20 pl-3' : ''}`}>
+                <div className={`${isChild ? 'w-7 h-7' : 'w-9 h-9'} rounded-xl bg-[#101722] border border-white/[0.06] flex items-center justify-center shrink-0`}>{meta.icon}</div>
                 <div className="flex-1 min-w-0">
-                  <div className="text-[13.5px] text-[#F7F9FC] truncate">{t.goal}</div>
+                  <div className={`${isChild ? 'text-[12.5px] text-[#98A4B8]' : 'text-[13.5px] text-[#F7F9FC]'} truncate`}>{t.goal}</div>
                 </div>
                 <span className={`text-[12px] font-medium shrink-0 ${meta.color}`}>{meta.label}</span>
               </div>

@@ -740,8 +740,10 @@ app.post('/plan', async (req) => {
 });
 
 app.get('/tasks', async () => {
+  // parent_task_id lets the UI nest an orchestration's specialist children
+  // under their parent (M11 tree view) instead of listing them flat.
   const { rows } = await pool.query(
-    `SELECT id, goal, status, created_by, created_at, updated_at FROM tasks ORDER BY created_at DESC LIMIT 50`,
+    `SELECT id, goal, status, created_by, parent_task_id, created_at, updated_at FROM tasks ORDER BY created_at DESC LIMIT 50`,
   );
   return { tasks: rows };
 });

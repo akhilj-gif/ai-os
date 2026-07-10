@@ -43,10 +43,23 @@ export default function Tasks() {
     }
   }
 
+  // M11 tree view: an orchestration's specialist children nest under their
+  // parent instead of appearing as their own top-level rows.
+  const childrenByParent = new Map<string, TaskSummary[]>();
+  for (const t of tasks) {
+    if (!t.parent_task_id) continue;
+    const list = childrenByParent.get(t.parent_task_id) ?? [];
+    list.push(t);
+    childrenByParent.set(t.parent_task_id, list);
+  }
+  // children arrive newest-first from the API; show them in creation order
+  for (const list of childrenByParent.values()) list.reverse();
+  const roots = tasks.filter((t) => !t.parent_task_id);
+
   const groups = [
-    { title: 'Active', tasks: tasks.filter((t) => ['running', 'planning', 'awaiting_approval', 'paused'].includes(t.status)) },
-    { title: 'Recent', tasks: tasks.filter((t) => t.status === 'done').slice(0, 15) },
-    { title: 'Failed', tasks: tasks.filter((t) => t.status === 'failed').slice(0, 8) },
+    { title: 'Active', tasks: roots.filter((t) => ['running', 'planning', 'awaiting_approval', 'paused'].includes(t.status)) },
+    { title: 'Recent', tasks: roots.filter((t) => t.status === 'done').slice(0, 15) },
+    { title: 'Failed', tasks: roots.filter((t) => t.status === 'failed').slice(0, 8) },
   ];
 
   return (
@@ -89,18 +102,6 @@ export default function Tasks() {
                             <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="overflow-hidden">
                               <div className="ml-14 mt-2 mb-1 p-4 rounded-[14px] bg-[#05070A]/60 border border-white/[0.04] space-y-2.5">
                                 {!detail && <div className="text-[12.5px] text-[#5B6575]">Loading…</div>}
-                                {detail?.children && detail.children.length > 0 && (
-                                  <div>
-                                    <div className="text-[11px] uppercase tracking-wider text-[#5B6575] mb-1.5">Agents</div>
-                                    {detail.children.map((c) => (
-                                      <div key={c.id} className="flex items-center gap-2 text-[13px] py-1">
-                                        <Bot size={13} className="text-[#00D4FF] shrink-0" />
-                                        <span className="text-[#98A4B8] truncate flex-1">{c.goal}</span>
-                                        <span className={(META[c.status] ?? META.draft!).color}>{(META[c.status] ?? META.draft!).label}</span>
-                                      </div>
-                                    ))}
-                                  </div>
-                                )}
                                 {detail?.steps
                                   .filter((s) => s.output?.text || s.error)
                                   .slice(-3)
@@ -115,6 +116,49 @@ export default function Tasks() {
                                   ))}
                               </div>
                             </motion.div>
+                          )}
+
+                          {/* M11 tree: specialist children nested under the orchestration parent */}
+                          {(childrenByParent.get(task.id) ?? []).length > 0 && (
+                            <div className="ml-9 mt-1 pl-5 border-l border-[#00D4FF]/20 flex flex-col gap-1">
+                              {childrenByParent.get(task.id)!.map((c) => {
+                                const cMeta = META[c.status] ?? META.draft!;
+                                const cOpen = open === c.id;
+                                return (
+                                  <div key={c.id}>
+                                    <div
+                                      onClick={() => void toggle(c.id)}
+                                      className={`flex items-center gap-3 py-2 px-3 rounded-[12px] border transition-all cursor-pointer ${
+                                        cOpen ? 'border-[#00D4FF]/25 bg-[#101722]/70' : 'border-transparent hover:bg-[#101722]/60 hover:border-white/[0.06]'
+                                      }`}
+                                    >
+                                      <Bot size={14} className={`shrink-0 ${cMeta.spin ? 'text-[#3B82F6]' : 'text-[#00D4FF]'}`} />
+                                      <span className="text-[13px] text-[#98A4B8] truncate flex-1">{c.goal}</span>
+                                      <span className={`text-[12px] font-medium shrink-0 ${cMeta.color}`}>{cMeta.label}</span>
+                                    </div>
+                                    {cOpen && (
+                                      <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="overflow-hidden">
+                                        <div className="ml-7 mt-1 mb-1 p-3 rounded-[12px] bg-[#05070A]/60 border border-white/[0.04] space-y-2">
+                                          {!detail && <div className="text-[12.5px] text-[#5B6575]">Loading…</div>}
+                                          {detail?.steps
+                                            .filter((s) => s.output?.text || s.error)
+                                            .slice(-3)
+                                            .map((s) => (
+                                              <div key={s.id} className="text-[12.5px] leading-relaxed">
+                                                {s.error ? (
+                                                  <span className="text-[#F87171]">{s.error.slice(0, 220)}</span>
+                                                ) : (
+                                                  <span className="text-[#98A4B8] whitespace-pre-wrap">{s.output!.text!.slice(0, 400)}</span>
+                                                )}
+                                              </div>
+                                            ))}
+                                        </div>
+                                      </motion.div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
                           )}
                         </motion.div>
                       );
