@@ -2,7 +2,7 @@
   "name": "ai-os",
   "private": true,
   "version": "0.0.1",
-  "description": "Personal AI Operating System — see docs/BLUEPRINT.md",
+  "description": "Personal AI Operating System \u2014 see docs/BLUEPRINT.md",
   "type": "module",
   "scripts": {
     "dev": "pnpm --parallel --filter @ai-os/api --filter @ai-os/web dev",
@@ -26,5 +26,11 @@
   "dependencies": {
     "dotenv": "^17.4.2",
     "pg": "^8.22.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "baseline-browser-mapping": "2.10.40",
+      "browserslist": "4.28.4"
+    }
   }
 }

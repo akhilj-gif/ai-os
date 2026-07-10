@@ -50,5 +50,17 @@ module.exports = {
       out_file: join(root, 'logs/web.log'),
       error_file: join(root, 'logs/web.err.log'),
     },
+    {
+      ...common,
+      // The voice-first UI (Akhil's design, apps/voice) — Vite dev server on
+      // 3001, loopback only; /api proxies to the kernel on 4000.
+      name: 'ai-os-voice',
+      script: join(root, 'apps/voice/node_modules/vite/bin/vite.js'),
+      args: '--port=3001 --host=127.0.0.1',
+      interpreter: 'node',
+      cwd: join(root, 'apps/voice'),
+      out_file: join(root, 'logs/voice.log'),
+      error_file: join(root, 'logs/voice.err.log'),
+    },
   ],
 };
