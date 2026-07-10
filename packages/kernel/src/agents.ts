@@ -281,6 +281,10 @@ export interface AgentTaskOptions {
   extraSystem?: string;
   /** Post a progress line into the chat (plan announcement, per-agent ticks). */
   say?: (content: string) => Promise<void>;
+  /** M12b: the whole orchestration starts §8.3-tainted — set when the goal was
+   *  triggered by external content (a watched page changed), so no child can
+   *  auto-mutate off the back of it. */
+  initialUntrusted?: boolean;
 }
 
 /** Shape of tasks.agent_plan (migration 0015) — everything a restart needs to
@@ -304,13 +308,13 @@ export async function runAgentTask(pool: pg.Pool, taskId: string, opts: AgentTas
   } catch (err) {
     // Planning failed → degrade gracefully to the ordinary single loop.
     await trace.record({ traceId, taskId, component: 'kernel', event: 'agents.plan_failed', payload: { error: String(err) } });
-    return runTask(pool, taskId, { registry: opts.registry, extraSystem: opts.extraSystem, enableMemory: true });
+    return runTask(pool, taskId, { registry: opts.registry, extraSystem: opts.extraSystem, enableMemory: true, initialUntrusted: opts.initialUntrusted });
   }
 
   // One subtask = no orchestration worth paying for — run the plain loop.
   if (subtasks.length === 1) {
     await trace.record({ traceId, taskId, component: 'kernel', event: 'agents.collapsed', payload: { agent: subtasks[0]!.agent } });
-    return runTask(pool, taskId, { registry: opts.registry, extraSystem: opts.extraSystem, enableMemory: true });
+    return runTask(pool, taskId, { registry: opts.registry, extraSystem: opts.extraSystem, enableMemory: true, initialUntrusted: opts.initialUntrusted });
   }
 
   await pool.query(`UPDATE tasks SET status='running', updated_at=now() WHERE id=$1`, [taskId]);
@@ -422,7 +426,7 @@ async function driveOrchestration(
         registry: opts.registry,
         extraSystem: extra,
         allowedTools: agent.tools.length ? agent.tools : undefined,
-        initialUntrusted: ctx.untrusted,
+        initialUntrusted: ctx.untrusted || (opts.initialUntrusted ?? false),
         enableMemory: false, // token thrift: children get the dep context, not the memory sweep
       });
       const u = (await pool.query<{ untrusted: boolean }>(`SELECT untrusted FROM tasks WHERE id=$1`, [childId])).rows[0];

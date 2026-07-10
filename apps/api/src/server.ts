@@ -35,6 +35,8 @@ import {
   defaultExecutors,
   runLearningCycle,
   gatherFailureSignals,
+  tickRemote,
+  type RemoteCursor,
   type Schedule,
 } from '@ai-os/kernel';
 import { MemoryService } from '@ai-os/memory';
@@ -533,15 +535,18 @@ app.post('/notifications/:id/read', async (req, reply) => {
 // EXACT call the user saw (via the pack registry); on reject, cancel. Either way
 // post a confirmation into the chat and resolve the task. Fail-closed: only a
 // still-'pending' action can be acted on (no double-send).
-app.post('/pending/:id/decide', async (req, reply) => {
-  const { id } = req.params as { id: string };
-  const { decision } = (req.body ?? {}) as { decision?: 'approved' | 'rejected' };
-  if (decision !== 'approved' && decision !== 'rejected') return reply.code(400).send({ error: 'decision must be approved|rejected' });
+// Shared by the HTTP route and the M12a WhatsApp remote channel ("@os approve
+// <id>") — one fail-closed implementation, two surfaces.
+async function decidePendingAction(
+  id: string,
+  decision: 'approved' | 'rejected',
+  traceId: string,
+): Promise<{ ok: boolean; executed: boolean; rejected?: boolean; error?: string; httpCode?: number; line: string; result?: unknown }> {
   const pa = (await pool.query(`SELECT task_id, session_id, tool, args, status FROM pending_actions WHERE id=$1`, [id])).rows[0] as
     | { task_id: string; session_id: string | null; tool: string; args: Record<string, unknown>; status: string }
     | undefined;
-  if (!pa) return reply.code(404).send({ error: 'no such pending action' });
-  if (pa.status !== 'pending') return reply.code(409).send({ error: `already ${pa.status}` }); // no double-send
+  if (!pa) return { ok: false, executed: false, error: 'no such pending action', httpCode: 404, line: '⚠ No such pending approval.' };
+  if (pa.status !== 'pending') return { ok: false, executed: false, error: `already ${pa.status}`, httpCode: 409, line: `⚠ Already ${pa.status} — nothing to do.` }; // no double-send
   await pool.query(`UPDATE notifications SET read=true WHERE meta->>'pendingActionId' = $1`, [id]);
 
   const say = async (content: string) => {
@@ -551,9 +556,10 @@ app.post('/pending/:id/decide', async (req, reply) => {
   if (decision === 'rejected') {
     await pool.query(`UPDATE pending_actions SET status='rejected', decided_at=now() WHERE id=$1`, [id]);
     await pool.query(`UPDATE tasks SET status='done', updated_at=now() WHERE id=$1`, [pa.task_id]);
-    await say(`❌ Cancelled — I did not run ${pa.tool}.`);
-    trace.recordSafe({ traceId: req.traceId, taskId: pa.task_id, component: 'trust', event: 'pending.rejected', payload: { tool: pa.tool } });
-    return { ok: true, executed: false, rejected: true };
+    const line = `❌ Cancelled — I did not run ${pa.tool}.`;
+    await say(line);
+    trace.recordSafe({ traceId, taskId: pa.task_id, component: 'trust', event: 'pending.rejected', payload: { tool: pa.tool } });
+    return { ok: true, executed: false, rejected: true, line };
   }
 
   const tool = packRegistry().get(pa.tool);
@@ -565,9 +571,19 @@ app.post('/pending/:id/decide', async (req, reply) => {
   const success = !(result && typeof result === 'object' && 'error' in (result as object));
   await pool.query(`UPDATE pending_actions SET status=$2, result=$3, decided_at=now() WHERE id=$1`, [id, success ? 'executed' : 'failed', JSON.stringify(result)]);
   await pool.query(`UPDATE tasks SET status='done', updated_at=now() WHERE id=$1`, [pa.task_id]);
-  await say(success ? `✅ Done — ${pa.tool} executed.` : `⚠ ${pa.tool} failed: ${JSON.stringify(result).slice(0, 200)}`);
-  trace.recordSafe({ traceId: req.traceId, taskId: pa.task_id, component: 'trust', event: success ? 'pending.executed' : 'pending.failed', payload: { tool: pa.tool } });
-  return { ok: success, executed: success, result };
+  const line = success ? `✅ Done — ${pa.tool} executed.` : `⚠ ${pa.tool} failed: ${JSON.stringify(result).slice(0, 200)}`;
+  await say(line);
+  trace.recordSafe({ traceId, taskId: pa.task_id, component: 'trust', event: success ? 'pending.executed' : 'pending.failed', payload: { tool: pa.tool } });
+  return { ok: success, executed: success, line, result };
+}
+
+app.post('/pending/:id/decide', async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const { decision } = (req.body ?? {}) as { decision?: 'approved' | 'rejected' };
+  if (decision !== 'approved' && decision !== 'rejected') return reply.code(400).send({ error: 'decision must be approved|rejected' });
+  const out = await decidePendingAction(id, decision, req.traceId);
+  if (out.httpCode) return reply.code(out.httpCode).send({ error: out.error });
+  return out.rejected ? { ok: true, executed: false, rejected: true } : { ok: out.ok, executed: out.executed, result: out.result };
 });
 
 // ---------------------------------------------------------------------------
@@ -876,3 +892,106 @@ startScheduler(pool, {
   registry: packRegistry, // factory — pack toggles apply to future ticks without restart
   onTick: (r) => app.log.info({ claimed: r.claimed, reaped: r.reaped, missed: r.missed, ran: r.ran }, 'scheduler tick'),
 });
+
+// ---------------------------------------------------------------------------
+// M12a — WhatsApp remote control (ADR-0015): poll the self-chat through the
+// bridge for "@os" commands from Akhil's own number; run them through the
+// ordinary chat trust path; replies + approval prompts go back over the
+// bridge. Replies are interface plumbing (deterministic code), NOT a model
+// capability — whatsapp_send_message still queues for approval. Kill switch:
+// AIOS_WA_REMOTE=off. Bridge down/unpaired → silent no-op each tick.
+// ---------------------------------------------------------------------------
+if ((process.env.AIOS_WA_REMOTE ?? 'on') !== 'off') {
+  const WA_TRIGGER = process.env.AIOS_WA_TRIGGER ?? '@os';
+  const waBridge = async <T>(path: string, init?: RequestInit): Promise<T> => {
+    const base = process.env.WHATSAPP_BRIDGE_URL ?? 'http://127.0.0.1:4100';
+    const token = process.env.WHATSAPP_BRIDGE_TOKEN;
+    const res = await fetch(`${base}${path}`, {
+      ...init,
+      headers: { 'content-type': 'application/json', ...(token ? { 'x-bridge-token': token } : {}), ...(init?.headers ?? {}) },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Error(`bridge ${res.status}`);
+    return (await res.json()) as T;
+  };
+
+  // The remote channel gets its own session — phone commands show up in the
+  // UIs as a "WhatsApp remote" conversation, fully auditable.
+  const ensureRemoteSession = async (): Promise<string> => {
+    const existing = (await pool.query<{ session_id: string | null }>(`SELECT session_id FROM remote_channels WHERE channel='whatsapp'`)).rows[0];
+    if (existing?.session_id) return existing.session_id;
+    const s = (await pool.query<{ id: string }>(`INSERT INTO sessions (title) VALUES ('WhatsApp remote') RETURNING id`)).rows[0]!.id;
+    await pool.query(
+      `INSERT INTO remote_channels (channel, session_id) VALUES ('whatsapp', $1)
+       ON CONFLICT (channel) DO UPDATE SET session_id = EXCLUDED.session_id, updated_at = now()`,
+      [s],
+    );
+    return s;
+  };
+
+  let inFlight = false; // a slow tick (model call) must not stack on the next interval
+  const deps = {
+    trigger: WA_TRIGGER,
+    health: () => waBridge<{ ok: boolean; paired: boolean; me?: string }>('/health'),
+    messages: (chatId: string, limit: number) =>
+      waBridge<{ messages: Array<{ id: string; fromMe: boolean; text: string; timestamp: string }> }>(
+        `/messages?chatId=${encodeURIComponent(chatId)}&limit=${limit}`,
+      ).then((r) => r.messages),
+    send: (chatId: string, text: string) => waBridge<{ messageId?: string }>('/send', { method: 'POST', body: JSON.stringify({ chatId, text }) }),
+    runCommand: async (text: string): Promise<string> => {
+      const sessionId = await ensureRemoteSession();
+      const { rows } = await pool.query<{ id: string }>(
+        `INSERT INTO tasks (goal, status, created_by, trace_id) VALUES ($1, 'draft', 'user', $2) RETURNING id`,
+        [text, newTraceId()],
+      );
+      const taskId = rows[0]!.id;
+      await addMessage(pool, { sessionId, role: 'user', content: text, taskId });
+      await completeChatTask(taskId, 'auto');
+      const msgs = await listMessages(pool, sessionId);
+      const reply = msgs.filter((m) => m.task_id === taskId && m.role === 'assistant').at(-1);
+      return reply?.content ?? '(the task ran but produced no reply — check the Tasks page)';
+    },
+    decidePending: async (idPrefix: string, decision: 'approved' | 'rejected'): Promise<string> => {
+      const matches = (
+        await pool.query<{ id: string }>(
+          `SELECT id FROM pending_actions WHERE status='pending' AND replace(id::text, '-', '') LIKE $1 || '%'`,
+          [idPrefix.replace(/-/g, '')],
+        )
+      ).rows;
+      if (matches.length === 0) return '⚠ No pending approval matches that id.';
+      if (matches.length > 1) return '⚠ That id matches more than one pending approval — use more characters.';
+      return (await decidePendingAction(matches[0]!.id, decision, newTraceId())).line;
+    },
+    listPending: async () =>
+      (
+        await pool.query<{ id: string; tool: string; args: unknown; untrusted: boolean }>(
+          `SELECT id, tool, args, untrusted_context AS untrusted FROM pending_actions WHERE status='pending' ORDER BY created_at`,
+        )
+      ).rows,
+    loadCursor: async (): Promise<RemoteCursor> => {
+      const row = (await pool.query<{ cursor: Partial<RemoteCursor> | null }>(`SELECT cursor FROM remote_channels WHERE channel='whatsapp'`)).rows[0];
+      const c = row?.cursor ?? {};
+      return { lastTs: c.lastTs ?? null, seenIds: c.seenIds ?? [], announced: c.announced ?? [] };
+    },
+    saveCursor: async (c: RemoteCursor): Promise<void> => {
+      await pool.query(
+        `INSERT INTO remote_channels (channel, cursor) VALUES ('whatsapp', $1::jsonb)
+         ON CONFLICT (channel) DO UPDATE SET cursor = EXCLUDED.cursor, updated_at = now()`,
+        [JSON.stringify(c)],
+      );
+    },
+  };
+  setInterval(() => {
+    if (inFlight) return;
+    inFlight = true;
+    tickRemote(deps)
+      .then((r) => {
+        if (r.processed || r.announced) app.log.info(r, 'wa-remote tick');
+      })
+      .catch((err) => app.log.debug({ err: err instanceof Error ? err.message : err }, 'wa-remote tick skipped (bridge down?)'))
+      .finally(() => {
+        inFlight = false;
+      });
+  }, Number(process.env.AIOS_WA_POLL_MS) || 12_000);
+  app.log.info({ trigger: WA_TRIGGER }, 'whatsapp remote control enabled (self-chat commands)');
+}

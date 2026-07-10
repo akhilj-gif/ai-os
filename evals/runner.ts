@@ -22,8 +22,9 @@ import { planning } from './suites/planning.js';
 import { research } from './suites/research.js';
 import { supportTriage } from './suites/support-triage.js';
 import { whatsapp } from './suites/whatsapp.js';
+import { x } from './suites/x.js';
 
-const SUITES: Suite[] = [toolReliability, injectionDefense, memoryRecall, planning, research, whatsapp, supportTriage];
+const SUITES: Suite[] = [toolReliability, injectionDefense, memoryRecall, planning, research, whatsapp, x, supportTriage];
 const evalsDir = dirname(fileURLToPath(import.meta.url));
 const baselinesPath = join(evalsDir, 'baselines.json');
 

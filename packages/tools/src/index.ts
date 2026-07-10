@@ -8,6 +8,7 @@ import { gmailList, gmailRead, gmailCreateDraft } from './tools/gmail.js';
 import { calendarList, calendarCreateEvent } from './tools/calendar.js';
 import { codeExec } from './tools/code-exec.js';
 import { whatsappListChats, whatsappReadMessages, whatsappSearchContacts, whatsappSendMessage } from './tools/whatsapp.js';
+import { xGetMe, xDraftPost, xPublishPost } from './tools/x.js';
 
 export type { ToolDef, ToolContext, ToolSchema } from './registry.js';
 export { ToolRegistry } from './registry.js';
@@ -25,6 +26,7 @@ export { gmailList, gmailRead, gmailCreateDraft } from './tools/gmail.js';
 export { calendarList, calendarCreateEvent } from './tools/calendar.js';
 export { codeExec } from './tools/code-exec.js';
 export { whatsappListChats, whatsappReadMessages, whatsappSearchContacts, whatsappSendMessage } from './tools/whatsapp.js';
+export { xGetMe, xDraftPost, xPublishPost, xMockOutbox, X_MAX_CHARS } from './tools/x.js';
 
 export function buildRegistry(): ToolRegistry {
   const registry = new ToolRegistry();
@@ -44,6 +46,9 @@ export function buildRegistry(): ToolRegistry {
     whatsappReadMessages,
     whatsappSearchContacts,
     whatsappSendMessage,
+    xGetMe,
+    xDraftPost,
+    xPublishPost,
   ]) {
     registry.register(tool);
   }

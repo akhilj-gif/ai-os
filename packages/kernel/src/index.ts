@@ -18,6 +18,7 @@ export { ensureDefaultSession, addMessage, listMessages, type SessionMessage } f
 export { systemPrompt } from './prompts.js';
 export { runHelloWorldTask, type HelloResult } from './hello-task.js';
 export { assembleMemoryContext, compactHistory, shrinkToolResults } from './context.js';
+export { tickRemote, parseRemoteCommand, formatApprovalPrompt, type RemoteDeps, type RemoteCursor, type RemoteMessage, type PendingSummary } from './remote.js';
 export { makePlan, type Plan, type PlannedStep } from './planner.js';
 export {
   planAndStart,
@@ -51,7 +52,7 @@ export {
   type ExecutorResult,
   type TickReport,
 } from './scheduler.js';
-export { briefingExecutor, watchExecutor, reflectExecutor, defaultExecutors } from './jobs.js';
+export { briefingExecutor, watchExecutor, reflectExecutor, actExecutor, makeActExecutor, defaultExecutors, type ActRunner } from './jobs.js';
 export {
   runLearningCycle,
   gatherFailureSignals,
