@@ -3,6 +3,7 @@
 export { runTask, findOrphanedTasks, type TaskRunResult } from './executor.js';
 export {
   runAgentTask,
+  resumeAgentTask,
   classifyGoal,
   orchestrate,
   parsePlan,

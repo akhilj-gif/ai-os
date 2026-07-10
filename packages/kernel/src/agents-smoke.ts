@@ -105,5 +105,64 @@ console.log('\n— orchestrate —');
   check('concurrency 1 → no overlap', !overlap);
 }
 
+console.log('\n— orchestrate: checkpoint-resume (prior seam) —');
+{
+  // Simulate a restart after s1 finished: prior() serves s1's recorded result;
+  // the rest run normally and still see s1's output + taint.
+  const ran: string[] = [];
+  const seenCtx: Record<string, { depBlock: string; untrusted: boolean }> = {};
+  const res = await orchestrate('goal', diamond, {
+    concurrency: 2,
+    prior: (s) => (s.id === 's1' ? { id: 's1', agent: 'researcher', status: 'done' as const, text: 'RECORDED: pgvector 0.8 [cite]', untrusted: true } : null),
+    runChild: async (s, ctx) => {
+      ran.push(s.id);
+      seenCtx[s.id] = ctx;
+      return { status: 'done', text: `${s.id} ok`, untrusted: ctx.untrusted };
+    },
+    synth: async (_g, results: ChildResult[]) => `SYNTH:${results.map((r) => `${r.id}=${r.status}`).join(',')}`,
+  });
+  check('terminal child NOT re-run on resume', !ran.includes('s1'), `ran: ${ran.join(',')}`);
+  check('remaining children still run', ran.length === 3);
+  check('recorded result feeds dependents', seenCtx['s2']!.depBlock.includes('RECORDED: pgvector 0.8'));
+  check('recorded taint still propagates', seenCtx['s2']!.untrusted === true && seenCtx['s4']!.untrusted === true);
+  check('synthesis sees all four ordered', res.text === 'SYNTH:s1=done,s2=done,s3=done,s4=done', res.text);
+}
+
+{
+  // Restart after EVERYTHING finished (death during synthesis): no child runs,
+  // synthesis still produces the final answer.
+  let childCalls = 0;
+  const res = await orchestrate('goal', diamond, {
+    prior: (s) => ({ id: s.id, agent: s.agent, status: 'done' as const, text: `${s.id} recorded`, untrusted: false }),
+    runChild: async () => {
+      childCalls++;
+      return { status: 'done', text: 'should never run', untrusted: false };
+    },
+    synth: async (_g, results: ChildResult[]) => `SYNTH:${results.length}`,
+  });
+  check('all-terminal resume runs zero children', childCalls === 0);
+  check('all-terminal resume still synthesizes', res.text === 'SYNTH:4');
+}
+
+{
+  // A child that ended awaiting_approval before the restart keeps that status —
+  // resume must not re-run it (its approval card is already queued).
+  const ran: string[] = [];
+  const solo: Subtask[] = [
+    { id: 'a', agent: 'communicator', goal: 'send x', dependsOn: [] },
+    { id: 'b', agent: 'coder', goal: 'compute y', dependsOn: [] },
+  ];
+  const res = await orchestrate('g', solo, {
+    prior: (s) => (s.id === 'a' ? { id: 'a', agent: 'communicator', status: 'awaiting_approval' as const, text: 'queued send', untrusted: false } : null),
+    runChild: async (s) => {
+      ran.push(s.id);
+      return { status: 'done', text: 'ok', untrusted: false };
+    },
+    synth: async (_g, results: ChildResult[]) => results.map((r) => `${r.id}=${r.status}`).join(','),
+  });
+  check('awaiting_approval child not re-run', !ran.includes('a') && ran.includes('b'));
+  check('awaiting_approval status survives resume', res.text === 'a=awaiting_approval,b=done', res.text);
+}
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`);
 process.exit(failures === 0 ? 0 : 1);

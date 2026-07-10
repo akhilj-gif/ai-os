@@ -148,6 +148,11 @@ export interface OrchestrateDeps {
   synth: (goal: string, results: ChildResult[]) => Promise<string>;
   onEvent?: (e: { kind: 'child_done'; result: ChildResult } | { kind: 'wave'; index: number; ids: string[] }) => void | Promise<void>;
   concurrency?: number;
+  /** Checkpoint-resume: return the RECORDED result of a subtask that already
+   *  reached a terminal state before a restart — it is reused, runChild is
+   *  never called for it (the graph-executor "skip done steps" analog, so a
+   *  resumed orchestration is exactly-once). Null/undefined = run normally. */
+  prior?: (s: Subtask) => Promise<ChildResult | null> | ChildResult | null;
 }
 
 export async function orchestrate(goal: string, subtasks: Subtask[], deps: OrchestrateDeps): Promise<{ text: string; results: ChildResult[] }> {
@@ -167,6 +172,15 @@ export async function orchestrate(goal: string, subtasks: Subtask[], deps: Orche
       const chunk = wave.slice(i, i + concurrency);
       await Promise.all(
         chunk.map(async (s) => {
+          // Resume path: a child that finished before the restart keeps its
+          // recorded result — never re-run (its side effects already happened
+          // or are queued as an approval card).
+          const pre = await deps.prior?.(s);
+          if (pre) {
+            results.set(s.id, pre);
+            await deps.onEvent?.({ kind: 'child_done', result: pre });
+            return;
+          }
           const depResults = s.dependsOn.map((d) => results.get(d)!).filter(Boolean);
           const tainted = depResults.some((d) => d.untrusted);
           const depBlock = depResults.length
@@ -269,6 +283,14 @@ export interface AgentTaskOptions {
   say?: (content: string) => Promise<void>;
 }
 
+/** Shape of tasks.agent_plan (migration 0015) — everything a restart needs to
+ *  re-drive an orchestration without re-planning. */
+export interface PersistedAgentPlan {
+  subtasks: Subtask[];
+  /** subtask id → child task row id */
+  children: Record<string, string>;
+}
+
 export async function runAgentTask(pool: pg.Pool, taskId: string, opts: AgentTaskOptions): Promise<TaskRunResult> {
   const trace = new TraceStore(pool);
   const { rows } = await pool.query<{ goal: string; trace_id: string }>(`SELECT goal, trace_id FROM tasks WHERE id=$1`, [taskId]);
@@ -298,17 +320,93 @@ export async function runAgentTask(pool: pg.Pool, taskId: string, opts: AgentTas
       subtasks.map((s) => `${s.id}. **${s.agent}** — ${s.goal}${s.dependsOn.length ? ` _(after ${s.dependsOn.join(', ')})_` : ''}`).join('\n'),
   );
 
-  // Create the child task rows up front (visible in /tasks immediately).
+  // Create the child task rows up front (visible in /tasks immediately) and
+  // persist the plan on the parent IN THE SAME TRANSACTION: agent_plan present
+  // ⇒ every child row exists, so a restart can always resume from it (and a
+  // crash mid-creation leaves neither — the boot guard's fail-honest path).
   const childIds = new Map<string, string>();
-  for (const s of subtasks) {
-    const c = await pool.query<{ id: string }>(
-      `INSERT INTO tasks (goal, status, created_by, trace_id, parent_task_id) VALUES ($1,'draft','agent',$2,$3) RETURNING id`,
-      [`[${s.agent}] ${s.goal}`, traceId, taskId],
-    );
-    childIds.set(s.id, c.rows[0]!.id);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const s of subtasks) {
+      const c = await client.query<{ id: string }>(
+        `INSERT INTO tasks (goal, status, created_by, trace_id, parent_task_id) VALUES ($1,'draft','agent',$2,$3) RETURNING id`,
+        [`[${s.agent}] ${s.goal}`, traceId, taskId],
+      );
+      childIds.set(s.id, c.rows[0]!.id);
+    }
+    const plan: PersistedAgentPlan = { subtasks, children: Object.fromEntries(childIds) };
+    await client.query(`UPDATE tasks SET agent_plan=$2::jsonb, updated_at=now() WHERE id=$1`, [taskId, JSON.stringify(plan)]);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
   }
 
+  return driveOrchestration(pool, { taskId, goal: task.goal, traceId }, subtasks, childIds, opts);
+}
+
+/** Resume an orchestration interrupted by a restart, from its persisted plan.
+ *  Terminal children keep their recorded results (exactly-once); a mid-run
+ *  child continues from its own executor checkpoint. Returns null when there
+ *  is no usable plan (pre-0015 run / crash before the plan transaction) — the
+ *  caller falls back to failing the task honestly. NEVER re-plans. */
+export async function resumeAgentTask(pool: pg.Pool, taskId: string, opts: AgentTaskOptions): Promise<TaskRunResult | null> {
+  const trace = new TraceStore(pool);
+  const { rows } = await pool.query<{ goal: string; trace_id: string; agent_plan: PersistedAgentPlan | null }>(
+    `SELECT goal, trace_id, agent_plan FROM tasks WHERE id=$1`,
+    [taskId],
+  );
+  const task = rows[0];
+  const plan = task?.agent_plan;
+  if (!task || !plan?.subtasks?.length || !plan.children) return null;
+  const childIds = new Map(Object.entries(plan.children));
+  for (const s of plan.subtasks) if (!s?.id || !s.agent || !AGENTS[s.agent] || !childIds.has(s.id)) return null;
+
+  await pool.query(`UPDATE tasks SET status='running', updated_at=now() WHERE id=$1`, [taskId]);
+  await trace.record({ traceId: task.trace_id, taskId, component: 'kernel', event: 'agents.resumed', payload: { subtasks: plan.subtasks.length } });
+  await opts.say?.('⏯ A restart interrupted this multi-agent run — resuming where it left off (finished specialists are not re-run).');
+  return driveOrchestration(pool, { taskId, goal: task.goal, traceId: task.trace_id }, plan.subtasks, childIds, opts);
+}
+
+/** The shared driving half of an orchestration: run/resume the children,
+ *  synthesize, finalize the parent. Fresh runs and boot-resumes both land here;
+ *  the `prior` seam is what makes a resume exactly-once. */
+async function driveOrchestration(
+  pool: pg.Pool,
+  task: { taskId: string; goal: string; traceId: string },
+  subtasks: Subtask[],
+  childIds: Map<string, string>,
+  opts: AgentTaskOptions,
+): Promise<TaskRunResult> {
+  const trace = new TraceStore(pool);
+  const { taskId, traceId } = task;
+
   const { text, results } = await orchestrate(task.goal, subtasks, {
+    prior: async (s) => {
+      // A child that reached a terminal state before a restart is reused, not
+      // re-run. Its final text lives in its last completed reason step.
+      const childId = childIds.get(s.id)!;
+      const row = (
+        await pool.query<{ status: string; untrusted: boolean }>(`SELECT status::text, untrusted FROM tasks WHERE id=$1`, [childId])
+      ).rows[0];
+      if (!row || (row.status !== 'done' && row.status !== 'awaiting_approval')) return null;
+      const out = (
+        await pool.query<{ output: { text?: string } | null }>(
+          `SELECT output FROM steps WHERE task_id=$1 AND status='done' AND output IS NOT NULL ORDER BY created_at DESC LIMIT 1`,
+          [childId],
+        )
+      ).rows[0];
+      return {
+        id: s.id,
+        agent: s.agent,
+        status: row.status as TaskRunResult['status'],
+        text: out?.output?.text ?? '(result recorded before restart)',
+        untrusted: row.untrusted,
+      };
+    },
     runChild: async (s, ctx) => {
       const agent = AGENTS[s.agent]!;
       const childId = childIds.get(s.id)!;

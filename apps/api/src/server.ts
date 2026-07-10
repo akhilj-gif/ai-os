@@ -15,6 +15,7 @@ import {
   runHelloWorldTask,
   runTask,
   runAgentTask,
+  resumeAgentTask,
   classifyGoal,
   findOrphanedTasks,
   ensureDefaultSession,
@@ -802,24 +803,54 @@ await app.listen({ port, host: '127.0.0.1' });
 void (async () => {
   const orphans = await findOrphanedTasks(pool);
   for (const taskId of orphans) {
-    // M11 guard: orchestrations are NOT blindly re-runnable. A parent that died
-    // mid-orchestration would re-plan from scratch (duplicate children + double
-    // token burn — happened live 2026-07-10); an agent CHILD's collector died
-    // with the parent, so resuming it is orphaned work. Both are marked failed
-    // honestly; the user just asks again. (Checkpointed orchestration resume is
-    // future work.)
+    // M11 checkpoint-resume: an orchestration parent resumes from its persisted
+    // plan (tasks.agent_plan, migration 0015) — existing children are re-driven,
+    // NEVER re-planned (re-planning duplicated children live 2026-07-10). An
+    // agent CHILD is skipped when its parent is being resumed (the parent's
+    // orchestrator re-runs it from its own checkpoint); only a child with no
+    // live parent is dead work. No usable plan → the old fail-honest path.
     const shape = (
-      await pool.query<{ created_by: string; has_children: boolean }>(
-        `SELECT created_by::text, EXISTS(SELECT 1 FROM tasks c WHERE c.parent_task_id = t.id) AS has_children
+      await pool.query<{ created_by: string; has_children: boolean; has_plan: boolean; parent_active: boolean }>(
+        `SELECT created_by::text,
+                EXISTS(SELECT 1 FROM tasks c WHERE c.parent_task_id = t.id) AS has_children,
+                t.agent_plan IS NOT NULL AS has_plan,
+                EXISTS(SELECT 1 FROM tasks p WHERE p.id = t.parent_task_id AND p.status IN ('running','planning')) AS parent_active
          FROM tasks t WHERE t.id = $1`,
         [taskId],
       )
     ).rows[0];
-    if (shape && (shape.created_by === 'agent' || shape.has_children)) {
+    if (shape && shape.created_by === 'agent') {
+      if (shape.parent_active) {
+        app.log.info({ taskId }, 'orphaned agent child left to its parent orchestration resume');
+        continue;
+      }
       await pool.query(`UPDATE tasks SET status='failed', updated_at=now() WHERE id=$1`, [taskId]);
+      app.log.warn({ taskId }, 'orphaned agent child with no live parent marked failed');
+      continue;
+    }
+    if (shape && shape.has_children) {
       const sess = (await pool.query<{ session_id: string }>(`SELECT session_id FROM messages WHERE task_id=$1 AND role='user' LIMIT 1`, [taskId])).rows[0]?.session_id;
-      if (sess) await addMessage(pool, { sessionId: sess, role: 'assistant', content: '⚠ A restart interrupted this multi-agent run — please ask again.', taskId });
-      app.log.warn({ taskId, agentChild: shape.created_by === 'agent' }, 'orphaned orchestration marked failed (not resumable)');
+      const say = sess ? async (content: string) => { await addMessage(pool, { sessionId: sess, role: 'assistant', content, taskId }); } : undefined;
+      if (shape.has_plan) {
+        app.log.info({ taskId }, 'resuming orphaned orchestration from persisted plan');
+        trace.recordSafe({ traceId: newTraceId(), taskId, component: 'api', event: 'task.resume_on_boot', payload: { orchestration: true } });
+        resumeAgentTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), say })
+          .then(async (result) => {
+            if (result) {
+              if (say && result.text) await say(result.text);
+              return;
+            }
+            // Plan turned out unusable (malformed/agent renamed) — fail honestly.
+            await pool.query(`UPDATE tasks SET status='failed', updated_at=now() WHERE id=$1`, [taskId]);
+            if (say) await say('⚠ A restart interrupted this multi-agent run and its plan could not be recovered — please ask again.');
+            app.log.warn({ taskId }, 'orchestration resume found no usable plan; marked failed');
+          })
+          .catch((err) => app.log.error({ err, taskId }, 'orchestration resume failed'));
+        continue;
+      }
+      await pool.query(`UPDATE tasks SET status='failed', updated_at=now() WHERE id=$1`, [taskId]);
+      if (say) await say('⚠ A restart interrupted this multi-agent run — please ask again.');
+      app.log.warn({ taskId }, 'orphaned orchestration without a persisted plan marked failed');
       continue;
     }
     // Route by shape: a task with planner-authored steps (local_id set) is a
