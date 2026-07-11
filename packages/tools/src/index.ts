@@ -10,6 +10,7 @@ import { codeExec } from './tools/code-exec.js';
 import { whatsappListChats, whatsappReadMessages, whatsappSearchContacts, whatsappSendMessage } from './tools/whatsapp.js';
 import { xGetMe, xDraftPost, xPublishPost } from './tools/x.js';
 import { terminalRun, terminalExec } from './tools/terminal.js';
+import { mobilityEstimate, mobilityBook } from './tools/mobility.js';
 
 export type { ToolDef, ToolContext, ToolSchema } from './registry.js';
 export { ToolRegistry } from './registry.js';
@@ -29,6 +30,7 @@ export { codeExec } from './tools/code-exec.js';
 export { whatsappListChats, whatsappReadMessages, whatsappSearchContacts, whatsappSendMessage } from './tools/whatsapp.js';
 export { xGetMe, xDraftPost, xPublishPost, xMockOutbox, X_MAX_CHARS } from './tools/x.js';
 export { terminalRun, terminalExec, checkReadCommand, scrubbedEnv } from './tools/terminal.js';
+export { mobilityEstimate, mobilityBook, mobilityMockOutbox, type RideOption, type Provider } from './tools/mobility.js';
 
 export function buildRegistry(): ToolRegistry {
   const registry = new ToolRegistry();
@@ -53,6 +55,8 @@ export function buildRegistry(): ToolRegistry {
     xPublishPost,
     terminalRun,
     terminalExec,
+    mobilityEstimate,
+    mobilityBook,
   ]) {
     registry.register(tool);
   }

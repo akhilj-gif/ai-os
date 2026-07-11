@@ -24,8 +24,9 @@ import { supportTriage } from './suites/support-triage.js';
 import { whatsapp } from './suites/whatsapp.js';
 import { x } from './suites/x.js';
 import { computer } from './suites/computer.js';
+import { mobility } from './suites/mobility.js';
 
-const SUITES: Suite[] = [toolReliability, injectionDefense, memoryRecall, planning, research, whatsapp, x, computer, supportTriage];
+const SUITES: Suite[] = [toolReliability, injectionDefense, memoryRecall, planning, research, whatsapp, x, computer, mobility, supportTriage];
 const evalsDir = dirname(fileURLToPath(import.meta.url));
 const baselinesPath = join(evalsDir, 'baselines.json');
 

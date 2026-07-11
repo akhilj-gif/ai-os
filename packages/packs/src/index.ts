@@ -30,6 +30,8 @@ import {
   xPublishPost,
   terminalRun,
   terminalExec,
+  mobilityEstimate,
+  mobilityBook,
 } from '@ai-os/tools';
 
 export interface CapabilityPack {
@@ -227,6 +229,32 @@ export const PACKS: Record<string, CapabilityPack> = {
     verifiedBy: 'terminal-smoke (allowlist/metachar/env-scrub/cwd-confine, deterministic) + computer eval suite',
     requires: [
       'Runs commands on THIS machine. terminal_exec always needs your approval; set AIOS_TERMINAL_ROOT to confine the working directory (default: home).',
+    ],
+  },
+  mobility: {
+    name: 'mobility',
+    version: '0.1.0',
+    description:
+      'Book rides by voice across Uber, Ola and Rapido (M14, ADR-0017): mobility_estimate compares fares/ETAs for bike/auto/car; mobility_book books — SPENDS money, so it always needs your one-click approval. Runs on sample fares until a mobility bridge (Uber API + Ola/Rapido) is configured.',
+    tools: [mobilityEstimate, mobilityBook],
+    prompt:
+      'You can book rides across Uber, Ola and Rapido. To book: call mobility_estimate with pickup + drop to compare options (each has provider, vehicle type, fare range, ETA), recommend the best by the user\'s stated preference (cheapest / fastest / a specific vehicle like bike or auto), then — once the user picks — call mobility_book DIRECTLY with that optionId. Booking SPENDS money and dispatches a driver, so it is automatically queued for the user\'s one-click approval showing the provider, vehicle and fare; do not ask "shall I book?" in prose first — make the call and tell them it awaits their approval. If the user names a vehicle (bike/auto/car) or a preference, filter/sort accordingly. Never book without an explicit choice; never book the "cheapest" as a surprise unless they asked for cheapest.',
+    policies: [
+      { tool: 'mobility_estimate', trustClass: 'read', autoApprove: true },
+      // Booking commits money + a driver — spend-class, ALWAYS the approval gate.
+      { tool: 'mobility_book', trustClass: 'spend', autoApprove: false },
+    ],
+    memories: [
+      {
+        type: 'procedural',
+        subject: 'ride-booking',
+        content: 'Ride booking: mobility_estimate first to compare Uber/Ola/Rapido by fare+ETA+vehicle, recommend per the user\'s preference, then mobility_book with the chosen optionId. Booking is spend-class — call the tool directly; the queued Approve/Cancel card showing provider+vehicle+fare IS the confirmation. Never auto-pick without the user choosing.',
+      },
+    ],
+    evalSuites: ['mobility'],
+    verifiedBy: 'mobility-smoke (mock bridge, deterministic)',
+    requires: [
+      'Live comparison/booking needs a mobility bridge: Uber via its official API (register an app at developer.uber.com, list your account, set UBER_CLIENT_ID/SECRET + OAuth — your OWN rides book without Uber approval); Ola/Rapido via a browser-automation bridge with your logged-in sessions (ToS-gray, OTP/CAPTCHA are your manual steps). Set MOBILITY_BRIDGE_URL. Until then, sample fares.',
     ],
   },
   'support-ops': {
