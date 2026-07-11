@@ -1104,10 +1104,21 @@ if ((process.env.AIOS_WA_REMOTE ?? 'on') !== 'off') {
       if (matches.length > 1) return '⚠ That id matches more than one pending approval — use more characters.';
       return (await decidePendingAction(matches[0]!.id, decision, newTraceId())).line;
     },
+    // Only ANNOUNCE (push to WhatsApp) approvals that actually originated from
+    // a WhatsApp command — session_id already carries true origin (the
+    // lineage walk in queuePendingAction). Without this filter, EVERY pending
+    // approval system-wide (voice UI, web chat, autonomous orchestrations)
+    // got pushed to the phone the next time this ticked — not what "only
+    // when I use it with WhatsApp" means. Approving/rejecting an id typed
+    // here still works regardless of origin (decidePending, unchanged) —
+    // this only restricts the unsolicited PUSH.
     listPending: async () =>
       (
         await pool.query<{ id: string; tool: string; args: unknown; untrusted: boolean }>(
-          `SELECT id, tool, args, untrusted_context AS untrusted FROM pending_actions WHERE status='pending' ORDER BY created_at`,
+          `SELECT id, tool, args, untrusted_context AS untrusted FROM pending_actions
+           WHERE status='pending'
+             AND session_id = (SELECT session_id FROM remote_channels WHERE channel='whatsapp')
+           ORDER BY created_at`,
         )
       ).rows,
     loadCursor: async (): Promise<RemoteCursor> => {
