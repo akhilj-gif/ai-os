@@ -268,7 +268,10 @@ export const PACKS: Record<string, CapabilityPack> = {
     evalSuites: ['mobility'],
     verifiedBy: 'mobility-smoke (mock bridge, deterministic)',
     requires: [
-      'Live comparison/booking needs a mobility bridge: Uber via its official API (register an app at developer.uber.com, list your account, set UBER_CLIENT_ID/SECRET + OAuth — your OWN rides book without Uber approval); Ola/Rapido via a browser-automation bridge with your logged-in sessions (ToS-gray, OTP/CAPTCHA are your manual steps). Set MOBILITY_BRIDGE_URL. Until then, sample fares.',
+      'Live comparison/booking needs a mobility bridge: Uber via its official API (register an app at developer.uber.com, list your account, set UBER_CLIENT_ID/SECRET + OAuth — your OWN rides book without Uber approval).',
+      'Ola: www.olacabs.com has a real geocoded location-search UI (confirmed live 2026-07-11 via the browser pack) but the guest search does not surface an in-page fare result — it likely needs a logged-in session. Sign in once in the headed browser bridge (BROWSER_HEADLESS=0), then the Ola automation can be built against the authenticated flow.',
+      'Rapido: confirmed live 2026-07-11 — rapido.bike is a marketing page ONLY (no location fields, "Download App" is the sole CTA) and there is no public API. Browser automation is NOT viable; Rapido stays mock-only unless a mobile-app automation approach is pursued separately (a different, larger undertaking).',
+      'Set MOBILITY_BRIDGE_URL once a real aggregating bridge exists. Until then, sample fares.',
     ],
   },
   browser: {

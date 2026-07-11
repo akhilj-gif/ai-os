@@ -4,9 +4,11 @@
 // bridge never auto-solves them). Binds 127.0.0.1 only.
 //
 // Element refs: /find tags matching elements with a data-aios-ref attribute and
-// returns {ref, role, name}; /act resolves `[data-aios-ref="…"]`. Refs are valid
-// until the next navigation (attributes reset on a new document), so callers
-// /find again after navigating.
+// returns {ref, role, name}; /act resolves `[data-aios-ref="…"]`. Each /find call
+// re-tags from scratch (clearing any refs a PRIOR call left behind), so refs are
+// a snapshot of THAT call only — /act with a ref from an earlier /find (before
+// the page changed, or before a narrower-query /find re-numbered from e0) may
+// resolve to nothing or the wrong element. Always /find immediately before /act.
 //
 // Run: pnpm --filter @ai-os/browser-bridge start
 //   BROWSER_HEADLESS=1  → run headless (no visible window)
@@ -14,7 +16,8 @@
 import { fileURLToPath } from 'node:url';
 import Fastify from 'fastify';
 import { chromium, type BrowserContext, type Page } from 'playwright';
-import { DEFAULT_BROWSER_BRIDGE_PORT, type ElementRef } from './contract.js';
+import { DEFAULT_BROWSER_BRIDGE_PORT } from './contract.js';
+import { findInPage } from './find-in-page.js';
 
 const PORT = Number(process.env.BROWSER_BRIDGE_PORT) || DEFAULT_BROWSER_BRIDGE_PORT;
 const HEADLESS = process.env.BROWSER_HEADLESS === '1' || process.env.BROWSER_HEADLESS === 'true';
@@ -33,30 +36,6 @@ async function ensurePage(): Promise<Page> {
   const start = process.env.AIOS_BROWSER_START_URL;
   if (start) await page.goto(start, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
   return page;
-}
-
-// Tag interactive elements and return refs. Runs IN the page (real function,
-// not a string — a string form would ignore the query arg); assigns a stable
-// data-aios-ref to each candidate so /act can resolve it deterministically.
-function findInPage(query: string): ElementRef[] {
-  const q = (query || '').toLowerCase();
-  const sel = 'a,button,input,textarea,select,[role=button],[role=link],[onclick]';
-  const out: ElementRef[] = [];
-  let i = 0;
-  for (const el of Array.from(document.querySelectorAll(sel))) {
-    const r = el.getBoundingClientRect();
-    const cs = getComputedStyle(el);
-    if (!(r.width > 0 && r.height > 0) || cs.visibility === 'hidden' || cs.display === 'none') continue;
-    const tag = el.tagName.toLowerCase();
-    const role = el.getAttribute('role') || (tag === 'a' ? 'link' : tag === 'button' ? 'button' : tag === 'input' || tag === 'textarea' || tag === 'select' ? 'field' : 'button');
-    const name = (el.getAttribute('aria-label') || el.textContent || el.getAttribute('placeholder') || el.getAttribute('value') || el.getAttribute('name') || '').trim().replace(/\s+/g, ' ').slice(0, 120);
-    if (q && !(name.toLowerCase().includes(q) || role.includes(q))) continue;
-    const ref = 'e' + i++;
-    el.setAttribute('data-aios-ref', ref);
-    out.push({ ref, role, name });
-    if (out.length >= 50) break;
-  }
-  return out;
 }
 
 async function main(): Promise<void> {

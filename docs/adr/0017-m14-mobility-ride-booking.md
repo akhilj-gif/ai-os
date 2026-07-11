@@ -21,6 +21,37 @@ comparison. The gating question was API availability. Findings:
 - **Rapido** — **no public consumer API**; only unofficial reverse-engineered
   clients. Browser automation is the only route.
 
+## Update 2026-07-11 — live browser scouting (M15b bridge)
+
+With the Playwright bridge built, scouted both sites' actual web presence
+before writing any Ola/Rapido automation:
+
+- **Rapido — dead end for browser automation, confirmed empirically.**
+  `rapido.bike` is a marketing page only: no location fields, no search UI —
+  "Download App" is the sole call to action. This independently confirms the
+  API finding above: there is genuinely no web surface to automate. Rapido
+  stays mock-only unless a mobile-app-automation approach is pursued
+  separately (a different, larger undertaking — not in scope here).
+- **Ola — a real, working search UI exists.** `www.olacabs.com` has a
+  geocoded location-search (pickup/drop autocomplete backed by real address
+  data) and a "SEARCH OLA CABS" button — confirmed by actually typing a
+  pickup/drop and selecting suggestions. But the guest (logged-out) search
+  does not surface an in-page fare result; it most likely requires a session.
+  **Next step is Akhil's, not code:** run the bridge headed
+  (`BROWSER_HEADLESS=0`) and sign into Ola once — the persistent `.userdata`
+  profile keeps the session, and the authenticated flow can then be automated.
+- **A general bridge bug was found and fixed along the way**: `/find`'s
+  element-detection selector missed custom widgets built from `<li>`/`<div>`
+  with no ARIA role (Ola's autocomplete items were exactly this shape) — now
+  covers `role=option/listitem/menuitem` and clickable-by-cursor elements.
+  Separately, refs from an earlier `/find` call weren't cleared before a later
+  call re-numbered from `e0`, so two DIFFERENT elements could end up sharing
+  one ref (hit live: Playwright's strict-mode check correctly refused to
+  guess which element `/act` meant). Both are general robustness fixes that
+  help every site the browser pack touches, not just Ola. Locked down
+  deterministically: `find-in-page-smoke.ts` (9/9, real headless Chromium
+  against a local fixture reproducing the exact shape that broke).
+
 ## Decision
 
 Per Akhil's rule ("official API where it exists; else a browser bridge that
