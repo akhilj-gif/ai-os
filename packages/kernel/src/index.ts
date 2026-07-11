@@ -68,3 +68,13 @@ export {
   type Verifier as LearningVerifier,
   type LearningResult,
 } from './learning.js';
+export {
+  tick as coordinatorTick,
+  startCoordinator,
+  type CoordinatorOptions,
+  type CoordinatorReport,
+  type StuckTaskFinding,
+  type ApprovalBacklogFinding,
+  type JobStreakFinding,
+  type ProviderHealthFinding,
+} from './coordinator.js';

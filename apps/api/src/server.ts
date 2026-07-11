@@ -32,6 +32,8 @@ import {
   createJob,
   tick,
   startScheduler,
+  startCoordinator,
+  type CoordinatorReport,
   defaultExecutors,
   runLearningCycle,
   gatherFailureSignals,
@@ -48,6 +50,7 @@ const memory = new MemoryService(pool);
 // M9: the runtime tool surface is composed from ENABLED capability packs (loaded
 // at boot, refreshed on install/toggle). Kernel-core = workspace only.
 let enabledPacks = new Set<string>();
+let lastCoordinatorReport: CoordinatorReport | null = null; // M16: latest tick, for GET /coordinator/status
 const packRegistry = () => composeRegistry(enabledPacks);
 const packPrompt = () => packPrompts(enabledPacks);
 const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', {
@@ -693,6 +696,14 @@ app.get('/dashboard', async () => {
   };
 });
 
+// M16: the Coordinator's most recent tick — visibility into what it's
+// watching/found/did, without waiting for a notification to show up.
+app.get('/coordinator/status', async () => ({
+  enabled: (process.env.AIOS_COORDINATOR ?? 'on') !== 'off',
+  autoResume: (process.env.AIOS_COORDINATOR_AUTORESUME ?? 'on') !== 'off',
+  lastTick: lastCoordinatorReport,
+}));
+
 // ---------------------------------------------------------------------------
 // M9 Capability Packs (ADR-0012): manifests live in code; install state in DB.
 // Install applies bundled policies + seeds procedural memories (provenance = the
@@ -867,16 +878,18 @@ app.post('/tasks/:id/approve', async (req) => {
 });
 
 // ---------------------------------------------------------------------------
-// Boot: resume tasks orphaned by a mid-run kill (M1 exit criterion)
-// ---------------------------------------------------------------------------
-const port = Number(process.env.API_PORT ?? 4000);
-enabledPacks = await loadEnabledPacks(pool); // before listen: routes + resume + scheduler all compose from it
-app.log.info({ packs: [...enabledPacks] }, 'capability packs enabled');
-await app.listen({ port, host: '127.0.0.1' });
-
-void (async () => {
-  const orphans = await findOrphanedTasks(pool);
-  for (const taskId of orphans) {
+// Resume ONE task by its current shape — the single source of truth for
+// "how to continue a task that stopped mid-run". Used at boot (every
+// running/planning task is orphaned by definition — M1 exit criterion) AND
+// live by the Coordinator (M16, below) when a task shows no progress for a
+// while. NEVER re-plans (M11's persisted-plan resume); NEVER bypasses
+// approval (resuming continues the SAME durable checkpoint/plan — any
+// approval-gated step still queues exactly as it would have the first time).
+// Never rejects (errors are logged internally) so callers can fire-and-forget
+// (`void resumeTaskById(id)`, boot-resume's original concurrent-dispatch
+// behavior) or `await` it, without an unhandled-rejection risk either way.
+function resumeTaskById(taskId: string, why: 'boot' | 'coordinator'): Promise<void> {
+  return (async () => {
     // M11 checkpoint-resume: an orchestration parent resumes from its persisted
     // plan (tasks.agent_plan, migration 0015) — existing children are re-driven,
     // NEVER re-planned (re-planning duplicated children live 2026-07-10). An
@@ -895,20 +908,20 @@ void (async () => {
     ).rows[0];
     if (shape && shape.created_by === 'agent') {
       if (shape.parent_active) {
-        app.log.info({ taskId }, 'orphaned agent child left to its parent orchestration resume');
-        continue;
+        app.log.info({ taskId, why }, 'orphaned agent child left to its parent orchestration resume');
+        return;
       }
       await pool.query(`UPDATE tasks SET status='failed', updated_at=now() WHERE id=$1`, [taskId]);
-      app.log.warn({ taskId }, 'orphaned agent child with no live parent marked failed');
-      continue;
+      app.log.warn({ taskId, why }, 'orphaned agent child with no live parent marked failed');
+      return;
     }
     if (shape && shape.has_children) {
       const sess = (await pool.query<{ session_id: string }>(`SELECT session_id FROM messages WHERE task_id=$1 AND role='user' LIMIT 1`, [taskId])).rows[0]?.session_id;
       const say = sess ? async (content: string) => { await addMessage(pool, { sessionId: sess, role: 'assistant', content, taskId }); } : undefined;
       if (shape.has_plan) {
-        app.log.info({ taskId }, 'resuming orphaned orchestration from persisted plan');
-        trace.recordSafe({ traceId: newTraceId(), taskId, component: 'api', event: 'task.resume_on_boot', payload: { orchestration: true } });
-        resumeAgentTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), say })
+        app.log.info({ taskId, why }, 'resuming orphaned orchestration from persisted plan');
+        trace.recordSafe({ traceId: newTraceId(), taskId, component: 'api', event: 'task.resume_on_boot', payload: { orchestration: true, why } });
+        await resumeAgentTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), say })
           .then(async (result) => {
             if (result) {
               if (say && result.text) await say(result.text);
@@ -916,16 +929,15 @@ void (async () => {
             }
             // Plan turned out unusable (malformed/agent renamed) — fail honestly.
             await pool.query(`UPDATE tasks SET status='failed', updated_at=now() WHERE id=$1`, [taskId]);
-            if (say) await say('⚠ A restart interrupted this multi-agent run and its plan could not be recovered — please ask again.');
-            app.log.warn({ taskId }, 'orchestration resume found no usable plan; marked failed');
-          })
-          .catch((err) => app.log.error({ err, taskId }, 'orchestration resume failed'));
-        continue;
+            if (say) await say('⚠ This multi-agent run stalled and its plan could not be recovered — please ask again.');
+            app.log.warn({ taskId, why }, 'orchestration resume found no usable plan; marked failed');
+          });
+        return;
       }
       await pool.query(`UPDATE tasks SET status='failed', updated_at=now() WHERE id=$1`, [taskId]);
-      if (say) await say('⚠ A restart interrupted this multi-agent run — please ask again.');
-      app.log.warn({ taskId }, 'orphaned orchestration without a persisted plan marked failed');
-      continue;
+      if (say) await say('⚠ This multi-agent run stalled — please ask again.');
+      app.log.warn({ taskId, why }, 'orphaned orchestration without a persisted plan marked failed');
+      return;
     }
     // Route by shape: a task with planner-authored steps (local_id set) is a
     // graph task → resume via runGraph (skips done steps, exactly-once); a plain
@@ -933,11 +945,23 @@ void (async () => {
     // chat task continues from its checkpoint — re-classifying it into a fresh
     // orchestration would discard that state.
     const isGraph = (await pool.query(`SELECT 1 FROM steps WHERE task_id=$1 AND local_id IS NOT NULL LIMIT 1`, [taskId])).rowCount ?? 0;
-    app.log.info({ taskId, isGraph: !!isGraph }, 'resuming orphaned task');
-    trace.recordSafe({ traceId: newTraceId(), taskId, component: 'api', event: 'task.resume_on_boot', payload: { graph: !!isGraph } });
-    const p = isGraph ? runGraph(pool, taskId, { registry: packRegistry() }) : completeChatTask(taskId, 'off');
-    Promise.resolve(p).catch((err) => app.log.error({ err, taskId }, 'orphan resume failed'));
-  }
+    app.log.info({ taskId, why, isGraph: !!isGraph }, 'resuming task');
+    trace.recordSafe({ traceId: newTraceId(), taskId, component: 'api', event: 'task.resume_on_boot', payload: { graph: !!isGraph, why } });
+    await Promise.resolve(isGraph ? runGraph(pool, taskId, { registry: packRegistry() }) : completeChatTask(taskId, 'off'));
+  })().catch((err) => app.log.error({ err, taskId, why }, 'resume failed'));
+}
+
+// ---------------------------------------------------------------------------
+// Boot: resume tasks orphaned by a mid-run kill (M1 exit criterion)
+// ---------------------------------------------------------------------------
+const port = Number(process.env.API_PORT ?? 4000);
+enabledPacks = await loadEnabledPacks(pool); // before listen: routes + resume + scheduler all compose from it
+app.log.info({ packs: [...enabledPacks] }, 'capability packs enabled');
+await app.listen({ port, host: '127.0.0.1' });
+
+void (async () => {
+  const orphans = await findOrphanedTasks(pool);
+  for (const taskId of orphans) void resumeTaskById(taskId, 'boot'); // fire-and-forget, concurrent — matches the pre-refactor dispatch
 })();
 
 // M7: the scheduler heartbeat. Ticks every SCHEDULER_POLL_MS (default 30s); due
@@ -948,6 +972,28 @@ startScheduler(pool, {
   registry: packRegistry, // factory — pack toggles apply to future ticks without restart
   onTick: (r) => app.log.info({ claimed: r.claimed, reaped: r.reaped, missed: r.missed, ran: r.ran }, 'scheduler tick'),
 });
+
+// M16 — the Coordinator (Akhil, 2026-07-11: "a smart coordinator... watches
+// quotas, service health, stuck tasks... proactively tells me when something
+// needs attention"). Generalizes boot-resume from "once at boot" to "continuously,
+// live": a task with no progress for AIOS_COORDINATOR_STUCK_MINUTES gets resumed
+// through the exact same resumeTaskById path, plus provider-health/approval-
+// backlog/job-failure-streak surfacing — all via notifications, never bypassing
+// approval. Kill switches: AIOS_COORDINATOR=off (whole feature),
+// AIOS_COORDINATOR_AUTORESUME=off (keep watching + notifying, never auto-resume).
+if ((process.env.AIOS_COORDINATOR ?? 'on') !== 'off') {
+  const autoResume = (process.env.AIOS_COORDINATOR_AUTORESUME ?? 'on') !== 'off';
+  startCoordinator(pool, {
+    resumeStuckTask: autoResume ? (taskId) => resumeTaskById(taskId, 'coordinator') : undefined,
+    onTick: (r) => {
+      lastCoordinatorReport = r;
+      if (r.stuckTasks.length || r.providerDegraded || r.approvalBacklog.length || r.jobStreaks.length) {
+        app.log.info({ stuck: r.stuckTasks.length, resumed: r.resumedTaskIds.length, providerDegraded: !!r.providerDegraded, backlog: r.approvalBacklog.length, jobStreaks: r.jobStreaks.length }, 'coordinator tick');
+      }
+    },
+  });
+  app.log.info({ autoResume }, 'coordinator enabled');
+}
 
 // ---------------------------------------------------------------------------
 // M12a — WhatsApp remote control (ADR-0015): poll the self-chat through the
