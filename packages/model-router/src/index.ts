@@ -9,10 +9,11 @@ export type ModelRole = 'routing' | 'execution' | 'planning';
 
 /** Providers are swappable behind two API shapes (ADR-0002):
  *  'anthropic' = Anthropic Messages API (Claude, xAI/Grok) · 'openai' = OpenAI-compatible
- *  chat/completions (Gemini free tier, Groq, OpenRouter). Priority when several keys are
- *  set: Anthropic > xAI > Gemini. MODEL_* env vars override any default table. */
+ *  chat/completions (Gemini free tier, Groq, NVIDIA NIM, OpenRouter). Which provider goes
+ *  first is now capability-routed (ADR-0019), not a fixed list — see CAPABILITY_CHAINS.
+ *  MODEL_* env vars override any default table. */
 interface Provider {
-  name: 'anthropic' | 'xai' | 'gemini' | 'groq';
+  name: 'anthropic' | 'xai' | 'gemini' | 'nvidia' | 'groq';
   kind: 'anthropic' | 'openai';
   /** Primary first; extra keys are rotated onto 429s (free-tier quota relief). */
   apiKeys: string[];
@@ -66,40 +67,110 @@ const PROVIDERS: Record<string, () => Provider | null> = {
           },
         }
       : null,
+  // NVIDIA NIM (build.nvidia.com/integrate.api.nvidia.com): OpenAI-compatible,
+  // hosts open models (Llama, DeepSeek, Qwen, ...) — the "coding/general/
+  // open-source reasoning" tier (ADR-0019). Models confirmed live against this
+  // catalog 2026-07-11; swap in a stronger execution/planning model once you've
+  // verified it responds 200 the same way (catalog changes without notice).
+  nvidia: () =>
+    process.env.NVIDIA_API_KEY
+      ? {
+          name: 'nvidia',
+          kind: 'openai',
+          apiKeys: [process.env.NVIDIA_API_KEY],
+          baseURL: 'https://integrate.api.nvidia.com/v1',
+          defaults: {
+            routing: 'meta/llama-3.1-8b-instruct',
+            execution: 'meta/llama-3.1-70b-instruct',
+            planning: 'meta/llama-3.1-70b-instruct',
+          },
+        }
+      : null,
 };
 
-// Auto-priority when MODEL_PROVIDER is unset. MODEL_PROVIDER forces one provider
-// (used to point the gym at Groq without switching the chat app off Gemini).
-const PROVIDER_PRIORITY = ['anthropic', 'xai', 'gemini', 'groq'] as const;
+/** Capability classes a task can be routed by (ADR-0019). 'coding' is also the
+ *  catch-all — Akhil's own spec groups "coding, general chat, open-source
+ *  reasoning" behind one arrow to one provider, so unclassified text lands
+ *  here rather than needing a separate 'general' bucket. */
+export type Capability = 'workspace' | 'coding' | 'fast';
 
-function resolveProvider(): Provider {
+// Premium providers (a paid/funded key) always win when configured — this
+// predates capability routing and is orthogonal to it (ADR-0011's original
+// "Anthropic > xAI" precedent). Free-tier providers are then ordered by
+// which one best fits the task's capability class.
+const PREMIUM_PRIORITY = ['anthropic', 'xai'] as const;
+
+/** Per-capability free-tier provider order — the whole point of ADR-0019:
+ *  configurable, extensible, not one fixed chain for every task.
+ *  - workspace: Google Workspace/Gmail/Calendar/Drive/Search/Vision → Gemini's
+ *    native multimodal + Google-context strength.
+ *  - coding: coding/general chat/open-source reasoning → NVIDIA's open-model
+ *    catalog (also today's catch-all bucket, see Capability above).
+ *  - fast: ultra-low-latency/simple (the kernel's own routing-tier calls) →
+ *    Groq, whose whole value proposition is inference speed. */
+const CAPABILITY_CHAINS: Record<Capability, readonly string[]> = {
+  workspace: ['gemini', 'nvidia', 'groq'],
+  coding: ['nvidia', 'groq', 'gemini'],
+  fast: ['groq', 'gemini', 'nvidia'],
+};
+
+const WORKSPACE_TOOL_RE = /^(gmail_|calendar_|workspace_|web_search|fetch_url)/;
+const CODING_TOOL_RE = /^code_exec/;
+const WORKSPACE_TEXT_RE = /\b(gmail|e-?mail|calendar|drive|google workspace|workspace|vision|image|photo|screenshot|web ?search|search the web)\b/i;
+const CODING_TEXT_RE = /\b(code|coding|debug|refactor|function|algorithm|typescript|javascript|python|programming|\bbug\b)\b/i;
+
+/** Classify a call into a capability bucket (ADR-0019) from signals already on
+ *  the call — no extra model round-trip. Tool names (when offered) are the
+ *  most reliable signal; prompt/message text is the fallback for callModel()
+ *  callers, which have no tools field at all. Exported for direct smoke
+ *  testing (same rationale as isInfraFailure). */
+export function classifyCapability(input: {
+  role: ModelRole;
+  prompt?: string;
+  messages?: ChatMessage[];
+  tools?: ChatToolDef[];
+}): Capability {
+  if (input.role === 'routing') return 'fast';
+  const toolNames = input.tools?.map((t) => t.name) ?? [];
+  if (toolNames.some((n) => WORKSPACE_TOOL_RE.test(n))) return 'workspace';
+  if (toolNames.some((n) => CODING_TOOL_RE.test(n))) return 'coding';
+  const text = input.prompt ?? input.messages?.map((m) => (typeof m.content === 'string' ? m.content : '')).join(' ') ?? '';
+  if (WORKSPACE_TEXT_RE.test(text)) return 'workspace';
+  if (CODING_TEXT_RE.test(text)) return 'coding';
+  return 'coding';
+}
+
+function resolveProvider(capability: Capability = 'coding'): Provider {
   const forced = process.env.MODEL_PROVIDER;
   if (forced) {
     const p = PROVIDERS[forced]?.();
     if (!p) throw new Error(`MODEL_PROVIDER=${forced} but its API key is not set (or unknown provider)`);
     return p;
   }
-  for (const name of PROVIDER_PRIORITY) {
+  for (const name of [...PREMIUM_PRIORITY, ...CAPABILITY_CHAINS[capability]]) {
     const p = PROVIDERS[name]!();
     if (p) return p;
   }
-  throw new Error('No model provider configured — set ANTHROPIC_API_KEY, XAI_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY in .env');
+  throw new Error('No model provider configured — set ANTHROPIC_API_KEY, XAI_API_KEY, GEMINI_API_KEY, NVIDIA_API_KEY, or GROQ_API_KEY in .env');
 }
 
-/** Provider failover order (ADR-0011). Pinning MODEL_PROVIDER means PINNED —
- *  a single-element chain, no failover — so evals and baselines stay
- *  deterministic. Unpinned: every configured provider in priority order; when
- *  the primary fails on INFRA (quota/rate-limit/network), the call falls
- *  through to the next and execution continues immediately. */
-export function failoverChain(): Provider[] {
+/** Provider failover order (ADR-0011, capability-routed since ADR-0019).
+ *  Pinning MODEL_PROVIDER means PINNED — a single-element chain, no failover,
+ *  ignoring capability entirely — so evals and baselines stay deterministic.
+ *  Unpinned: premium providers first (if configured), then every configured
+ *  provider in the order CAPABILITY_CHAINS[capability] prescribes; when the
+ *  primary fails on INFRA (quota/rate-limit/network), the call falls through
+ *  to the next and execution continues immediately. Defaults to 'coding' —
+ *  the catch-all bucket — when the caller has no capability signal at all. */
+export function failoverChain(capability: Capability = 'coding'): Provider[] {
   if (process.env.MODEL_PROVIDER) return [resolveProvider()];
   const chain: Provider[] = [];
-  for (const name of PROVIDER_PRIORITY) {
+  for (const name of [...PREMIUM_PRIORITY, ...CAPABILITY_CHAINS[capability]]) {
     const p = PROVIDERS[name]!();
     if (p) chain.push(p);
   }
   if (chain.length === 0) {
-    throw new Error('No model provider configured — set ANTHROPIC_API_KEY, XAI_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY in .env');
+    throw new Error('No model provider configured — set ANTHROPIC_API_KEY, XAI_API_KEY, GEMINI_API_KEY, NVIDIA_API_KEY, or GROQ_API_KEY in .env');
   }
   return chain;
 }
@@ -266,6 +337,9 @@ export interface ModelCallInput {
   traceId: string;
   taskId?: string;
   name?: string;
+  /** Override auto-classification (ADR-0019) when the caller already knows
+   *  which capability bucket this call belongs to. Usually omitted. */
+  capability?: Capability;
 }
 
 export interface ModelCallResult {
@@ -452,8 +526,10 @@ export async function callModel(input: ModelCallInput): Promise<ModelCallResult>
   // the next provider IMMEDIATELY (non-final providers get one fast retry round,
   // only the last gets the full patient backoff). MODEL_* model-name overrides
   // apply to the PRIMARY only — fallback providers use their own role defaults
-  // (a pinned model name belongs to one provider's catalog).
-  const chain = failoverChain();
+  // (a pinned model name belongs to one provider's catalog). Chain order is
+  // capability-routed (ADR-0019): classified from the prompt unless the caller
+  // already knows (input.capability).
+  const chain = failoverChain(input.capability ?? classifyCapability({ role: input.role, prompt: input.prompt }));
   let lastErr: unknown;
   for (let i = 0; i < chain.length; i++) {
     const provider = chain[i]!;
@@ -524,10 +600,16 @@ export interface ChatInput {
   traceId: string;
   taskId?: string;
   name?: string;
+  /** Override auto-classification (ADR-0019) when the caller already knows
+   *  which capability bucket this call belongs to. Usually omitted. */
+  capability?: Capability;
 }
 
 export async function chat(input: ChatInput): Promise<ChatResult> {
-  const chain = failoverChain();
+  // Chain order is capability-routed (ADR-0019): tool names on offer are the
+  // most reliable signal (gmail_*/calendar_*/web_search → workspace,
+  // code_exec → coding), text is the fallback.
+  const chain = failoverChain(input.capability ?? classifyCapability({ role: input.role, messages: input.messages, tools: input.tools }));
   if (chain[0]!.kind !== 'openai') {
     throw new Error(
       `chat() with tools is OpenAI-shape only at M1 (provider "${chain[0]!.name}" is ${chain[0]!.kind}) — see ADR-0004`,
