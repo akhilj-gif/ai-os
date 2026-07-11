@@ -1,0 +1,16 @@
+{
+  "name": "@ai-os/browser-bridge",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "fastify": "^5.9.0",
+    "playwright": "^1.49.0"
+  },
+  "devDependencies": {
+    "dotenv": "^17.4.2"
+  }
+}

@@ -52,6 +52,20 @@ module.exports = {
     },
     {
       ...common,
+      // M15b: the Playwright browser bridge (real Chromium) on 4200, loopback
+      // only. Headless under pm2; run headed manually to sign into gated sites
+      // (the persistent .userdata profile keeps you logged in afterward).
+      name: 'ai-os-browser',
+      script: join(root, 'apps/browser-bridge/src/index.ts'),
+      interpreter: 'node',
+      interpreter_args: '--import tsx',
+      cwd: root,
+      env: { BROWSER_HEADLESS: '1', BROWSER_BRIDGE_PORT: '4200' },
+      out_file: join(root, 'logs/browser-bridge.log'),
+      error_file: join(root, 'logs/browser-bridge.err.log'),
+    },
+    {
+      ...common,
       // The voice-first UI (Akhil's design, apps/voice) — Vite dev server on
       // 3001, loopback only; /api proxies to the kernel on 4000.
       name: 'ai-os-voice',
