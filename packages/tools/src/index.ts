@@ -11,6 +11,7 @@ import { whatsappListChats, whatsappReadMessages, whatsappSearchContacts, whatsa
 import { xGetMe, xDraftPost, xPublishPost } from './tools/x.js';
 import { terminalRun, terminalExec } from './tools/terminal.js';
 import { mobilityEstimate, mobilityBook } from './tools/mobility.js';
+import { browserNavigate, browserRead, browserFind, browserExtract, browserAct } from './tools/browser.js';
 
 export type { ToolDef, ToolContext, ToolSchema } from './registry.js';
 export { ToolRegistry } from './registry.js';
@@ -33,6 +34,7 @@ export { terminalRun, terminalExec, checkReadCommand, scrubbedEnv } from './tool
 export { mobilityEstimate, mobilityBook, mobilityMockOutbox, type RideOption, type Provider } from './tools/mobility.js';
 export { decideRide, DEFAULT_PREFS, type MobilityPrefs, type RideContext, type RideDecision } from './tools/mobility-decide.js';
 export { uberConfigured, uberAuthorizeUrl, exchangeUberCode, uberVehicleClass, encodeUberOption, decodeUberOption, isUberOption, mapUberEstimates, UberNotConnectedError, type UberPriceItem, type UberTimeItem, type Coords } from './tools/uber.js';
+export { browserNavigate, browserRead, browserFind, browserExtract, browserAct, browserMockActions } from './tools/browser.js';
 
 export function buildRegistry(): ToolRegistry {
   const registry = new ToolRegistry();
@@ -59,6 +61,11 @@ export function buildRegistry(): ToolRegistry {
     terminalExec,
     mobilityEstimate,
     mobilityBook,
+    browserNavigate,
+    browserRead,
+    browserFind,
+    browserExtract,
+    browserAct,
   ]) {
     registry.register(tool);
   }
