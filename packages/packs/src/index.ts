@@ -34,6 +34,10 @@ import {
   mobilityBook,
 } from '@ai-os/tools';
 
+// Re-export the Uber OAuth helpers so the API (which depends on @ai-os/packs,
+// not directly on @ai-os/tools) can wire the /oauth/uber routes (M14c).
+export { uberConfigured, uberAuthorizeUrl, exchangeUberCode } from '@ai-os/tools';
+
 export interface CapabilityPack {
   name: string;
   version: string;

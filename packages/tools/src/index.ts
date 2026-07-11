@@ -32,6 +32,7 @@ export { xGetMe, xDraftPost, xPublishPost, xMockOutbox, X_MAX_CHARS } from './to
 export { terminalRun, terminalExec, checkReadCommand, scrubbedEnv } from './tools/terminal.js';
 export { mobilityEstimate, mobilityBook, mobilityMockOutbox, type RideOption, type Provider } from './tools/mobility.js';
 export { decideRide, DEFAULT_PREFS, type MobilityPrefs, type RideContext, type RideDecision } from './tools/mobility-decide.js';
+export { uberConfigured, uberAuthorizeUrl, exchangeUberCode, uberVehicleClass, encodeUberOption, decodeUberOption, isUberOption, mapUberEstimates, UberNotConnectedError, type UberPriceItem, type UberTimeItem, type Coords } from './tools/uber.js';
 
 export function buildRegistry(): ToolRegistry {
   const registry = new ToolRegistry();

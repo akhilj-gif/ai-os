@@ -11,6 +11,7 @@
 // vehicle + fare. §8.3 also blocks it under untrusted context.
 import type { ToolContext, ToolDef } from '../registry.js';
 import { decideRide, DEFAULT_PREFS, type MobilityPrefs, type RideContext } from './mobility-decide.js';
+import { uberConfigured, uberEstimate, uberBook, isUberOption } from './uber.js';
 
 export type Provider = 'uber' | 'ola' | 'rapido';
 
@@ -119,6 +120,18 @@ export const mobilityEstimate: ToolDef = {
       options = r.options ?? [];
       live = true;
       if (r.distanceKm != null && args.distanceKm == null) args = { ...args, distanceKm: r.distanceKm };
+    } else if (uberConfigured() && ctx?.pool) {
+      // No aggregating bridge, but Uber is connected (M14c): real Uber options
+      // via its official API + mock Ola/Rapido until their browser bridge lands.
+      // A live Uber failure (not connected / API error) degrades to all-mock.
+      try {
+        const uber = await uberEstimate(ctx.pool, pickup, drop);
+        options = [...uber, ...mockOptions().filter((o) => o.provider !== 'uber')];
+        live = true;
+      } catch {
+        options = mockOptions();
+        live = false;
+      }
     } else {
       options = mockOptions();
       live = false;
@@ -170,9 +183,14 @@ export const mobilityBook: ToolDef = {
     },
     required: ['optionId'],
   },
-  async execute(args) {
+  async execute(args, ctx) {
     const optionId = String(args.optionId ?? '').trim();
     if (!optionId) throw new Error('optionId is required');
+    // Real Uber booking (M14c) — runs only here, AFTER the user approved this
+    // spend-class call. A live Uber option is booked for real on their account.
+    if (isUberOption(optionId) && uberConfigured() && ctx?.pool) {
+      return uberBook(ctx.pool, optionId);
+    }
     if (bridgeUrl()) {
       return bridge<{ ok: boolean; bookingId: string; provider: Provider; status: string }>('/book', { optionId });
     }

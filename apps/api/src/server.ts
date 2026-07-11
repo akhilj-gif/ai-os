@@ -41,7 +41,7 @@ import {
 } from '@ai-os/kernel';
 import { MemoryService } from '@ai-os/memory';
 import { failoverChain, transcribe, synthesize } from '@ai-os/model-router';
-import { composeRegistry, packPrompts, loadEnabledPacks, installPack, setPackEnabled, listPacks, PACKS } from '@ai-os/packs';
+import { composeRegistry, packPrompts, loadEnabledPacks, installPack, setPackEnabled, listPacks, PACKS, uberConfigured, uberAuthorizeUrl, exchangeUberCode } from '@ai-os/packs';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const memory = new MemoryService(pool);
@@ -227,6 +227,38 @@ app.get('/oauth/google/status', async () => {
   return rows[0]
     ? { connected: true, email: rows[0].account_email, scopes: rows[0].scopes }
     : { connected: false };
+});
+
+// M14c — Uber OAuth (ride booking on Akhil's own account). Mirrors Google:
+// /oauth/uber → consent; callback stores tokens in oauth_tokens provider='uber'.
+// Only usable once UBER_CLIENT_ID/SECRET/REDIRECT_URI are in .env.
+app.get('/oauth/uber', async (_req, reply) => {
+  if (!uberConfigured()) return reply.code(400).send({ error: 'Uber not configured — set UBER_CLIENT_ID, UBER_CLIENT_SECRET, UBER_REDIRECT_URI in .env first' });
+  const state = randomUUID();
+  pendingOAuthStates.add(state);
+  return reply.redirect(uberAuthorizeUrl(state));
+});
+
+app.get('/oauth/uber/callback', async (req, reply) => {
+  const { code, state, error } = req.query as { code?: string; state?: string; error?: string };
+  if (error) return reply.redirect('http://localhost:3000/?uber=denied');
+  if (!code || !state || !pendingOAuthStates.delete(state)) {
+    return reply.code(400).send({ error: 'invalid oauth state or missing code' });
+  }
+  try {
+    await exchangeUberCode(pool, code);
+  } catch (err) {
+    req.log.error({ err: err instanceof Error ? err.message : err }, 'uber oauth exchange failed');
+    return reply.code(502).send({ error: 'Uber token exchange failed — check the app credentials and redirect URI' });
+  }
+  trace.recordSafe({ traceId: req.traceId, component: 'api', event: 'oauth.uber.connected', payload: {} });
+  return reply.redirect('http://localhost:3000/?uber=connected');
+});
+
+app.get('/oauth/uber/status', async () => {
+  if (!uberConfigured()) return { connected: false, configured: false };
+  const { rows } = await pool.query(`SELECT scopes FROM oauth_tokens WHERE provider = 'uber'`);
+  return { connected: rows.length > 0, configured: true };
 });
 
 // ---------------------------------------------------------------------------
