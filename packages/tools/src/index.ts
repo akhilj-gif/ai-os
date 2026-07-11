@@ -31,6 +31,7 @@ export { whatsappListChats, whatsappReadMessages, whatsappSearchContacts, whatsa
 export { xGetMe, xDraftPost, xPublishPost, xMockOutbox, X_MAX_CHARS } from './tools/x.js';
 export { terminalRun, terminalExec, checkReadCommand, scrubbedEnv } from './tools/terminal.js';
 export { mobilityEstimate, mobilityBook, mobilityMockOutbox, type RideOption, type Provider } from './tools/mobility.js';
+export { decideRide, DEFAULT_PREFS, type MobilityPrefs, type RideContext, type RideDecision } from './tools/mobility-decide.js';
 
 export function buildRegistry(): ToolRegistry {
   const registry = new ToolRegistry();

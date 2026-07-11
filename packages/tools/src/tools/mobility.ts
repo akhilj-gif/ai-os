@@ -9,7 +9,8 @@
 // SPEND-class + auto_approve=false ALWAYS — it commits money and dispatches a
 // driver, so every call queues for the user's approval showing provider +
 // vehicle + fare. §8.3 also blocks it under untrusted context.
-import type { ToolDef } from '../registry.js';
+import type { ToolContext, ToolDef } from '../registry.js';
+import { decideRide, DEFAULT_PREFS, type MobilityPrefs, type RideContext } from './mobility-decide.js';
 
 export type Provider = 'uber' | 'ola' | 'rapido';
 
@@ -57,45 +58,101 @@ function mockOptions(): RideOption[] {
   ];
 }
 
+/** Load the decision-engine preferences (M14b) — the editable/learnable
+ *  mobility_prefs row, merged over the built-in defaults. Any DB hiccup falls
+ *  back to defaults so a comparison never fails on preferences. */
+async function loadPrefs(ctx: ToolContext | undefined): Promise<MobilityPrefs> {
+  if (!ctx?.pool) return DEFAULT_PREFS;
+  try {
+    const row = (await ctx.pool.query<{ prefs: Partial<MobilityPrefs> }>(`SELECT prefs FROM mobility_prefs WHERE id = true`)).rows[0];
+    return row?.prefs ? { ...DEFAULT_PREFS, ...row.prefs } : DEFAULT_PREFS;
+  } catch {
+    return DEFAULT_PREFS;
+  }
+}
+
+/** Best-effort "is it raining at the pickup?" via keyless open-meteo (geocode →
+ *  current precipitation). Any failure → undefined, and the rain rule simply
+ *  doesn't fire (fail-open is safe: booking is still approval-gated). */
+async function isRainingAt(pickup: string): Promise<boolean | undefined> {
+  if (process.env.AIOS_MOBILITY_WEATHER === 'off') return undefined;
+  try {
+    const geo = (await (await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(pickup)}&count=1`, { signal: AbortSignal.timeout(6000) })).json()) as {
+      results?: Array<{ latitude: number; longitude: number }>;
+    };
+    const loc = geo.results?.[0];
+    if (!loc) return undefined;
+    const wx = (await (await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${loc.latitude}&longitude=${loc.longitude}&current=precipitation,rain`, { signal: AbortSignal.timeout(6000) })).json()) as {
+      current?: { precipitation?: number; rain?: number };
+    };
+    const p = wx.current;
+    if (!p) return undefined;
+    return (p.precipitation ?? 0) > 0 || (p.rain ?? 0) > 0;
+  } catch {
+    return undefined;
+  }
+}
+
 export const mobilityEstimate: ToolDef = {
   name: 'mobility_estimate',
   untrustedOutput: false, // structured fares the bridge shapes — not free web content; flagging would wrongly block the follow-on booking
   description:
-    'Compare ride options across Uber, Ola and Rapido for a pickup→drop trip: returns each provider\'s vehicle types (bike/auto/car/…) with fare range, ETA and surge. Use this to recommend the cheapest/fastest option before booking. Read-only — no ride is booked.',
+    'Compare ride options across Uber, Ola and Rapido AND get a smart recommendation. Returns each provider\'s vehicle types (bike/auto/car/…) with fare range/ETA/surge, plus a `recommendation` that applies the user\'s travel preferences (rank by price/ETA/balanced, avoid bikes in rain, prefer a car within ₹X of cheapest, auto over bike on long trips, confirm late-night) with plain-language `reasons`. Read-only — no ride is booked; book the recommended optionId with mobility_book (which asks for approval).',
   inputSchema: {
     type: 'object',
     properties: {
       pickup: { type: 'string', description: 'Pickup location (address or place name)' },
       drop: { type: 'string', description: 'Destination (address or place name)' },
       vehicle: { type: 'string', description: 'Optional filter: bike | auto | car. Omit to see all.' },
+      distanceKm: { type: 'number', description: 'Trip distance in km, if known (enables the long-trip rule).' },
     },
     required: ['pickup', 'drop'],
   },
-  async execute(args) {
+  async execute(args, ctx) {
     const pickup = String(args.pickup ?? '').trim();
     const drop = String(args.drop ?? '').trim();
     if (!pickup || !drop) throw new Error('pickup and drop are required');
     let options: RideOption[];
     let live: boolean;
     if (bridgeUrl()) {
-      const r = await bridge<{ options: RideOption[] }>('/estimate', { pickup, drop });
+      const r = await bridge<{ options: RideOption[]; distanceKm?: number }>('/estimate', { pickup, drop });
       options = r.options ?? [];
       live = true;
+      if (r.distanceKm != null && args.distanceKm == null) args = { ...args, distanceKm: r.distanceKm };
     } else {
       options = mockOptions();
       live = false;
     }
     const vf = String(args.vehicle ?? '').trim().toLowerCase();
     if (vf) options = options.filter((o) => o.vehicle.toLowerCase().includes(vf));
-    options.sort((a, b) => a.fareLow - b.fareLow);
-    const cheapest = options[0];
-    const fastest = [...options].sort((a, b) => a.etaMin - b.etaMin)[0];
+
+    // M14b decision engine: apply the user's learned preferences to produce a
+    // ranked recommendation with reasons. Context: local hour + rain + distance.
+    const prefs = await loadPrefs(ctx);
+    const context: RideContext = {
+      hour: new Date().getHours(),
+      distanceKm: args.distanceKm != null ? Number(args.distanceKm) : undefined,
+      isRaining: prefs.avoidBikeIfRaining ? await isRainingAt(pickup) : undefined,
+    };
+    const decision = decideRide(options, context, prefs);
+
     return {
       pickup,
       drop,
-      options,
-      cheapest: cheapest ? { optionId: cheapest.optionId, provider: cheapest.provider, vehicle: cheapest.vehicle, fareLow: cheapest.fareLow } : null,
-      fastest: fastest ? { optionId: fastest.optionId, provider: fastest.provider, etaMin: fastest.etaMin } : null,
+      options: decision.ranked,
+      recommendation: decision.recommended
+        ? {
+            optionId: decision.recommended.optionId,
+            provider: decision.recommended.provider,
+            vehicle: decision.recommended.vehicle,
+            fareLow: decision.recommended.fareLow,
+            fareHigh: decision.recommended.fareHigh,
+            etaMin: decision.recommended.etaMin,
+            reasons: decision.reasons,
+            mustConfirm: decision.mustConfirm,
+          }
+        : null,
+      excluded: decision.excluded.map((e) => ({ provider: e.option.provider, vehicle: e.option.vehicle, reason: e.reason })),
       ...(live ? {} : { mock: true, note: 'No mobility bridge configured — sample fares. Configure MOBILITY_BRIDGE_URL (Uber API + Ola/Rapido) for live comparison.' }),
     };
   },

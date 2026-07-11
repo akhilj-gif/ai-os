@@ -18,22 +18,28 @@ if (process.env.MOBILITY_BRIDGE_URL) {
   console.log('SKIP  MOBILITY_BRIDGE_URL is set — this smoke only runs against the mock.');
   process.exit(0);
 }
+// Determinism: disable the live weather lookup so the rain rule can't reorder
+// options based on the real forecast for "home".
+process.env.AIOS_MOBILITY_WEATHER = 'off';
 
 const ctx = { pool: null as never, taskId: 'smoke' };
 
-console.log('— estimate (compare across providers) —');
-let firstOptionId = '';
+console.log('— estimate (compare + preference-aware recommendation) —');
 {
   const r = (await mobilityEstimate.execute({ pickup: 'home', drop: 'airport' }, ctx)) as {
     options: Array<{ optionId: string; provider: string; vehicle: string; fareLow: number }>;
-    cheapest: { provider: string; fareLow: number } | null;
+    recommendation: { provider: string; vehicle: string; reasons: string[]; mustConfirm: boolean } | null;
     mock?: boolean;
   };
   check('returns options across all three providers', new Set(r.options.map((o) => o.provider)).size === 3, [...new Set(r.options.map((o) => o.provider))].join(','));
-  check('options sorted cheapest-first', r.options.every((o, i) => i === 0 || o.fareLow >= r.options[i - 1]!.fareLow));
-  check('cheapest is the Rapido bike', r.cheapest?.provider === 'rapido' && r.cheapest.fareLow === 55, JSON.stringify(r.cheapest));
+  // Default prefs, no rain/distance → cheapest+fastest (rapido bike) wins; no car within ₹40 of it.
+  check('recommends the Rapido bike (cheapest & fastest)', r.recommendation?.provider === 'rapido' && r.recommendation.vehicle === 'bike', JSON.stringify(r.recommendation?.provider + '/' + r.recommendation?.vehicle));
+  check('recommendation carries plain-language reasons', (r.recommendation?.reasons.length ?? 0) > 0);
   check('flagged as mock (no bridge)', r.mock === true);
-  firstOptionId = r.cheapest ? r.options.find((o) => o.provider === 'rapido' && o.vehicle === 'bike')!.optionId : '';
+}
+{
+  const r = (await mobilityEstimate.execute({ pickup: 'home', drop: 'airport', vehicle: 'bike' }, ctx)) as { options: Array<{ vehicle: string }> };
+  check('vehicle filter narrows to bikes only', r.options.length > 0 && r.options.every((o) => o.vehicle.includes('bike')));
 }
 {
   const r = (await mobilityEstimate.execute({ pickup: 'home', drop: 'airport', vehicle: 'bike' }, ctx)) as { options: Array<{ vehicle: string }> };
@@ -43,7 +49,7 @@ let firstOptionId = '';
 console.log('\n— book (mock outbox only, never a real ride) —');
 {
   const before = mobilityMockOutbox.length;
-  const r = (await mobilityBook.execute({ optionId: firstOptionId }, ctx)) as { ok?: boolean; provider?: string; mock?: boolean };
+  const r = (await mobilityBook.execute({ optionId: 'mock-rapido-bike' }, ctx)) as { ok?: boolean; provider?: string; mock?: boolean };
   check('book records in the mock outbox only', r.ok === true && r.mock === true && mobilityMockOutbox.length === before + 1);
   check('outbox records the chosen provider', mobilityMockOutbox.at(-1)!.provider === 'rapido');
   const bad = (await mobilityBook.execute({ optionId: 'does-not-exist' }, ctx)) as { error?: string };

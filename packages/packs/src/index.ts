@@ -238,7 +238,7 @@ export const PACKS: Record<string, CapabilityPack> = {
       'Book rides by voice across Uber, Ola and Rapido (M14, ADR-0017): mobility_estimate compares fares/ETAs for bike/auto/car; mobility_book books — SPENDS money, so it always needs your one-click approval. Runs on sample fares until a mobility bridge (Uber API + Ola/Rapido) is configured.',
     tools: [mobilityEstimate, mobilityBook],
     prompt:
-      'You can book rides across Uber, Ola and Rapido. To book: call mobility_estimate with pickup + drop to compare options (each has provider, vehicle type, fare range, ETA), recommend the best by the user\'s stated preference (cheapest / fastest / a specific vehicle like bike or auto), then — once the user picks — call mobility_book DIRECTLY with that optionId. Booking SPENDS money and dispatches a driver, so it is automatically queued for the user\'s one-click approval showing the provider, vehicle and fare; do not ask "shall I book?" in prose first — make the call and tell them it awaits their approval. If the user names a vehicle (bike/auto/car) or a preference, filter/sort accordingly. Never book without an explicit choice; never book the "cheapest" as a surprise unless they asked for cheapest.',
+      'You can book rides across Uber, Ola and Rapido, and you make SMART travel decisions — not just cheapest. To book: call mobility_estimate with pickup + drop; it returns the ranked options AND a `recommendation` that has already applied the user\'s learned preferences (rain → avoid bikes, prefer a car within a small price gap, auto over bike on long trips, confirm late-night, rank by price/ETA/balanced) with plain-language `reasons`. Relay the recommendation and its reasons, then — once the user is happy — call mobility_book DIRECTLY with the chosen optionId (default to `recommendation.optionId` unless they picked another). If `recommendation.mustConfirm` is true (e.g. late night), explicitly confirm intent before booking. Booking SPENDS money and dispatches a driver, so it is automatically queued for the user\'s one-click approval showing provider/vehicle/fare; do not ask "shall I book?" in prose first — make the call and tell them it awaits approval. If the user overrides a preference for this trip ("just the bike, rain\'s fine"), honor it. Never book without an explicit choice.',
     policies: [
       { tool: 'mobility_estimate', trustClass: 'read', autoApprove: true },
       // Booking commits money + a driver — spend-class, ALWAYS the approval gate.
@@ -248,7 +248,12 @@ export const PACKS: Record<string, CapabilityPack> = {
       {
         type: 'procedural',
         subject: 'ride-booking',
-        content: 'Ride booking: mobility_estimate first to compare Uber/Ola/Rapido by fare+ETA+vehicle, recommend per the user\'s preference, then mobility_book with the chosen optionId. Booking is spend-class — call the tool directly; the queued Approve/Cancel card showing provider+vehicle+fare IS the confirmation. Never auto-pick without the user choosing.',
+        content: 'Ride booking: mobility_estimate first to compare Uber/Ola/Rapido — it returns a preference-aware recommendation (with reasons) already applying the user\'s rules; relay it, then mobility_book with the chosen optionId (default to the recommendation). Booking is spend-class — call the tool directly; the queued Approve/Cancel card showing provider+vehicle+fare IS the confirmation. If recommendation.mustConfirm is set, confirm intent first. Honor a per-trip override. Never auto-pick without the user choosing.',
+      },
+      {
+        type: 'procedural',
+        subject: 'travel-preferences',
+        content: 'The mobility decision engine applies the user\'s standing travel rules (avoid bikes in rain; prefer a car within a small price gap of the cheapest; auto over bike on long trips; confirm bookings late at night; rank by price/ETA/balanced), stored as editable data in mobility_prefs. Explain WHY an option was recommended using the returned reasons — the value is smart, transparent choices, not just the lowest fare.',
       },
     ],
     evalSuites: ['mobility'],
