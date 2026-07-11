@@ -484,7 +484,10 @@ app.post('/code', async (req, reply) => {
 // Jobs are fixed read-only pipelines (briefing/watch/reflect) — the only thing an
 // unattended run can do is write a notification.
 // ---------------------------------------------------------------------------
-const JOB_KINDS = new Set(['briefing', 'watch', 'reflect']);
+// briefing/watch/reflect = fixed read-only pipelines. act (M12b) runs an agent
+// loop on a trigger (mutations still approval-gated). learn (M13b) runs the
+// gym-gated learning cycle. Both are unattended but contained by the trust gate.
+const JOB_KINDS = new Set(['briefing', 'watch', 'reflect', 'act', 'learn']);
 
 app.get('/jobs', async () => {
   const { rows: jobs } = await pool.query(
@@ -506,6 +509,9 @@ app.post('/jobs', async (req, reply) => {
   }
   if (kind === 'watch' && !/^https?:\/\//i.test(String(payload?.url ?? ''))) {
     return reply.code(400).send({ error: 'watch jobs need payload.url (http/https)' });
+  }
+  if (kind === 'act' && !String(payload?.goal ?? '').trim()) {
+    return reply.code(400).send({ error: 'act jobs need payload.goal (what to do when triggered)' });
   }
   try {
     return await createJob(pool, { name: name.trim(), kind, schedule, payload });

@@ -13,6 +13,7 @@ import { runReflection } from '@ai-os/memory';
 import type { JobExecutor, ExecutorContext, JobRow } from './scheduler.js';
 import { runTask } from './executor.js';
 import { runAgentTask, classifyGoal } from './agents.js';
+import { runLearningCycle } from './learning.js';
 
 const TZ = () => process.env.AIOS_TZ ?? 'Asia/Kolkata';
 
@@ -214,8 +215,34 @@ export function makeActExecutor(runner: ActRunner = defaultActRunner): JobExecut
 
 export const actExecutor: JobExecutor = makeActExecutor();
 
+/** learn — M13b (ADR-0016): the brain trains itself on a schedule. Runs the
+ *  full M10 learning cycle (gather behavioral failures → propose small general
+ *  playbooks → GYM-GATE each → adopt/reject/queue). autoAdopt=false: unattended,
+ *  the OS never silently rewrites itself — clean-but-unproven playbooks QUEUE
+ *  for the user's review (surfaced here + in /improvements). Only the gym can
+ *  reject; only a human adopts a queued one. INFRA errors propagate → the
+ *  scheduler defers (quota never kills the cycle). */
+export const learnExecutor: JobExecutor = async (pool) => {
+  const r = await runLearningCycle(pool, { autoAdopt: false });
+  const summary = `learning cycle: ${r.proposed} proposed · ${r.adopted.length} adopted · ${r.rejected.length} rejected (gym) · ${r.queued.length} queued for review`;
+  // Notify only when there's something to see — a no-signal week is silent.
+  const notify =
+    r.proposed > 0
+      ? {
+          kind: 'learning',
+          title: `🧠 Learning cycle — ${r.queued.length} improvement${r.queued.length === 1 ? '' : 's'} awaiting your review`,
+          body:
+            `The OS reviewed its recent failures and gym-tested ${r.proposed} proposed playbook${r.proposed === 1 ? '' : 's'}.\n` +
+            `${r.rejected.length ? `Rejected by the gym (would regress): ${r.rejected.join(', ')}\n` : ''}` +
+            `${r.queued.length ? `Queued for you to approve in /improvements: ${r.queued.join(', ')}\n` : ''}` +
+            `${r.adopted.length ? `Auto-adopted: ${r.adopted.join(', ')}\n` : ''}`.trim(),
+        }
+      : undefined;
+  return { summary, output: { taskId: r.taskId, proposed: r.proposed, queued: r.queued, rejected: r.rejected }, notify };
+};
+
 export function defaultExecutors(): Record<string, JobExecutor> {
-  return { briefing: briefingExecutor, watch: watchExecutor, reflect: reflectExecutor, act: actExecutor };
+  return { briefing: briefingExecutor, watch: watchExecutor, reflect: reflectExecutor, act: actExecutor, learn: learnExecutor };
 }
 
 export type { JobRow };

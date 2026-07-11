@@ -52,7 +52,7 @@ export {
   type ExecutorResult,
   type TickReport,
 } from './scheduler.js';
-export { briefingExecutor, watchExecutor, reflectExecutor, actExecutor, makeActExecutor, defaultExecutors, type ActRunner } from './jobs.js';
+export { briefingExecutor, watchExecutor, reflectExecutor, actExecutor, makeActExecutor, learnExecutor, defaultExecutors, type ActRunner } from './jobs.js';
 export {
   runLearningCycle,
   gatherFailureSignals,
