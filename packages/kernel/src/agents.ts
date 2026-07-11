@@ -15,8 +15,15 @@
 //  - a specialist cannot call outside its toolkit (executor allowedTools guard,
 //    enforced BEFORE the approval-queue branch).
 //
-// Quota reality (free Groq, ~8k TPM): concurrency defaults to 2, plans are
-// capped at 5 subtasks, and the planner is told to prefer the FEWEST agents.
+// Independent subtasks in a wave run CONCURRENTLY by default (see
+// DEFAULT_CONCURRENCY below) — with real multi-provider failover restored
+// (2026-07-11 fix: a stale MODEL_PROVIDER=groq pin had disabled it for 2
+// days), a handful of parallel children is safe. Concurrency is also
+// ADAPTIVE: if a chunk shows real rate-limit pressure, it self-heals toward
+// sequential for the REST of that run instead of assuming a fixed number
+// forever (which is exactly how "2" above went stale the moment the primary
+// provider changed). Plans are capped at 5 subtasks; the planner is told to
+// prefer the FEWEST agents.
 import type pg from 'pg';
 import { TraceStore } from '@ai-os/shared';
 import { callModel } from '@ai-os/model-router';
@@ -142,11 +149,33 @@ export interface ChildResult {
   untrusted: boolean;
 }
 
+// Independent subtasks run concurrently up to this ceiling by default. Not a
+// tuned-for-one-provider magic number (that's how the old "2" went stale) —
+// just a modest starting point; genuine pressure shrinks it at runtime (below).
+const DEFAULT_CONCURRENCY = 3;
+
+// Matches the provider-exhaustion shapes the kernel already produces
+// (executor.ts's humanizeFailure output text, e.g. "…rate-limited right
+// now…" / "…reaching the AI model provider…") or raw INFRA_* markers if they
+// ever reach here unhumanized. A child task's FINAL text carrying this means
+// every retry/failover option in the model router was exhausted — real,
+// current pressure, not a fluke. Shared with jobs.ts's actExecutor (was a
+// near-duplicate inline regex there; one definition now).
+const RATE_LIMIT_PRESSURE = /INFRA_(RATELIMIT|NETWORK)|rate.?limit|\bquota\b|\bnetwork\b|\b429\b|\b503\b|reaching the AI model provider/i;
+export function isRateLimitPressure(text: string): boolean {
+  return RATE_LIMIT_PRESSURE.test(text);
+}
+
 export interface OrchestrateDeps {
   /** Run one subtask; receives dependency context + inherited taint. */
   runChild: (s: Subtask, ctx: { depBlock: string; untrusted: boolean }) => Promise<{ status: TaskRunResult['status']; text: string; untrusted: boolean }>;
   synth: (goal: string, results: ChildResult[]) => Promise<string>;
-  onEvent?: (e: { kind: 'child_done'; result: ChildResult } | { kind: 'wave'; index: number; ids: string[] }) => void | Promise<void>;
+  onEvent?: (e: { kind: 'child_done'; result: ChildResult } | { kind: 'wave'; index: number; ids: string[] } | { kind: 'concurrency_reduced'; from: number; to: number }) => void | Promise<void>;
+  /** Starting ceiling for parallel children (default DEFAULT_CONCURRENCY, or
+   *  AIOS_AGENT_CONCURRENCY). This is a CEILING, not a fixed rate — the engine
+   *  shrinks it automatically (never grows it back within one run) if a chunk
+   *  shows real rate-limit pressure, so it self-heals toward sequential only
+   *  under genuine load instead of a human having to notice and retune it. */
   concurrency?: number;
   /** Checkpoint-resume: return the RECORDED result of a subtask that already
    *  reached a terminal state before a restart — it is reused, runChild is
@@ -156,21 +185,25 @@ export interface OrchestrateDeps {
 }
 
 export async function orchestrate(goal: string, subtasks: Subtask[], deps: OrchestrateDeps): Promise<{ text: string; results: ChildResult[] }> {
-  // Default 1 (sequential): the free-tier Groq window is 8k TPM and a single
-  // researcher-with-web-content call books ~7k — two concurrent children just
-  // starve each other through 429 retries (measured live 2026-07-10). Raise
-  // AIOS_AGENT_CONCURRENCY when a paid provider is configured.
-  const concurrency = Math.max(1, deps.concurrency ?? (Number(process.env.AIOS_AGENT_CONCURRENCY) || 1));
+  let concurrency = Math.max(1, deps.concurrency ?? (Number(process.env.AIOS_AGENT_CONCURRENCY) || DEFAULT_CONCURRENCY));
   const results = new Map<string, ChildResult>();
   const waves = topoWaves(subtasks);
 
   for (let w = 0; w < waves.length; w++) {
     const wave = waves[w]!;
     await deps.onEvent?.({ kind: 'wave', index: w, ids: wave.map((s) => s.id) });
-    // Chunk the wave to the concurrency cap (free-tier TPM shares one window).
-    for (let i = 0; i < wave.length; i += concurrency) {
+    // Chunk the wave to the current concurrency ceiling — independent
+    // subtasks (no dependency between them) run TOGETHER, not one by one.
+    // NB advance `i` by the chunk size we actually just dispatched, captured
+    // BEFORE the backoff below can shrink `concurrency` — a bare
+    // `i += concurrency` re-reads the (by-then-mutated) variable at the
+    // increment step, silently re-slicing and re-running already-done
+    // children (caught live: s2/s3 executed twice when a chunk both used
+    // concurrency=4 for its slice AND shrank concurrency to 2 afterward).
+    for (let i = 0; i < wave.length; ) {
       const chunk = wave.slice(i, i + concurrency);
-      await Promise.all(
+      i += chunk.length;
+      const chunkResults = await Promise.all(
         chunk.map(async (s) => {
           // Resume path: a child that finished before the restart keeps its
           // recorded result — never re-run (its side effects already happened
@@ -179,7 +212,7 @@ export async function orchestrate(goal: string, subtasks: Subtask[], deps: Orche
           if (pre) {
             results.set(s.id, pre);
             await deps.onEvent?.({ kind: 'child_done', result: pre });
-            return;
+            return pre;
           }
           const depResults = s.dependsOn.map((d) => results.get(d)!).filter(Boolean);
           const tainted = depResults.some((d) => d.untrusted);
@@ -196,8 +229,21 @@ export async function orchestrate(goal: string, subtasks: Subtask[], deps: Orche
           const r: ChildResult = { id: s.id, agent: s.agent, ...child };
           results.set(s.id, r);
           await deps.onEvent?.({ kind: 'child_done', result: r });
+          return r;
         }),
       );
+      // Adaptive backoff: only meaningful when this chunk actually ran things
+      // concurrently (size 1 = nothing to shrink from). A genuinely exhausted
+      // provider surfaces its final, all-retries-spent text here (runChild
+      // catches to a failed result rather than throwing) — that's real
+      // pressure, so shrink toward sequential for the REST of this run. Never
+      // grows back up mid-run; the next orchestration starts fresh at the
+      // ceiling, so a bad provider-day never permanently downgrades the OS.
+      if (concurrency > 1 && chunkResults.some((r) => isRateLimitPressure(r.text))) {
+        const next = Math.max(1, Math.floor(concurrency / 2));
+        await deps.onEvent?.({ kind: 'concurrency_reduced', from: concurrency, to: next });
+        concurrency = next;
+      }
     }
   }
 

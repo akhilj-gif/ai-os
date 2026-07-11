@@ -12,7 +12,7 @@ import { MemoryService } from '@ai-os/memory';
 import { runReflection } from '@ai-os/memory';
 import type { JobExecutor, ExecutorContext, JobRow } from './scheduler.js';
 import { runTask } from './executor.js';
-import { runAgentTask, classifyGoal } from './agents.js';
+import { runAgentTask, classifyGoal, isRateLimitPressure } from './agents.js';
 import { runLearningCycle } from './learning.js';
 
 const TZ = () => process.env.AIOS_TZ ?? 'Asia/Kolkata';
@@ -195,7 +195,7 @@ export function makeActExecutor(runner: ActRunner = defaultActRunner): JobExecut
     // runTask swallows provider errors into a humanized failed result — re-raise
     // quota/network as INFRA so the scheduler DEFERS (retry ~15m) instead of
     // burning the failure budget on the world's problems.
-    if (result.status === 'failed' && /rate.?limit|INFRA_|quota|network|reaching the AI model provider/i.test(result.text)) {
+    if (result.status === 'failed' && isRateLimitPressure(result.text)) {
       throw new Error(`INFRA_RATELIMIT act run deferred: ${result.text.slice(0, 200)}`);
     }
 

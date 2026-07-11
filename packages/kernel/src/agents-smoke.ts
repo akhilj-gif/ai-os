@@ -1,7 +1,7 @@
 // M11 agents — deterministic smoke (no DB, no model): plan parsing/validation,
 // topological waves, and the orchestrate() engine with stubbed runners.
 // Run: npx tsx packages/kernel/src/agents-smoke.ts
-import { parsePlan, topoWaves, orchestrate, type Subtask, type ChildResult } from './agents.js';
+import { parsePlan, topoWaves, orchestrate, isRateLimitPressure, type Subtask, type ChildResult } from './agents.js';
 
 let failures = 0;
 function check(name: string, cond: boolean, detail = ''): void {
@@ -162,6 +162,90 @@ console.log('\n— orchestrate: checkpoint-resume (prior seam) —');
   });
   check('awaiting_approval child not re-run', !ran.includes('a') && ran.includes('b'));
   check('awaiting_approval status survives resume', res.text === 'a=awaiting_approval,b=done', res.text);
+}
+
+console.log('\n— isRateLimitPressure —');
+check('humanized rate-limit text matches', isRateLimitPressure('⚠ I couldn’t finish that — the AI model provider is rate-limited right now.'));
+check('humanized network text matches', isRateLimitPressure('⚠ I couldn’t finish that — I had trouble reaching the AI model provider (network issue).'));
+check('raw INFRA_RATELIMIT marker matches', isRateLimitPressure('INFRA_RATELIMIT 429 (groq): ...'));
+check('an ordinary success/failure text does not match', !isRateLimitPressure('Task exceeded its iteration budget (12).'));
+
+console.log('\n— orchestrate: default concurrency (no explicit override) —');
+{
+  // No `concurrency` in deps and no AIOS_AGENT_CONCURRENCY env — independent
+  // subtasks must run TOGETHER (this is the actual behavior Akhil reported as
+  // "one by one, wastes time"), not serialize just because nothing was passed.
+  delete process.env.AIOS_AGENT_CONCURRENCY;
+  const independent: Subtask[] = Array.from({ length: 4 }, (_, i) => ({ id: `p${i}`, agent: 'generalist', goal: 'x', dependsOn: [] }));
+  let maxInFlight = 0;
+  let inFlight = 0;
+  await orchestrate('g', independent, {
+    runChild: async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 20));
+      inFlight--;
+      return { status: 'done', text: 'ok', untrusted: false };
+    },
+    synth: async () => 'done',
+  });
+  check('default concurrency runs independent subtasks in parallel (not 1 at a time)', maxInFlight > 1, `max in flight: ${maxInFlight}`);
+}
+
+console.log('\n— orchestrate: adaptive concurrency backoff under real pressure —');
+{
+  // 8 independent subtasks, explicit ceiling 4 (deterministic regardless of
+  // env/default). The FIRST chunk (s0-s3) hits genuine rate-limit pressure —
+  // the engine must shrink for the REST of the run (s4-s7), not keep hammering
+  // an exhausted provider at the same concurrency forever.
+  const eight: Subtask[] = Array.from({ length: 8 }, (_, i) => ({ id: `s${i}`, agent: 'generalist', goal: 'x', dependsOn: [] }));
+  const startedAt: Record<string, number> = {};
+  const runCount: Record<string, number> = {};
+  let inFlight = 0;
+  const reductions: Array<{ from: number; to: number }> = [];
+  const res = await orchestrate('g', eight, {
+    concurrency: 4,
+    runChild: async (s) => {
+      runCount[s.id] = (runCount[s.id] ?? 0) + 1;
+      inFlight++;
+      startedAt[s.id] = inFlight;
+      await new Promise((r) => setTimeout(r, 20));
+      inFlight--;
+      if (s.id === 's0' || s.id === 's1') {
+        return { status: 'failed', text: '⚠ I couldn’t finish that — the AI model provider is rate-limited right now. It usually clears within a minute.', untrusted: false };
+      }
+      return { status: 'done', text: `${s.id} ok`, untrusted: false };
+    },
+    synth: async () => 'done',
+    onEvent: async (e) => {
+      if (e.kind === 'concurrency_reduced') reductions.push({ from: e.from, to: e.to });
+    },
+  });
+  const firstChunkMax = Math.max(startedAt.s0!, startedAt.s1!, startedAt.s2!, startedAt.s3!);
+  const secondChunkMax = Math.max(startedAt.s4!, startedAt.s5!, startedAt.s6!, startedAt.s7!);
+  check('first chunk ran at the full starting ceiling', firstChunkMax === 4, `max: ${firstChunkMax}`);
+  check('pressure in chunk 1 shrinks concurrency for chunk 2 (self-heals, not stuck)', secondChunkMax <= 2, `max: ${secondChunkMax}`);
+  check('the shrink is reported via onEvent (observable, not silent)', reductions.length === 1 && reductions[0]!.from === 4 && reductions[0]!.to === 2, JSON.stringify(reductions));
+  // Regression guard for a real bug this feature shipped with: `i +=
+  // concurrency` in the wave-chunking loop re-read `concurrency` AFTER the
+  // backoff above had already shrunk it, so the next slice's start index was
+  // wrong and re-included s2/s3 — they ran twice, silently overwriting their
+  // own results. Caught only by manually logging dispatch order, NOT by the
+  // max-in-flight assertions above — so it gets its own explicit check.
+  check('every subtask ran EXACTLY once (no re-slice duplication after a shrink)', eight.every((s) => runCount[s.id] === 1), JSON.stringify(runCount));
+  check('all 8 results present in the final ordered output, none dropped', res.results.length === 8 && new Set(res.results.map((r) => r.id)).size === 8);
+}
+
+{
+  // A single-child chunk (concurrency already 1) has nothing to shrink from —
+  // must not throw or misbehave when isRateLimitPressure fires anyway.
+  const solo: Subtask[] = [{ id: 'a', agent: 'generalist', goal: 'x', dependsOn: [] }];
+  const res = await orchestrate('g', solo, {
+    concurrency: 1,
+    runChild: async () => ({ status: 'failed', text: 'INFRA_RATELIMIT 429', untrusted: false }),
+    synth: async (_g, results: ChildResult[]) => results.map((r) => r.status).join(','),
+  });
+  check('concurrency already 1: pressure detection is a no-op, not a crash', res.text === 'failed');
 }
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`);

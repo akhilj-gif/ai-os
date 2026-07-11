@@ -8,11 +8,13 @@ export {
   orchestrate,
   parsePlan,
   topoWaves,
+  isRateLimitPressure,
   AGENTS,
   type Subtask,
   type ChildResult,
   type AgentDef,
   type AgentTaskOptions,
+  type OrchestrateDeps,
 } from './agents.js';
 export { ensureDefaultSession, addMessage, listMessages, type SessionMessage } from './sessions.js';
 export { systemPrompt } from './prompts.js';
