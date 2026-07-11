@@ -142,6 +142,11 @@ export interface RunTaskOptions {
    *  set when a dependency subtask's output was untrusted-derived, so the
    *  taint propagates ACROSS agents instead of resetting per child task. */
   initialUntrusted?: boolean;
+  /** Perf (2026-07-11): a caller that already computed the memory-context
+   *  block (e.g. in parallel with classifyGoal) passes it here so runTask
+   *  doesn't redo the embedding + recall round-trip. undefined = compute it
+   *  normally; '' counts as "computed, nothing relevant" — not "uncomputed". */
+  precomputedMemory?: string;
 }
 
 /** Run (or resume) a task to completion. Idempotent on restart. */
@@ -170,12 +175,19 @@ export async function runTask(
     // Context Engine: inject always-loaded preferences + task-relevant recalled
     // memories at task start (blueprint §7.3). Best-effort — memory must never
     // block a task. Eval runs (opts.registry set) skip it for determinism.
+    // Perf: skip the round-trip entirely if the caller already computed it
+    // (completeChatTask runs this in parallel with classifyGoal).
     let memoryBlock = '';
-    if (!opts.registry || opts.enableMemory) {
+    if (opts.precomputedMemory !== undefined) {
+      memoryBlock = opts.precomputedMemory;
+    } else if (!opts.registry || opts.enableMemory) {
+      const t0 = Date.now();
       try {
         memoryBlock = await assembleMemoryContext(pool, { goal: task.goal });
       } catch (err) {
         console.warn('[kernel] memory context failed (non-fatal):', err instanceof Error ? err.message : err);
+      } finally {
+        console.log(`[latency] assembleMemoryContext taskId=${taskId} ms=${Date.now() - t0}`);
       }
     }
     messages = [
@@ -215,6 +227,7 @@ export async function runTask(
     messages = shrinkToolResults(messages, CONTEXT_TOKEN_BUDGET);
 
     let resp;
+    const modelT0 = Date.now();
     try {
       // maxTokens 1024 (not the router's 2048 default): providers BOOK max_tokens
       // against the tokens-per-minute window up front (Groq free tier: 12k TPM for
@@ -229,6 +242,8 @@ export async function runTask(
       await pool.query(`UPDATE tasks SET status='failed', updated_at=now() WHERE id=$1`, [taskId]);
       await trace.record({ traceId, taskId, component: 'kernel', event: 'task.failed', payload: { error: msg } });
       return { taskId, status: 'failed', text: humanizeFailure(msg) };
+    } finally {
+      console.log(`[latency] chat taskId=${taskId} iter=${iter} ms=${Date.now() - modelT0}`);
     }
 
     totalTokens += resp.usage.inputTokens + resp.usage.outputTokens;
@@ -267,10 +282,18 @@ export async function runTask(
       );
       await trace.record({ traceId, taskId, component: 'kernel', event: queuedApproval ? 'task.awaiting_approval' : 'task.done', payload: { iterations: iter + 1, tokens: totalTokens } });
       // Learn from the exchange (best-effort; skipped for eval runs and for
-      // awaiting-approval turns — the exchange isn't complete yet).
+      // awaiting-approval turns — the exchange isn't complete yet). Perf
+      // (2026-07-11): fire-and-forget — this is a background "what's worth
+      // remembering" LLM call with no bearing on THIS reply, so it must not
+      // hold the user's response hostage to an extra model round-trip. A
+      // failure here is already non-fatal by design (extractAndStore catches
+      // internally); detaching it just stops it blocking, same guarantee.
       if (!opts.registry && !queuedApproval) {
-        const stored = await extractAndStore(pool, { taskId, traceId, userText: task.goal, assistantText: text });
-        if (stored) await trace.record({ traceId, taskId, component: 'memory', event: 'memory.extracted', payload: { count: stored } });
+        void extractAndStore(pool, { taskId, traceId, userText: task.goal, assistantText: text })
+          .then((stored) => {
+            if (stored) return trace.record({ traceId, taskId, component: 'memory', event: 'memory.extracted', payload: { count: stored } });
+          })
+          .catch((err) => console.warn('[kernel] memory extraction failed (non-fatal):', err instanceof Error ? err.message : err));
       }
       return { taskId, status: finalStatus, text };
     }

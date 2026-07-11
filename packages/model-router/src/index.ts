@@ -72,6 +72,12 @@ const PROVIDERS: Record<string, () => Provider | null> = {
   // open-source reasoning" tier (ADR-0019). Models confirmed live against this
   // catalog 2026-07-11; swap in a stronger execution/planning model once you've
   // verified it responds 200 the same way (catalog changes without notice).
+  // Perf (2026-07-11 latency pass): the free/community tier's latency is HIGH
+  // VARIANCE, not just "slower" — 70b measured 2.9s one call, 27-48s minutes
+  // later for the identical model+prompt, no code change in between (shared
+  // queue depth, outside our control). execution now uses the small 8b model
+  // (consistently ~1-3s) so everyday chat isn't gambling on that queue; 70b
+  // stays on planning only, used less often and already latency-tolerant work.
   nvidia: () =>
     process.env.NVIDIA_API_KEY
       ? {
@@ -81,7 +87,7 @@ const PROVIDERS: Record<string, () => Provider | null> = {
           baseURL: 'https://integrate.api.nvidia.com/v1',
           defaults: {
             routing: 'meta/llama-3.1-8b-instruct',
-            execution: 'meta/llama-3.1-70b-instruct',
+            execution: 'meta/llama-3.1-8b-instruct',
             planning: 'meta/llama-3.1-70b-instruct',
           },
         }

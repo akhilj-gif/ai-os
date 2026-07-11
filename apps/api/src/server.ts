@@ -17,6 +17,7 @@ import {
   runAgentTask,
   resumeAgentTask,
   classifyGoal,
+  assembleMemoryContext,
   findOrphanedTasks,
   ensureDefaultSession,
   addMessage,
@@ -42,7 +43,7 @@ import {
   type Schedule,
 } from '@ai-os/kernel';
 import { MemoryService } from '@ai-os/memory';
-import { failoverChain, transcribe, synthesize } from '@ai-os/model-router';
+import { failoverChain, transcribe, synthesize, callModel } from '@ai-os/model-router';
 import { composeRegistry, packPrompts, loadEnabledPacks, installPack, setPackEnabled, listPacks, PACKS, uberConfigured, uberAuthorizeUrl, exchangeUberCode } from '@ai-os/packs';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
@@ -297,11 +298,33 @@ async function completeChatTask(taskId: string, agentMode: 'auto' | 'force' | 'o
   // 'auto' asks a routing-tier classifier (fail-safe → simple); AIOS_AGENTS=off
   // is the kill switch. Orchestrated runs post progress lines into the chat.
   let useAgents = false;
+  // Perf (2026-07-11): classifyGoal (routing-tier model call) and the memory-
+  // context embed+recall are INDEPENDENT — neither needs the other's result —
+  // but ran sequentially before. Kick memory off in parallel and hand runTask
+  // the finished value, skipping its own internal recall. Only worth starting
+  // when 'auto' will actually reach runTask afterward: 'off' (boot-resume) has
+  // its own checkpoint memory already, and 'force' goes straight to
+  // runAgentTask, which doesn't consume a memory block — starting the fetch in
+  // either case would just be wasted work with nothing to hand it to.
+  let precomputedMemory: string | undefined;
   if (process.env.AIOS_AGENTS !== 'off' && agentMode !== 'off') {
     if (agentMode === 'force') useAgents = true;
     else {
       const t = await pool.query<{ goal: string; trace_id: string }>(`SELECT goal, trace_id FROM tasks WHERE id=$1`, [taskId]);
-      useAgents = t.rows[0] ? (await classifyGoal(t.rows[0].goal, t.rows[0].trace_id)) === 'complex' : false;
+      const goal = t.rows[0];
+      if (goal) {
+        const memT0 = Date.now();
+        const [classification, memory] = await Promise.all([
+          classifyGoal(goal.goal, goal.trace_id),
+          assembleMemoryContext(pool, { goal: goal.goal }).catch((err) => {
+            console.warn('[api] memory context failed (non-fatal):', err instanceof Error ? err.message : err);
+            return '';
+          }),
+        ]);
+        console.log(`[latency] classifyGoal+memoryContext taskId=${taskId} ms=${Date.now() - memT0}`);
+        useAgents = classification === 'complex';
+        precomputedMemory = memory;
+      }
     }
   }
 
@@ -311,7 +334,7 @@ async function completeChatTask(taskId: string, agentMode: 'auto' | 'force' | 'o
         extraSystem: packPrompt(),
         say: async (content) => { await addMessage(pool, { sessionId, role: 'assistant', content, taskId }); },
       })
-    : await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true, history: prior });
+    : await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true, history: prior, precomputedMemory });
   await addMessage(pool, { sessionId, role: 'assistant', content: result.text, taskId });
 }
 
@@ -957,6 +980,23 @@ function resumeTaskById(taskId: string, why: 'boot' | 'coordinator'): Promise<vo
 const port = Number(process.env.API_PORT ?? 4000);
 enabledPacks = await loadEnabledPacks(pool); // before listen: routes + resume + scheduler all compose from it
 app.log.info({ packs: [...enabledPacks] }, 'capability packs enabled');
+
+// Perf (2026-07-11): pre-warm each capability bucket's primary provider (DNS +
+// TLS handshake) so the FIRST real request doesn't pay cold-connection cost.
+// Fire-and-forget, never blocks boot; a warm failure is just a missed warm —
+// the real request still gets its own full retry/failover machinery.
+void (async () => {
+  const t0 = Date.now();
+  const results = await Promise.allSettled(
+    (['workspace', 'coding', 'fast'] as const).map((capability) =>
+      callModel({ role: 'routing', prompt: 'ping', capability, maxTokens: 1, traceId: randomUUID(), name: 'provider-warmup' }),
+    ),
+  );
+  app.log.info(
+    { ms: Date.now() - t0, ok: results.filter((r) => r.status === 'fulfilled').length, of: results.length },
+    'provider pre-warm',
+  );
+})();
 await app.listen({ port, host: '127.0.0.1' });
 
 void (async () => {
