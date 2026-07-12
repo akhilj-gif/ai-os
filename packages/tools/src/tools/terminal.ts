@@ -13,6 +13,7 @@
 // confined to AIOS_TERMINAL_ROOT. code_exec (Docker, ADR-0009) stays the path
 // for untrusted CODE; this is for trusted operational commands.
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve, relative, isAbsolute } from 'node:path';
 import type { ToolDef } from '../registry.js';
@@ -44,12 +45,14 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_OUTPUT = 64_000; // head+tail cap per stream
 
 // Heads that only INSPECT — safe to run without asking. Platform-neutral where
-// possible; the Windows-native ones (dir/type/Get-*) sit alongside the POSIX set.
+// possible; the Windows-native ones (dir/type) sit alongside the POSIX set.
+// NOTE: runInShell() always runs through cmd.exe on Windows (never
+// powershell.exe), so PowerShell-only cmdlet names (Get-ChildItem, Test-Path,
+// etc.) can never actually execute here — don't add them.
 const READ_ALLOWLIST = new Set([
   'ls', 'dir', 'pwd', 'cd', 'cat', 'type', 'head', 'tail', 'wc', 'find', 'where', 'which',
   'echo', 'date', 'whoami', 'hostname', 'uname', 'df', 'du', 'ps', 'env', 'printenv',
   'tree', 'stat', 'file', 'grep', 'findstr',
-  'get-childitem', 'get-content', 'get-location', 'get-process', 'select-string', 'test-path',
 ]);
 // git is allowed ONLY for read subcommands.
 const GIT_READ_SUBCMDS = new Set(['status', 'log', 'diff', 'show', 'branch', 'remote', 'config']);
@@ -66,6 +69,11 @@ function confineCwd(raw: unknown): string {
   const rel = relative(root, abs);
   if (rel.startsWith('..') || isAbsolute(rel)) {
     throw new Error(`cwd "${req}" escapes the terminal root (${root}); set AIOS_TERMINAL_ROOT to widen it`);
+  }
+  // Fail here with a clear message — otherwise Node's spawn() ENOENTs against
+  // the shell executable path, which misleadingly reads as "cmd.exe is missing".
+  if (!existsSync(abs)) {
+    throw new Error(`cwd "${req}" does not exist (resolved to ${abs})`);
   }
   return abs;
 }
@@ -89,16 +97,36 @@ interface RunResult {
 // terminal_exec intentionally allows the full shell (post-approval).
 function runInShell(command: string, cwd: string, timeoutMs: number): Promise<RunResult> {
   const isWin = process.platform === 'win32';
-  const shell = isWin ? (process.env.ComSpec || 'cmd.exe') : '/bin/sh';
-  const args = isWin ? ['/d', '/s', '/c', command] : ['-c', command];
   return new Promise((resolveP) => {
-    const child = spawn(shell, args, { cwd, env: scrubbedEnv(), windowsHide: true });
+    // shell:true lets Node pick AND correctly invoke the platform shell itself
+    // (ComSpec on Windows, /bin/sh on POSIX). Building the cmd.exe argv by hand
+    // (as this used to) skips Node's windowsVerbatimArguments handling, so
+    // Node's own per-argument escaping and cmd.exe's /S /C quote-stripping both
+    // rewrite the string independently and disagree — any quoted value
+    // (`-m "a b"`, `-Command "..."`) comes out corrupted on the other side.
+    const child = spawn(command, { cwd, env: scrubbedEnv(), windowsHide: true, shell: true });
     let stdout = '';
     let stderr = '';
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill();
+      // Windows: the real command runs as a GRANDCHILD of Node (child of the
+      // cmd.exe process above) and inherits cmd.exe's stdout pipe handle.
+      // taskkill /T kills the whole tree (cmd.exe AND the grandchild) in one
+      // shot — calling child.kill() first is not just redundant, it actively
+      // breaks this: Node's default kill terminates the cmd.exe wrapper
+      // almost instantly, so by the time taskkill runs its PID no longer
+      // exists ("ERROR: The process ... not found"), taskkill's /t never
+      // gets to enumerate/kill the real grandchild, and the command runs to
+      // completion untouched (live-confirmed: 'close' fired at the command's
+      // OWN natural duration, not at timeoutMs, despite timedOut being
+      // correctly set true). On POSIX there is no tree-kill equivalent here,
+      // so child.kill() is still the right (and only) mechanism.
+      if (isWin && child.pid) {
+        spawn('taskkill', ['/pid', String(child.pid), '/t', '/f']).on('error', () => {});
+      } else {
+        child.kill();
+      }
     }, timeoutMs);
     child.stdout.on('data', (d) => {
       if (stdout.length < MAX_OUTPUT * 2) stdout += d.toString();
@@ -136,7 +164,7 @@ export const terminalRun: ToolDef = {
   name: 'terminal_run',
   untrustedOutput: false, // read-only + allowlisted: an injected read is harmless and actuates nothing
   description:
-    'Run a READ-ONLY inspection command on the host and return its output (ls, cat, pwd, git status/log/diff, dir, type, Get-ChildItem, etc.). No approval needed. For ANYTHING that changes the system, use terminal_exec instead. No shell chaining/redirect/pipes here.',
+    'Run a READ-ONLY inspection command on the host and return its output (ls, cat, pwd, git status/log/diff, dir, type, etc.). Runs via the platform shell (cmd.exe on Windows, sh elsewhere) — PowerShell-only cmdlets are not available. No approval needed. For ANYTHING that changes the system, use terminal_exec instead. No shell chaining/redirect/pipes here.',
   inputSchema: {
     type: 'object',
     properties: {

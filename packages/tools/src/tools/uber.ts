@@ -108,12 +108,23 @@ export interface Coords {
   lng: number;
 }
 
+/** open-meteo's place search returns zero results for comma-joined "locality,
+ *  city" strings even though each half resolves alone, and with no country
+ *  bias a bare English name like "Bangalore" matches an unrelated same-named
+ *  town in Pakistan ahead of "Bengaluru", India. countryCode=IN biases to the
+ *  app's home market; on a comma-joined miss, retry with just the part
+ *  before the first comma. */
+async function geocodeSearch(query: string): Promise<{ latitude: number; longitude: number } | null> {
+  const r = (await (await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(query)}&count=1&countryCode=IN`, { signal: AbortSignal.timeout(6000) })).json()) as {
+    results?: Array<{ latitude: number; longitude: number }>;
+  };
+  return r.results?.[0] ?? null;
+}
+
 export async function geocode(place: string): Promise<Coords | null> {
   try {
-    const r = (await (await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(place)}&count=1`, { signal: AbortSignal.timeout(6000) })).json()) as {
-      results?: Array<{ latitude: number; longitude: number }>;
-    };
-    const loc = r.results?.[0];
+    const commaIdx = place.indexOf(',');
+    const loc = (await geocodeSearch(place)) ?? (commaIdx === -1 ? null : await geocodeSearch(place.slice(0, commaIdx).trim()));
     return loc ? { lat: loc.latitude, lng: loc.longitude } : null;
   } catch {
     return null;

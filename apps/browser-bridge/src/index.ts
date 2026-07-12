@@ -19,6 +19,11 @@ import { chromium, type BrowserContext, type Page } from 'playwright';
 import { DEFAULT_BROWSER_BRIDGE_PORT } from './contract.js';
 import { findInPage } from './find-in-page.js';
 
+// Playwright's own error messages (e.g. locator timeouts) embed ANSI dim/reset
+// codes from its terminal call-log pretty-printer — strip them before they hit
+// a JSON error body, which has no terminal to render them.
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+
 const PORT = Number(process.env.BROWSER_BRIDGE_PORT) || DEFAULT_BROWSER_BRIDGE_PORT;
 const HEADLESS = process.env.BROWSER_HEADLESS === '1' || process.env.BROWSER_HEADLESS === 'true';
 const MAX_TEXT = 20_000;
@@ -81,6 +86,12 @@ async function main(): Promise<void> {
     if (!action) return reply.code(400).send({ error: 'action is required' });
     const p = await ensurePage();
     const loc = ref ? p.locator(`[data-aios-ref="${ref}"]`) : null;
+    // A stale/typo'd ref has to fail this check to even reach click/fill/
+    // selectOption below — otherwise a ref that plainly never existed pays
+    // the full 15s action-timeout instead of failing in ~milliseconds.
+    if (loc && (await loc.count()) === 0) {
+      return reply.code(404).send({ error: `no element matches ref "${ref}" — it may be stale (page navigated/re-rendered); call read/find again for current refs` });
+    }
     try {
       switch (action) {
         case 'click':
@@ -105,7 +116,8 @@ async function main(): Promise<void> {
           return reply.code(400).send({ error: `unknown action "${action}"` });
       }
     } catch (err) {
-      return reply.code(500).send({ error: err instanceof Error ? err.message.slice(0, 300) : 'action failed' });
+      const message = err instanceof Error ? err.message : 'action failed';
+      return reply.code(500).send({ error: message.replace(ANSI_RE, '').slice(0, 300) });
     }
     await p.waitForLoadState('domcontentloaded', { timeout: 10_000 }).catch(() => undefined);
     return { ok: true, action, url: p.url(), title: await p.title() };

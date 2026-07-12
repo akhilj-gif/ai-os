@@ -23,7 +23,17 @@ async function bridge<T>(path: string, body?: unknown): Promise<T> {
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(30_000),
   });
-  if (!res.ok) throw new Error(`browser bridge ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  if (!res.ok) {
+    const text = await res.text();
+    let message = text;
+    try {
+      const parsed = JSON.parse(text) as { error?: unknown };
+      if (typeof parsed.error === 'string') message = parsed.error;
+    } catch {
+      // body wasn't JSON — fall back to the raw text below
+    }
+    throw new Error(`browser bridge ${res.status}: ${message.slice(0, 300)}`);
+  }
   return (await res.json()) as T;
 }
 

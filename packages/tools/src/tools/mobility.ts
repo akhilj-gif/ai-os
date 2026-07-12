@@ -72,16 +72,27 @@ async function loadPrefs(ctx: ToolContext | undefined): Promise<MobilityPrefs> {
   }
 }
 
+/** open-meteo's place search returns zero results for comma-joined "locality,
+ *  city" strings even though each half resolves alone, and with no country
+ *  bias a bare English name like "Bangalore" matches an unrelated same-named
+ *  town in Pakistan ahead of "Bengaluru", India. countryCode=IN biases to the
+ *  app's home market; on a comma-joined miss, retry with just the part
+ *  before the first comma. */
+async function geocodeSearch(query: string): Promise<{ latitude: number; longitude: number } | null> {
+  const geo = (await (await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(query)}&count=1&countryCode=IN`, { signal: AbortSignal.timeout(6000) })).json()) as {
+    results?: Array<{ latitude: number; longitude: number }>;
+  };
+  return geo.results?.[0] ?? null;
+}
+
 /** Best-effort "is it raining at the pickup?" via keyless open-meteo (geocode →
  *  current precipitation). Any failure → undefined, and the rain rule simply
  *  doesn't fire (fail-open is safe: booking is still approval-gated). */
 async function isRainingAt(pickup: string): Promise<boolean | undefined> {
   if (process.env.AIOS_MOBILITY_WEATHER === 'off') return undefined;
   try {
-    const geo = (await (await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(pickup)}&count=1`, { signal: AbortSignal.timeout(6000) })).json()) as {
-      results?: Array<{ latitude: number; longitude: number }>;
-    };
-    const loc = geo.results?.[0];
+    const commaIdx = pickup.indexOf(',');
+    const loc = (await geocodeSearch(pickup)) ?? (commaIdx === -1 ? null : await geocodeSearch(pickup.slice(0, commaIdx).trim()));
     if (!loc) return undefined;
     const wx = (await (await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${loc.latitude}&longitude=${loc.longitude}&current=precipitation,rain`, { signal: AbortSignal.timeout(6000) })).json()) as {
       current?: { precipitation?: number; rain?: number };
@@ -116,10 +127,19 @@ export const mobilityEstimate: ToolDef = {
     let options: RideOption[];
     let live: boolean;
     if (bridgeUrl()) {
-      const r = await bridge<{ options: RideOption[]; distanceKm?: number }>('/estimate', { pickup, drop });
-      options = r.options ?? [];
-      live = true;
-      if (r.distanceKm != null && args.distanceKm == null) args = { ...args, distanceKm: r.distanceKm };
+      // A bridge restart/timeout/crash must degrade to mock like the Uber
+      // branch below does, not throw uncaught (see mobility_book, which stays
+      // uncaught on purpose — booking must never silently report a fake
+      // mock success for what was meant to be a real bridge booking).
+      try {
+        const r = await bridge<{ options: RideOption[]; distanceKm?: number }>('/estimate', { pickup, drop });
+        options = r.options ?? [];
+        live = true;
+        if (r.distanceKm != null && args.distanceKm == null) args = { ...args, distanceKm: r.distanceKm };
+      } catch {
+        options = mockOptions();
+        live = false;
+      }
     } else if (uberConfigured() && ctx?.pool) {
       // No aggregating bridge, but Uber is connected (M14c): real Uber options
       // via its official API + mock Ola/Rapido until their browser bridge lands.
