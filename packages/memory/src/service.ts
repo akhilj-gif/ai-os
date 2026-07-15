@@ -102,10 +102,19 @@ export class MemoryService {
     const limit = opts.limit ?? DEFAULT_LIMIT;
     const minRel = opts.minRelevance ?? DEFAULT_MIN_RELEVANCE;
     let queryVec: number[] | null = null;
-    try {
-      queryVec = await embedOne(opts.query);
-    } catch {
-      queryVec = null; // keyword-only fallback
+    // Perf (2026-07-16): a 1-2 word query ("hi", "thanks", "ok", "yes") carries
+    // no semantic signal worth an ~800ms embedding round-trip — and this sits on
+    // the reply's critical path (memory context is injected before the model
+    // call). Skip the embed for such queries and let the keyword (ts_rank) path
+    // below serve any literal match; real recall queries are full sentences
+    // (≥3 words) and still embed. Cuts ~800ms off greetings/acknowledgements.
+    const worthEmbedding = opts.query.trim().split(/\s+/).filter(Boolean).length >= 3;
+    if (worthEmbedding) {
+      try {
+        queryVec = await embedOne(opts.query);
+      } catch {
+        queryVec = null; // keyword-only fallback
+      }
     }
 
     const relExpr = queryVec
