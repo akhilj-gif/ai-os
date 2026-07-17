@@ -306,13 +306,16 @@ export async function transcribe(audio: Buffer, mime: string): Promise<string> {
 // ---------------------------------------------------------------------------
 // Text-to-speech (spoken replies). Always Groq, like transcribe()/embed() —
 // Orpheus (Canopy Labs) gives a natural human voice instead of the browser's
-// robotic speechSynthesis default. Voice is env-tunable; default "tara" is a
-// realistic FEMALE voice (Akhil's ask, 2026-07-11). NB playai-tts was
-// DECOMMISSIONED on Groq (400 as of 2026-07-11) — orpheus is its successor;
-// any synth failure makes the UI fall back to the browser voice.
+// robotic speechSynthesis default. Voice is env-tunable via AIOS_TTS_VOICE.
+// Default "autumn" is a realistic FEMALE voice (preserves Akhil's 2026-07-11
+// ask). NB the old default "tara" was RETIRED — orpheus now serves only
+// [autumn diana hannah austin daniel troy] and 400s on any other name
+// (confirmed live 2026-07-17); female options are autumn/diana/hannah. playai-
+// tts before it was decommissioned; any synth failure falls back to the
+// browser voice in the UI.
 // ---------------------------------------------------------------------------
 const TTS_MODEL = process.env.MODEL_TTS ?? 'canopylabs/orpheus-v1-english';
-const TTS_VOICE = process.env.AIOS_TTS_VOICE ?? 'tara';
+const TTS_VOICE = process.env.AIOS_TTS_VOICE ?? 'autumn';
 const TTS_MAX_CHARS = 900; // matches the UI's speakable() cap; PlayAI's own cap is 10k
 
 export async function synthesize(text: string): Promise<{ audio: Buffer; mime: string }> {
