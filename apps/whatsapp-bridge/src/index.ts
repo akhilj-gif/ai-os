@@ -6,6 +6,13 @@
 // something the OS does for them. The bridge holds the session; the OS's trust
 // gate holds the policy (send = irreversible + approval).
 // NOTE: UNVERIFIED until first paired — the mock (mock.ts) is the verified twin.
+import dotenv from 'dotenv';
+import { fileURLToPath as fp } from 'node:url';
+// Load the workspace-root .env like the API does — without this the bridge
+// never saw WHATSAPP_BRIDGE_TOKEN, so the token auth hook below silently
+// no-opped (found live 2026-07-17: /chats served 200 with no token set).
+dotenv.config({ path: fp(new URL('../../../.env', import.meta.url)) });
+
 import Fastify from 'fastify';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';

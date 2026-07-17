@@ -56,7 +56,15 @@ console.log('\n— env is scrubbed of secrets —');
 console.log('\n— pack manifest trust posture —');
 {
   const pack = PACKS.computer;
-  check('computer pack registered with both tools', !!pack && pack.tools.length === 2);
+  // M19 added the desktop file tools (fs_list/read/search/write) alongside the
+  // two terminal tools — assert by NAME, not count, so growth is deliberate.
+  const names = new Set((pack?.tools ?? []).map((t) => t.name));
+  check(
+    'computer pack registers terminal + desktop file tools',
+    !!pack && ['terminal_run', 'terminal_exec', 'fs_list', 'fs_read', 'fs_search', 'fs_write'].every((n) => names.has(n)),
+  );
+  const fsWritePolicy = pack!.policies.find((p) => p.tool === 'fs_write');
+  check('fs_write is write + NEVER auto (the desktop write gate)', fsWritePolicy?.trustClass === 'write' && fsWritePolicy.autoApprove === false);
   const run = pack!.policies.find((p) => p.tool === 'terminal_run');
   const exec = pack!.policies.find((p) => p.tool === 'terminal_exec');
   check('terminal_run is read + auto', run?.trustClass === 'read' && run.autoApprove === true);
