@@ -38,8 +38,15 @@ export default function RightPanel() {
     return () => clearInterval(t);
   }, []);
 
+  // Responsive (2026-07-17): only show the 360px Tasks/Chats panel when the
+  // viewport is genuinely wide enough (>=1280px, Tailwind xl). Below that —
+  // including common laptop widths under Windows 125%/150% display scaling —
+  // the fixed sidebar(260)+panel(360)+gaps crushed the center voice-orb hero to
+  // ~130px and it overlapped the panels. Hidden (hidden xl:flex), the hero
+  // takes the full remaining width; everything here is also reachable via the
+  // sidebar nav (Tasks/Chats).
   return (
-    <div className="w-[360px] flex flex-col h-full gap-5 z-10">
+    <div className="w-[360px] hidden xl:flex flex-col h-full gap-5 z-10">
       {/* Tasks Panel */}
       <motion.div
         initial={{ opacity: 0, x: 20 }}
