@@ -262,6 +262,9 @@ importers:
       '@ai-os/memory':
         specifier: workspace:*
         version: link:../memory
+      '@ai-os/model-router':
+        specifier: workspace:*
+        version: link:../model-router
       '@ai-os/shared':
         specifier: workspace:*
         version: link:../shared

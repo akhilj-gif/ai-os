@@ -44,7 +44,7 @@ import {
 } from '@ai-os/kernel';
 import { MemoryService } from '@ai-os/memory';
 import { failoverChain, transcribe, synthesize, callModel } from '@ai-os/model-router';
-import { composeRegistry, packPrompts, loadEnabledPacks, installPack, setPackEnabled, listPacks, PACKS, uberConfigured, uberAuthorizeUrl, exchangeUberCode } from '@ai-os/packs';
+import { composeRegistry, packPrompts, loadEnabledPacks, installPack, setPackEnabled, listPacks, PACKS, uberConfigured, uberAuthorizeUrl, exchangeUberCode, forgePack, installDynamicPack, listStagedPacks } from '@ai-os/packs';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const memory = new MemoryService(pool);
@@ -52,8 +52,55 @@ const memory = new MemoryService(pool);
 // at boot, refreshed on install/toggle). Kernel-core = workspace only.
 let enabledPacks = new Set<string>();
 let lastCoordinatorReport: CoordinatorReport | null = null; // M16: latest tick, for GET /coordinator/status
-const packRegistry = () => composeRegistry(enabledPacks);
-const packPrompt = () => packPrompts(enabledPacks);
+const packRegistry = () => {
+  const r = composeRegistry(enabledPacks);
+  // M20 meta-tools: the OS can forge new packs from chat. pack_forge only
+  // STAGES source (inert, reviewable); pack_install activates and is
+  // irreversible-class + never-auto, so the approval card IS the human gate.
+  r.register({
+    name: 'pack_forge',
+    untrustedOutput: false,
+    description:
+      'Build a NEW capability pack (new tools) for a capability the OS lacks — e.g. "a dictionary API tool". Writes and verifies the pack code, then STAGES it (inactive). Nothing runs until the user installs it via pack_install. Report the staged pack name, its tools, and that it awaits their install approval.',
+    inputSchema: {
+      type: 'object',
+      properties: { request: { type: 'string', description: "What capability to build, in the user's words (include the API to use if they named one)." } },
+      required: ['request'],
+    },
+    async execute(args, ctx) {
+      try {
+        const res = await forgePack(String(args.request ?? ''), { traceId: newTraceId(), taskId: ctx.taskId, staticPackNames: Object.keys(PACKS) });
+        return { staged: res.name, tools: res.toolNames, description: res.description, requires: res.requires, rounds: res.rounds, next: 'Ask the user to review and install with pack_install (their approval card is the activation gate).' };
+      } catch (err) {
+        return { error: err instanceof Error ? err.message.slice(0, 600) : String(err) };
+      }
+    },
+  });
+  r.register({
+    name: 'pack_install',
+    untrustedOutput: false,
+    description:
+      'ACTIVATE a previously staged (forged) pack by name — its tools become live. Requires the user\'s one-click approval; call it directly once they ask, the approval card is the confirmation.',
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'Staged pack name (from pack_forge).' } },
+      required: ['name'],
+    },
+    async execute(args) {
+      try {
+        const res = await installDynamicPack(pool, String(args.name ?? ''), Object.keys(PACKS));
+        enabledPacks = await loadEnabledPacks(pool); // recompose so the new tools are live next call
+        return { installed: res.name, tools: res.tools, note: 'Every tool in this pack requires one-click approval per call until the user relaxes its policy in /settings.' };
+      } catch (err) {
+        return { error: err instanceof Error ? err.message.slice(0, 600) : String(err) };
+      }
+    },
+  });
+  return r;
+};
+const packPrompt = () =>
+  packPrompts(enabledPacks) +
+  '\n[forge] If the user asks for a capability no current tool provides and it could be served by a public web API, offer to BUILD it: call pack_forge with their request. After it stages, tell them the pack name/tools and that installing needs their approval (pack_install).';
 const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', {
   maxRetriesPerRequest: 1,
   lazyConnect: true,
@@ -735,6 +782,35 @@ app.get('/coordinator/status', async () => ({
 app.get('/packs', async () => ({ packs: await listPacks(pool) }));
 
 // ---------------------------------------------------------------------------
+// M20 Pack Forge (ADR-0022): forge → review staged SOURCE → install (human
+// gate). The HTTP install endpoint is itself the approval when driven from the
+// UI; from chat, pack_install queues the normal approval card instead.
+// ---------------------------------------------------------------------------
+app.post('/packs/forge', async (req, reply) => {
+  const { request } = (req.body ?? {}) as { request?: string };
+  if (!request?.trim()) return reply.code(400).send({ error: 'request is required' });
+  try {
+    const res = await forgePack(request.trim(), { traceId: req.traceId, staticPackNames: Object.keys(PACKS) });
+    return { staged: res.name, tools: res.toolNames, description: res.description, requires: res.requires, rounds: res.rounds, review: `GET /packs/staged then POST /packs/staged/${res.name}/install` };
+  } catch (err) {
+    return reply.code(422).send({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/packs/staged', async () => ({ staged: await listStagedPacks(Object.keys(PACKS)) }));
+
+app.post('/packs/staged/:name/install', async (req, reply) => {
+  const { name } = req.params as { name: string };
+  try {
+    const res = await installDynamicPack(pool, name, Object.keys(PACKS));
+    enabledPacks = await loadEnabledPacks(pool);
+    return { installed: res.name, tools: res.tools };
+  } catch (err) {
+    return reply.code(422).send({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // M10 Learning Loop (ADR-0014): the audit trail of self-improvements, and a
 // manual trigger. A cycle proposes playbooks from recent failures and adopts one
 // ONLY if the gym proves no regression. POST /learning/run runs the real gym
@@ -980,6 +1056,14 @@ function resumeTaskById(taskId: string, why: 'boot' | 'coordinator'): Promise<vo
 const port = Number(process.env.API_PORT ?? 4000);
 enabledPacks = await loadEnabledPacks(pool); // before listen: routes + resume + scheduler all compose from it
 app.log.info({ packs: [...enabledPacks] }, 'capability packs enabled');
+// M20 meta-tool policies (idempotent, never overwrites user edits): forging
+// only STAGES inert source (write/auto — and §8.3 blocks it under untrusted
+// context); installing ACTIVATES generated code → irreversible, never auto.
+await pool.query(
+  `INSERT INTO trust_policies (tool, trust_class, auto_approve) VALUES
+     ('pack_forge','write',true), ('pack_install','irreversible',false)
+   ON CONFLICT (tool) DO NOTHING`,
+);
 
 // Perf (2026-07-11): pre-warm each capability bucket's primary provider (DNS +
 // TLS handshake) so the FIRST real request doesn't pay cold-connection cost.

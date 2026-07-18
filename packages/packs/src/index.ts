@@ -48,6 +48,25 @@ import {
 // not directly on @ai-os/tools) can wire the /oauth/uber routes (M14c).
 export { uberConfigured, uberAuthorizeUrl, exchangeUberCode } from '@ai-os/tools';
 
+// M20 — Pack Forge substrate (dynamic.ts): runtime-authored packs. `import
+// type` in dynamic.ts keeps this edge acyclic at runtime.
+import { DYNAMIC, loadDynamicPack } from './dynamic.js';
+export {
+  DYNAMIC,
+  loadDynamicPack,
+  stagePack,
+  installDynamicPack,
+  listStagedPacks,
+  scanPackSource,
+  validateManifest,
+  toCapabilityPack,
+  dynamicPacksDir,
+  type DynamicManifest,
+  type StageResult,
+  type StagedPackInfo,
+} from './dynamic.js';
+export { forgePack, FORGE_GUIDE, type ForgeResult } from './forge.js';
+
 export interface CapabilityPack {
   name: string;
   version: string;
@@ -352,12 +371,19 @@ export const PACKS: Record<string, CapabilityPack> = {
   },
 };
 
+/** Static + dynamic (forged) packs in one view — M20. Dynamic packs must be
+ *  loaded into DYNAMIC first (loadEnabledPacks does this for enabled ones). */
+export function allPacks(): Record<string, CapabilityPack> {
+  return { ...PACKS, ...DYNAMIC };
+}
+
 /** Compose the runtime tool registry: kernel-core tools + every ENABLED pack's tools. */
 export function composeRegistry(enabled: Set<string>): ToolRegistry {
   const registry = new ToolRegistry();
+  const packs = allPacks();
   for (const t of CORE_TOOLS) registry.register(t);
   for (const name of enabled) {
-    const pack = PACKS[name];
+    const pack = packs[name];
     if (!pack) continue; // a DB row for a pack this build doesn't know — ignore
     for (const t of pack.tools) registry.register(t);
   }
@@ -366,7 +392,7 @@ export function composeRegistry(enabled: Set<string>): ToolRegistry {
 
 /** The system-prompt fragment contributed by enabled packs (stable order). */
 export function packPrompts(enabled: Set<string>): string {
-  return Object.values(PACKS)
+  return Object.values(allPacks())
     .filter((p) => enabled.has(p.name) && p.prompt)
     .map((p) => `[${p.name}] ${p.prompt}`)
     .join('\n');
@@ -376,8 +402,20 @@ export async function loadEnabledPacks(pool: pg.Pool): Promise<Set<string>> {
   const { rows } = await pool.query<{ name: string }>(`SELECT name FROM capability_packs WHERE enabled`);
   const enabled = new Set<string>();
   for (const r of rows) {
-    if (PACKS[r.name]) enabled.add(r.name);
-    else console.warn(`[packs] DB lists unknown pack "${r.name}" — ignoring (removed from this build?)`);
+    if (PACKS[r.name]) {
+      enabled.add(r.name);
+      continue;
+    }
+    // M20: an enabled name this build doesn't know statically may be a FORGED
+    // pack staged on disk — load it (re-scanned + floor re-applied every load).
+    // A broken/tampered file disables gracefully; it must never crash boot.
+    try {
+      await loadDynamicPack(r.name, Object.keys(PACKS));
+      enabled.add(r.name);
+      console.log(`[packs] dynamic pack "${r.name}" loaded from packs-dynamic/`);
+    } catch (err) {
+      console.warn(`[packs] enabled pack "${r.name}" failed to load — skipping: ${err instanceof Error ? err.message.slice(0, 200) : err}`);
+    }
   }
   return enabled;
 }
@@ -466,7 +504,7 @@ export async function listPacks(pool: pg.Pool): Promise<PackStatus[]> {
     `SELECT name, version, enabled FROM capability_packs`,
   );
   const state = new Map(rows.map((r) => [r.name, r]));
-  return Object.values(PACKS).map((p) => ({
+  return Object.values(allPacks()).map((p) => ({
     name: p.name,
     version: p.version,
     description: p.description,

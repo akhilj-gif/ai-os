@@ -9,3 +9,4 @@ apps/whatsapp-bridge/.auth/
 apps/whatsapp-bridge/store.json
 logs/
 apps/browser-bridge/.userdata/
+packs-dynamic/
