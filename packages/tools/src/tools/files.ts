@@ -21,8 +21,9 @@
 // break the core demo flow (read a file → analyze it in the code sandbox)
 // while adding no protection those gates don't already give.
 import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, readdirSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
-import { resolve, relative, isAbsolute, join, dirname, basename } from 'node:path';
+import { resolve, relative, isAbsolute, join, dirname, basename, extname } from 'node:path';
 import type { ToolDef } from '../registry.js';
 
 const READ_MAX_CHARS = 48_000; // head+tail cap on returned file text
@@ -184,6 +185,51 @@ export const fsSearch: ToolDef = {
       };
       walk(start, 0);
       return { searched: start, matches, exhausted: visited >= SEARCH_MAX_VISITED, visited };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+  },
+};
+
+// Extensions fs_open may hand to the OS default handler. The default handler
+// for anything executable/script-like would RUN it — so this is an allowlist
+// of viewer-safe formats, not a blocklist. Everything else → terminal_exec
+// (approval-gated) if the user really wants it launched.
+const OPEN_SAFE_EXT = new Set([
+  '.html', '.htm', '.txt', '.md', '.log', '.csv', '.json', '.xml', '.pdf',
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp',
+  '.mp3', '.wav', '.mp4', '.webm',
+]);
+
+export const fsOpen: ToolDef = {
+  name: 'fs_open',
+  untrustedOutput: false,
+  description:
+    "Open a file or folder on the user's real computer in their default app (browser for .html, image viewer, Explorer for folders) — use this to SHOW the user something you created or found, right after telling them the path. Viewer-safe formats only (documents/images/media); it refuses executables/scripts. No approval needed.",
+  inputSchema: {
+    type: 'object',
+    properties: { path: { type: 'string', description: 'File or folder to open, relative to the allowed root or absolute within it.' } },
+    required: ['path'],
+  },
+  async execute(args) {
+    try {
+      const target = confinePath(args.path);
+      if (!existsSync(target)) return { error: `not found: ${target}` };
+      const isDir = statSync(target).isDirectory();
+      const ext = extname(target).toLowerCase();
+      if (!isDir && !OPEN_SAFE_EXT.has(ext)) {
+        return { error: `refusing to open "${ext || '(no extension)'}" — fs_open only opens viewer-safe files (docs/images/media). Use terminal_exec (needs approval) to launch anything else.` };
+      }
+      // explorer.exe handles both cases on Windows with no shell-quoting issues
+      // (start's quoted-title quirk mangled args in the 2026-07-12 audit).
+      const [cmd, cmdArgs] =
+        process.platform === 'win32'
+          ? ['explorer.exe', [target]]
+          : process.platform === 'darwin'
+            ? ['open', [target]]
+            : ['xdg-open', [target]];
+      spawn(cmd, cmdArgs, { detached: true, stdio: 'ignore' }).unref();
+      return { opened: target, kind: isDir ? 'folder' : 'file' };
     } catch (err) {
       return { error: err instanceof Error ? err.message : String(err) };
     }

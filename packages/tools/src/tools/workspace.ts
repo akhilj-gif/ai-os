@@ -28,7 +28,8 @@ function safePath(ctx: ToolContext, p: string): string {
 
 export const workspaceList: ToolDef = {
   name: 'workspace_list',
-  description: "List files in this task's private workspace directory.",
+  description:
+    "List files in this task's INTERNAL scratch workspace — a private area the user cannot see. This is NOT the user's real computer; for the user's actual folders use fs_list (computer pack).",
   inputSchema: { type: 'object', properties: {} },
   async execute(_args, ctx) {
     const base = workspaceDir(ctx);
@@ -46,7 +47,8 @@ export const workspaceList: ToolDef = {
 
 export const workspaceRead: ToolDef = {
   name: 'workspace_read',
-  description: "Read a text file from this task's workspace.",
+  description:
+    "Read a text file from this task's INTERNAL scratch workspace (not the user's real files — use fs_read for those).",
   inputSchema: {
     type: 'object',
     properties: { path: { type: 'string', description: 'Relative path inside the workspace' } },
@@ -61,7 +63,8 @@ export const workspaceRead: ToolDef = {
 
 export const workspaceWrite: ToolDef = {
   name: 'workspace_write',
-  description: "Write a text file into this task's workspace (creates parent dirs).",
+  description:
+    "Write a scratch file into this task's INTERNAL workspace — the user CANNOT see files written here (2026-07-11 incident: a user-requested HTML file 'created' here was never found). When the user asks you to create/save a file FOR THEM, use fs_write instead (their real computer, e.g. Downloads/...) and tell them the absolute path. Use this only for intermediate work products no one asked to keep.",
   inputSchema: {
     type: 'object',
     properties: {

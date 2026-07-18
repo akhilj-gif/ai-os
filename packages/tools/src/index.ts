@@ -10,7 +10,7 @@ import { codeExec } from './tools/code-exec.js';
 import { whatsappListChats, whatsappReadMessages, whatsappSearchContacts, whatsappSendMessage } from './tools/whatsapp.js';
 import { xGetMe, xDraftPost, xPublishPost } from './tools/x.js';
 import { terminalRun, terminalExec } from './tools/terminal.js';
-import { fsList, fsRead, fsSearch, fsWrite } from './tools/files.js';
+import { fsList, fsRead, fsSearch, fsWrite, fsOpen } from './tools/files.js';
 import { mobilityEstimate, mobilityBook } from './tools/mobility.js';
 import { browserNavigate, browserRead, browserFind, browserExtract, browserAct } from './tools/browser.js';
 
@@ -32,7 +32,7 @@ export { codeExec } from './tools/code-exec.js';
 export { whatsappListChats, whatsappReadMessages, whatsappSearchContacts, whatsappSendMessage } from './tools/whatsapp.js';
 export { xGetMe, xDraftPost, xPublishPost, xMockOutbox, X_MAX_CHARS } from './tools/x.js';
 export { terminalRun, terminalExec, checkReadCommand, scrubbedEnv } from './tools/terminal.js';
-export { fsList, fsRead, fsSearch, fsWrite, confinePath } from './tools/files.js';
+export { fsList, fsRead, fsSearch, fsWrite, fsOpen, confinePath } from './tools/files.js';
 export { mobilityEstimate, mobilityBook, mobilityMockOutbox, type RideOption, type Provider } from './tools/mobility.js';
 export { decideRide, DEFAULT_PREFS, type MobilityPrefs, type RideContext, type RideDecision } from './tools/mobility-decide.js';
 export { uberConfigured, uberAuthorizeUrl, exchangeUberCode, uberVehicleClass, encodeUberOption, decodeUberOption, isUberOption, mapUberEstimates, UberNotConnectedError, type UberPriceItem, type UberTimeItem, type Coords } from './tools/uber.js';
@@ -65,6 +65,7 @@ export function buildRegistry(): ToolRegistry {
     fsRead,
     fsSearch,
     fsWrite,
+    fsOpen,
     mobilityEstimate,
     mobilityBook,
     browserNavigate,

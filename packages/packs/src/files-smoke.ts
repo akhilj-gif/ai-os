@@ -5,7 +5,7 @@
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fsList, fsRead, fsSearch, fsWrite, confinePath } from '@ai-os/tools';
+import { fsList, fsRead, fsSearch, fsWrite, fsOpen, confinePath } from '@ai-os/tools';
 
 let fail = 0;
 const check = (name: string, ok: boolean, extra = '') => {
@@ -80,6 +80,18 @@ try {
   check('search by content is case-insensitive', contentMatches.some((m) => m.path.endsWith('other.md')));
   const noQ = (await fsSearch.execute({ path: '.' }, ctx)) as R;
   check('search without any query → clear error', /nameContains/.test(String(noQ.error)));
+
+  console.log('— fs_open refusal paths (never launches anything in this smoke) —');
+  writeFileSync(join(root, 'demo', 'danger.exe'), 'MZ-not-really');
+  const exe = (await fsOpen.execute({ path: 'demo/danger.exe' }, ctx)) as R;
+  check('fs_open refuses executables (allowlist, not blocklist)', /viewer-safe/.test(String(exe.error)), String(exe.error));
+  writeFileSync(join(root, 'demo', 'script.ps1'), 'Write-Host hi');
+  const ps1 = (await fsOpen.execute({ path: 'demo/script.ps1' }, ctx)) as R;
+  check('fs_open refuses scripts', /viewer-safe/.test(String(ps1.error)));
+  const escOpen = (await fsOpen.execute({ path: '..\\..\\Windows\\notepad.exe' }, ctx)) as R;
+  check('fs_open escape rejected', /escapes the allowed root/.test(String(escOpen.error)));
+  const missingOpen = (await fsOpen.execute({ path: 'demo/ghost.html' }, ctx)) as R;
+  check('fs_open missing file → clear error', /not found/.test(String(missingOpen.error)));
 } finally {
   process.env.AIOS_TERMINAL_ROOT = savedRoot;
   rmSync(root, { recursive: true, force: true });

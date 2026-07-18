@@ -261,6 +261,26 @@ export async function runTask(
 
     if (!resp.toolCalls.length) {
       const text = resp.message.content ?? '';
+      // Fabricated-action guard (dogfooded 2026-07-18): with prior "…queued for
+      // your approval" exchanges replayed as conversation history, the model
+      // IMITATED that reply for a NEW request without calling any tool — the
+      // task ended 'done' claiming an approval that never existed, and the
+      // user's file was never created. The executor KNOWS whether an approval
+      // was queued this run, so a queued-claim with queuedApproval=false is a
+      // detectable lie: push back and force a corrective iteration instead of
+      // returning it to the user.
+      // Matches any "…queued/awaiting/pending/waiting … approval" phrasing —
+      // the first regex only caught "queued for/awaits approval" and the model
+      // dodged it live with "awaiting your approval" (2026-07-18).
+      if (!queuedApproval && iter < MAX_ITERATIONS - 1 && /(?:queued|await\w*|pending|waiting)[^.\n]{0,60}approval/i.test(text)) {
+        await trace.record({ traceId, taskId, component: 'executor', event: 'executor.fabricated_queue_claim', payload: { iteration: iter, text: text.slice(0, 200) } });
+        messages.push({
+          role: 'user',
+          content:
+            '[system-check] Your reply claims an action was queued for approval, but NO action was queued in this task — you have not called any tool this turn. Conversation history describes PAST tasks, not this one. If the user asked you to do something, call the appropriate tool NOW with the final arguments; if not, rewrite your reply without claiming any action.',
+        });
+        continue;
+      }
       // If an irreversible action was queued this run, the task isn't "done" — it's
       // waiting on the user's approval. Reflect that honestly in the status.
       const finalStatus = queuedApproval ? 'awaiting_approval' : 'done';
