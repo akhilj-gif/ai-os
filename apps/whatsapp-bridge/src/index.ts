@@ -338,9 +338,19 @@ app.get('/messages', async (req, reply) => {
   return { messages: list.slice(-Math.min(Number(limit) || 25, MAX_PER_CHAT)) };
 });
 app.post('/send', async (req, reply) => {
-  const { chatId, text } = (req.body ?? {}) as { chatId?: string; text?: string };
+  let { chatId } = (req.body ?? {}) as { chatId?: string; text?: string };
+  const { text } = (req.body ?? {}) as { chatId?: string; text?: string };
   if (!chatId || !text?.trim()) return reply.code(400).send({ error: 'chatId and text are required' });
   if (!paired) return reply.code(503).send({ error: 'bridge not paired' });
+  // Defense (2026-07-20): a bare number is normalized; anything that still
+  // isn't a jid gets a 400 with a usable message — previously it went straight
+  // into Baileys, which crashed the handler with "Cannot destructure property
+  // 'user' of 'jidDecode(...)'" and surfaced as an opaque 500.
+  chatId = chatId.trim();
+  if (/^\d{6,20}$/.test(chatId)) chatId = `${chatId}@s.whatsapp.net`;
+  if (!/^[\w.:-]+@(s\.whatsapp\.net|lid|g\.us)$/.test(chatId)) {
+    return reply.code(400).send({ error: `invalid chatId "${chatId}" — expected a jid like 9194...@s.whatsapp.net (use /chats or /contacts to resolve names)` });
+  }
   const sent = await sock.sendMessage(chatId, { text: text.trim() });
   return { ok: true, messageId: sent?.key?.id ?? 'unknown' };
 });

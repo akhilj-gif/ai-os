@@ -700,7 +700,18 @@ async function decidePendingAction(
   const success = !(result && typeof result === 'object' && 'error' in (result as object));
   await pool.query(`UPDATE pending_actions SET status=$2, result=$3, decided_at=now() WHERE id=$1`, [id, success ? 'executed' : 'failed', JSON.stringify(result)]);
   await pool.query(`UPDATE tasks SET status='done', updated_at=now() WHERE id=$1`, [pa.task_id]);
-  const line = success ? `✅ Done — ${pa.tool} executed.` : `⚠ ${pa.tool} failed: ${JSON.stringify(result).slice(0, 200)}`;
+  // Surface the INNERMOST error message, not nested JSON (dogfooded 2026-07-20:
+  // the chat showed `⚠ whatsapp_send_message failed: {"error":"whatsapp bridge
+  // 500: {\"statusCode\":500,...}"}` — unreadable to a human deciding what to
+  // do next). Bridge errors embed JSON-in-JSON; unwrap layers when possible.
+  let failText = '';
+  if (!success) {
+    let msg = String((result as { error?: unknown })?.error ?? 'unknown error');
+    const nested = msg.match(/"message"\s*:\s*"([^"]{3,200})"/); // inner HTTP body, if any
+    if (nested) msg = nested[1]!;
+    failText = msg.slice(0, 220);
+  }
+  const line = success ? `✅ Done — ${pa.tool} executed.` : `⚠ ${pa.tool} failed: ${failText}`;
   await say(line);
   trace.recordSafe({ traceId, taskId: pa.task_id, component: 'trust', event: success ? 'pending.executed' : 'pending.failed', payload: { tool: pa.tool } });
   return { ok: success, executed: success, line, result };

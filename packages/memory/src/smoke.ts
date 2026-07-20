@@ -39,6 +39,13 @@ await mem.remember({
 const r1 = await mem.recall({ query: 'how should I format my answer to them?', limit: 5 });
 check('recall finds reply-style by meaning', r1.some((r) => r.subject === 'smoke-reply-style'), r1.map((r) => `${r.subject}:${r.score.toFixed(3)}`).join(', '));
 
+// 3b. keyword-only path (queries under 3 words skip the embedding — the fast
+// path shipped 2026-07-16). Regression lock: this branch once left an
+// unreferenced $1 in params and threw "could not determine data type of
+// parameter $1", killing the whole memory block for every short message.
+const r1b = await mem.recall({ query: 'bullets', limit: 5 });
+check('short-query recall (keyword path) does not throw and can match by keyword', Array.isArray(r1b));
+
 // 4. preferences always-loaded
 const prefs = await mem.getPreferences();
 check('getPreferences returns the preference', prefs.some((p) => p.subject === 'smoke-reply-style'));

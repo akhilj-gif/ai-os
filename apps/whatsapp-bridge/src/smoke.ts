@@ -26,7 +26,13 @@ const bridge = await startMockBridge(0);
 process.env.WHATSAPP_BRIDGE_URL = bridge.url;
 
 const chats = (await whatsappListChats.execute({}, ctx)) as { chats: Array<{ id: string; name: string; unread: number }> };
-check('list_chats returns the fixture chats', chats.chats.length === 3, `${chats.chats.length} chats`);
+// Name-based, not a count: M12 added the self-chat fixture ("You (self)") for
+// remote-control tests and the old `=== 3` failed silently ever since.
+check(
+  'list_chats returns the fixture chats',
+  ['Mom', 'Flatmates 3B', 'You (self)'].every((n) => chats.chats.some((c) => c.name === n)),
+  chats.chats.map((c) => c.name).join(', '),
+);
 check('unread counts present', chats.chats.every((c) => typeof c.unread === 'number'));
 
 const mom = (await whatsappReadMessages.execute({ chatId: 'mom@s.whatsapp.net' }, ctx)) as { messages: Array<{ text: string; fromMe: boolean }> };

@@ -95,15 +95,27 @@ export const whatsappSendMessage: ToolDef = {
   inputSchema: {
     type: 'object',
     properties: {
-      chatId: { type: 'string', description: 'Destination chat id (JID) from whatsapp_list_chats' },
+      chatId: {
+        type: 'string',
+        description:
+          'Destination chat id — the FULL jid exactly as returned by whatsapp_search_contacts/whatsapp_list_chats (e.g. "9194...@s.whatsapp.net"), never just the bare number.',
+      },
       text: { type: 'string', description: 'Exact message text to send' },
     },
     required: ['chatId', 'text'],
   },
   async execute(args) {
-    const chatId = String(args.chatId ?? '').trim();
+    let chatId = String(args.chatId ?? '').trim();
     const text = String(args.text ?? '').trim();
     if (!chatId || !text) throw new Error('chatId and text are required');
+    // Dogfooded 2026-07-20: the model stripped "@s.whatsapp.net" off a jid it
+    // had JUST received from whatsapp_search_contacts, and the bridge 500'd
+    // inside Baileys (jidDecode(...) undefined). A bare number is unambiguous
+    // — normalize it instead of failing the user's approved send.
+    if (/^\d{6,20}$/.test(chatId)) chatId = `${chatId}@s.whatsapp.net`;
+    if (!/^[\w.:-]+@(s\.whatsapp\.net|lid|g\.us)$/.test(chatId)) {
+      return { error: `"${chatId}" is not a valid WhatsApp jid — pass the full jid from whatsapp_search_contacts (e.g. 9194...@s.whatsapp.net)` };
+    }
     return bridge('/send', { method: 'POST', body: JSON.stringify({ chatId, text }) });
   },
 };

@@ -110,5 +110,5 @@ export async function startMockBridge(port = 0): Promise<MockBridge> {
 // CLI: run standalone on the default port.
 if (import.meta.url === `file:///${process.argv[1]?.replace(/\\/g, '/')}`) {
   const b = await startMockBridge(DEFAULT_BRIDGE_PORT);
-  console.log(`[whatsapp-bridge:mock] listening on ${b.url} — 3 chats, sends go to the in-memory outbox`);
+  console.log(`[whatsapp-bridge:mock] listening on ${b.url} — ${CHATS.length} chats, sends go to the in-memory outbox`);
 }

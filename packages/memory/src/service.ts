@@ -117,11 +117,16 @@ export class MemoryService {
       }
     }
 
+    // NB the keyword-only branch must not leave an unreferenced $1 in params:
+    // Postgres cannot infer the type of a parameter no SQL expression touches
+    // ("could not determine data type of parameter $1") — hit live 2026-07-16
+    // when the short-query fast path made queryVec=null the COMMON case, and
+    // the throw took the WHOLE memory block (preferences included) with it.
     const relExpr = queryVec
       ? `GREATEST(1 - (embedding <=> $1::vector), COALESCE(ts_rank(content_tsv, plainto_tsquery('english', $2)) * 4, 0))`
-      : `COALESCE(ts_rank(content_tsv, plainto_tsquery('english', $2)) * 4, 0)`;
+      : `COALESCE(ts_rank(content_tsv, plainto_tsquery('english', $1)) * 4, 0)`;
 
-    const params: unknown[] = queryVec ? [vecLiteral(queryVec), opts.query] : [null, opts.query];
+    const params: unknown[] = queryVec ? [vecLiteral(queryVec), opts.query] : [opts.query];
     let p = params.length;
     const typeClause = opts.types?.length ? `AND type = ANY($${++p}::memory_type[])` : '';
     if (opts.types?.length) params.push(opts.types);
