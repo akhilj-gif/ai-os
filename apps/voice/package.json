@@ -10,13 +10,11 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "clsx": "^2.1.1",
     "framer-motion": "^12.42.2",
     "lucide-react": "^0.546.0",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
-    "react-router-dom": "^7.18.1",
-    "tailwind-merge": "^3.6.0"
+    "react-router-dom": "^7.18.1"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.14",

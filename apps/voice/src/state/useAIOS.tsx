@@ -3,7 +3,7 @@
 // send (typed or voice), the voice state machine (record → Whisper transcribe
 // → chat → spoken reply), and approval decisions. Components stay presentational.
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { api, type Msg, type PendingAction, type SessionSummary } from '../api/client';
+import { api, type Attachment, type Msg, type PendingAction, type SessionSummary } from '../api/client';
 import { isSpeech, rmsFromByteTimeDomain, vadDecision } from '../lib/vad';
 
 export type VoiceState = 'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking';
@@ -23,7 +23,7 @@ interface AIOS {
    *  re-arms automatically after the spoken reply. */
   conversation: boolean;
   setConversation: (v: boolean) => void;
-  send: (text: string) => Promise<void>;
+  send: (text: string, attachments?: Attachment[]) => Promise<void>;
   toggleVoice: () => Promise<void>;
   decide: (id: string, decision: 'approved' | 'rejected') => Promise<void>;
   newChat: () => Promise<string | null>;
@@ -101,20 +101,32 @@ export function AIOSProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  // First-load session resolution: saved → most recent → create.
+  // First-load session resolution: saved → most recent → create. Self-healing:
+  // if the kernel is unreachable (e.g. still starting after a sleep/restart),
+  // retry every 4s instead of leaving the UI permanently dead until a reload.
   useEffect(() => {
-    void (async () => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const resolve = async () => {
       try {
         const list = await refreshSessions();
+        if (cancelled) return;
         const saved = localStorage.getItem(LAST_SESSION_KEY);
         if (saved && list.some((s) => s.id === saved)) setSessionId(saved);
         else if (list.length) setSessionId(list[0]!.id);
         else setSessionId((await api.createSession()).id);
         setOnline(true);
       } catch {
+        if (cancelled) return;
         setOnline(false);
+        timer = setTimeout(() => void resolve(), 4000);
       }
-    })();
+    };
+    void resolve();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [refreshSessions]);
 
   useEffect(() => {
@@ -256,21 +268,39 @@ export function AIOSProvider({ children }: { children: ReactNode }) {
   }, [sessionId]);
 
   const send = useCallback(
-    async (text: string) => {
+    async (text: string, attachments?: Attachment[]) => {
       const trimmed = text.trim();
-      if (!trimmed || !sessionId || busy) return;
+      if ((!trimmed && !attachments?.length) || busy) return;
+      // Resolve a session on demand — NEVER silently drop a message just because
+      // first-load resolution hadn't finished or failed while the kernel was down.
+      let sid = sessionId;
+      if (!sid) {
+        try {
+          sid = (await api.createSession()).id;
+          setSessionId(sid);
+          void refreshSessions();
+        } catch {
+          setVoiceErr("Can't reach the OS — is the kernel online? Retrying automatically…");
+          return;
+        }
+      }
       setBusy(true);
       setVoice('thinking');
-      setMessages((m) => [...m, { id: `tmp-${Date.now()}`, role: 'user', content: trimmed, created_at: new Date().toISOString() }]);
+      setVoiceErr(null);
+      const label = trimmed || `📎 ${attachments!.map((a) => a.name).join(', ')}`;
+      setMessages((m) => [...m, { id: `tmp-${Date.now()}`, role: 'user', content: label, created_at: new Date().toISOString() }]);
+      let failed = false;
       try {
-        await api.chat(trimmed, sessionId);
+        await api.chat(trimmed, sid, attachments);
       } catch {
-        /* poller will surface whatever the kernel reached */
+        failed = true;
+        setVoiceErr("The OS didn't respond — it may be starting up. Give it a moment and try again.");
       }
       await refresh();
       void refreshSessions();
       setBusy(false);
       setVoice((v) => (v === 'thinking' ? 'idle' : v));
+      if (failed) setMessages((m) => m.filter((x) => !x.id.startsWith('tmp-'))); // drop the optimistic bubble on failure
     },
     [sessionId, busy, refresh, refreshSessions],
   );

@@ -147,6 +147,12 @@ export interface RunTaskOptions {
    *  doesn't redo the embedding + recall round-trip. undefined = compute it
    *  normally; '' counts as "computed, nothing relevant" — not "uncomputed". */
   precomputedMemory?: string;
+  /** Tier2 autopilot (graduated trust): when true the run is READ-ONLY — the
+   *  executor auto-runs read-class tools but REFUSES any write/irreversible/
+   *  spend call outright (it is NOT queued for approval), so an unattended,
+   *  self-initiated run can inspect and report but never mutate, send, or spend.
+   *  The model is told to report what it WOULD do instead. */
+  readOnly?: boolean;
 }
 
 /** Run (or resume) a task to completion. Idempotent on restart. */
@@ -325,12 +331,23 @@ export async function runTask(
       let approvedBy: 'policy' | null = null;
       let blocked = false;
       let queued = false;
+      let refused = false;
 
       if (allowed && !allowed.has(tc.name)) {
         // M11 agent scoping: a specialist can only touch ITS toolkit. Checked
         // before the approval-queue branch so an out-of-scope irreversible call
         // can't even reach the user as a queued card.
         result = { error: `tool ${tc.name} is not available to this agent (allowed: ${[...allowed].join(', ')})` };
+      } else if (opts.readOnly && decision.trustClass !== 'read') {
+        // Tier2 autopilot (read-only): a self-initiated, unattended run may READ
+        // but never mutate/send/spend. Refuse outright — do NOT queue an approval
+        // (unattended, no one is watching to approve). The model reports what it
+        // WOULD do so the user can run it themselves with one tap.
+        refused = true;
+        result = {
+          refused: true,
+          reason: `Autopilot is read-only: a "${decision.trustClass}" action can't run unattended. State exactly what you would do (tool + arguments) so the user can run it deliberately.`,
+        };
       } else if (!decision.autoApprove) {
         // Approval-required (irreversible/spend, e.g. whatsapp_send_message): chat
         // can't run it and can't collect approval mid-loop → QUEUE the exact call
@@ -387,9 +404,9 @@ export async function runTask(
       await trace.record({
         traceId,
         taskId,
-        component: blocked ? 'trust' : queued ? 'trust' : 'executor',
-        event: blocked ? 'tool.blocked_untrusted' : queued ? 'tool.queued_for_approval' : 'tool.executed',
-        payload: { tool: tc.name, trustClass: decision.trustClass, durationMs, blocked, queued },
+        component: blocked || queued || refused ? 'trust' : 'executor',
+        event: refused ? 'tool.refused_readonly' : blocked ? 'tool.blocked_untrusted' : queued ? 'tool.queued_for_approval' : 'tool.executed',
+        payload: { tool: tc.name, trustClass: decision.trustClass, durationMs, blocked, queued, refused },
       });
       // Provenance tagging (§8.3 rule 1): label untrusted output in-band so the
       // model treats it as data, never instructions.

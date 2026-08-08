@@ -2,6 +2,8 @@
 // Owns WHICH model runs and telemetry around the call — never prompt content.
 import Anthropic from '@anthropic-ai/sdk';
 import { Langfuse } from 'langfuse';
+import { readFile } from 'node:fs/promises';
+import { basename, extname } from 'node:path';
 
 /** Step classes from the routing table (blueprint §5):
  *  routing/classification → cheap tier · execution → mid tier · planning/hard reasoning → top tier */
@@ -120,9 +122,9 @@ const CAPABILITY_CHAINS: Record<Capability, readonly string[]> = {
   fast: ['groq', 'gemini', 'nvidia'],
 };
 
-const WORKSPACE_TOOL_RE = /^(gmail_|calendar_|workspace_|web_search|fetch_url)/;
+const WORKSPACE_TOOL_RE = /^(gmail_|calendar_|workspace_|web_search|fetch_url|screen_capture)/;
 const CODING_TOOL_RE = /^code_exec/;
-const WORKSPACE_TEXT_RE = /\b(gmail|e-?mail|calendar|drive|google workspace|workspace|vision|image|photo|screenshot|web ?search|search the web)\b/i;
+const WORKSPACE_TEXT_RE = /\b(gmail|e-?mail|calendar|drive|google workspace|workspace|vision|image|photo|screenshot|screen|web ?search|search the web)\b/i;
 const CODING_TEXT_RE = /\b(code|coding|debug|refactor|function|algorithm|typescript|javascript|python|programming|\bbug\b)\b/i;
 
 /** Classify a call into a capability bucket (ADR-0019) from signals already on
@@ -288,10 +290,12 @@ export async function transcribe(audio: Buffer, mime: string): Promise<string> {
       fd.append('model', STT_MODEL);
       // Short accented clips make Whisper's language auto-detect misfire badly
       // (real dogfooding result: English commands transcribed as Tamil and
-      // Icelandic gibberish). Commands are English — pin it, zero temperature,
-      // and bias with a domain prompt. AIOS_STT_LANGUAGE overrides if Akhil
-      // ever wants Telugu/Hindi commands.
-      fd.append('language', process.env.AIOS_STT_LANGUAGE ?? 'en');
+      // Icelandic gibberish). Commands default to English — pinned, zero temp,
+      // domain-biased. AIOS_STT_LANGUAGE overrides: set a code ('hi', 'te') to
+      // pin another language, or 'auto' to let Whisper detect (best for mixed
+      // Hinglish/Telugu speakers — omits the language param entirely).
+      const sttLang = process.env.AIOS_STT_LANGUAGE ?? 'en';
+      if (sttLang !== 'auto') fd.append('language', sttLang);
       fd.append('temperature', '0');
       fd.append('prompt', 'Short spoken command to a personal AI assistant about calendar, email, WhatsApp, meetings, reminders, or web search.');
       return { method: 'POST', headers: { authorization: `Bearer ${apiKey}` }, body: fd };
@@ -335,6 +339,142 @@ export async function synthesize(text: string): Promise<{ audio: Buffer; mime: s
   );
   if (!res.ok) throwHttp({ name: 'groq' } as Provider, res.status, await res.text());
   return { audio: Buffer.from(await res.arrayBuffer()), mime: 'audio/wav' };
+}
+
+// ---------------------------------------------------------------------------
+// Vision (chat image attachments): Gemini's OpenAI-compatible endpoint takes
+// multimodal content directly. Ignores MODEL_PROVIDER/failover like embed()/
+// transcribe() — it's the only provider in this router that serves vision.
+// ---------------------------------------------------------------------------
+const VISION_MODEL = 'gemini-2.5-flash';
+
+export async function describeImages(images: Array<{ mime: string; dataUrl: string }>, instruction: string): Promise<string> {
+  const keys = [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_FALLBACK].filter((k): k is string => !!k);
+  if (!keys.length) throw new Error('image understanding requires GEMINI_API_KEY');
+  const content = [
+    { type: 'text', text: instruction },
+    ...images.map((img) => ({ type: 'image_url', image_url: { url: img.dataUrl } })),
+  ];
+  const res = await fetchWithRateLimitRetry(
+    'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+    keys,
+    (apiKey) => ({
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+      // 2048 tokens: full OCR of a dense screenshot/document can be long.
+      body: JSON.stringify({ model: VISION_MODEL, max_tokens: 2048, messages: [{ role: 'user', content }] }),
+    }),
+    `gemini/${VISION_MODEL}`,
+  );
+  if (!res.ok) throwHttp({ name: 'gemini' } as Provider, res.status, await res.text());
+  const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  return (data.choices?.[0]?.message?.content ?? '').trim();
+}
+
+// ---------------------------------------------------------------------------
+// Video understanding (long-form video analysis). Gemini natively understands
+// video — audio track + sampled frames TOGETHER — so no separate transcription
+// or frame-extraction model is needed. Uses the NATIVE File API + generateContent
+// (not the OpenAI-compat shape the rest of this router speaks): upload the file,
+// wait for server-side processing, then ask. Gemini-only, ignores MODEL_PROVIDER/
+// failover like embed()/transcribe()/describeImages(). Handles ONE video file;
+// the `video` tool splits long videos into chunks, calls this per chunk, and
+// reduces the parts. Auth via the x-goog-api-key HEADER (never the key in a URL).
+// ---------------------------------------------------------------------------
+const VIDEO_MODEL = process.env.MODEL_VIDEO ?? 'gemini-2.5-flash';
+const GEMINI_NATIVE = 'https://generativelanguage.googleapis.com/v1beta';
+const GEMINI_UPLOAD = 'https://generativelanguage.googleapis.com/upload/v1beta/files';
+const VIDEO_MIME: Record<string, string> = {
+  '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.mkv': 'video/x-matroska',
+  '.avi': 'video/x-msvideo', '.mpeg': 'video/mpeg', '.mpg': 'video/mpeg', '.wmv': 'video/x-ms-wmv',
+  '.flv': 'video/x-flv', '.3gp': 'video/3gpp', '.m4v': 'video/mp4',
+};
+
+export function videoMimeFor(path: string): string {
+  return VIDEO_MIME[extname(path).toLowerCase()] ?? 'video/mp4';
+}
+
+/** Understand ONE video file with Gemini's native multimodal model. Uploads the
+ *  file, polls until it's ACTIVE (server-side video processing), runs
+ *  generateContent with the file + instruction, deletes the upload, returns the
+ *  model's text. Throws INFRA_* on rate limits so callers can back off. */
+export async function describeVideo(
+  videoPath: string,
+  instruction: string,
+  opts: { maxOutputTokens?: number; pollTimeoutMs?: number } = {},
+): Promise<string> {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) throw new Error('video understanding requires GEMINI_API_KEY');
+  const bytes = await readFile(videoPath);
+  const mime = videoMimeFor(videoPath);
+
+  // 1. Start a resumable upload — returns the one-time upload URL in a header.
+  const start = await fetch(GEMINI_UPLOAD, {
+    method: 'POST',
+    headers: {
+      'x-goog-api-key': key,
+      'X-Goog-Upload-Protocol': 'resumable',
+      'X-Goog-Upload-Command': 'start',
+      'X-Goog-Upload-Header-Content-Length': String(bytes.length),
+      'X-Goog-Upload-Header-Content-Type': mime,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ file: { display_name: basename(videoPath) } }),
+  });
+  if (!start.ok) throwHttp({ name: 'gemini' } as Provider, start.status, await start.text());
+  const uploadUrl = start.headers.get('x-goog-upload-url');
+  if (!uploadUrl) throw new Error('gemini video upload: no upload URL in start response');
+
+  // 2. Upload the bytes and finalize in one shot.
+  const up = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      'x-goog-api-key': key,
+      'X-Goog-Upload-Command': 'upload, finalize',
+      'X-Goog-Upload-Offset': '0',
+      'content-type': mime,
+    },
+    body: bytes,
+  });
+  if (!up.ok) throwHttp({ name: 'gemini' } as Provider, up.status, await up.text());
+  let file = ((await up.json()) as { file?: { name?: string; uri?: string; state?: string; mimeType?: string } }).file;
+  if (!file?.uri || !file?.name) throw new Error('gemini video upload: malformed response (no file uri)');
+
+  // 3. Poll until the server finishes processing the video (state ACTIVE).
+  const deadline = Date.now() + (opts.pollTimeoutMs ?? 240_000);
+  while (file.state && file.state !== 'ACTIVE') {
+    if (file.state === 'FAILED') throw new Error('gemini video processing FAILED');
+    if (Date.now() > deadline) throw new Error('gemini video processing timed out');
+    await new Promise((r) => setTimeout(r, 3000));
+    const poll = await fetch(`${GEMINI_NATIVE}/${file.name}`, { headers: { 'x-goog-api-key': key } });
+    if (!poll.ok) throwHttp({ name: 'gemini' } as Provider, poll.status, await poll.text());
+    file = (await poll.json()) as typeof file;
+  }
+
+  // 4. Ask the model about the video (rate-limit resilient, key-rotating).
+  const activeFile = file;
+  try {
+    const gen = await fetchWithRateLimitRetry(
+      `${GEMINI_NATIVE}/models/${VIDEO_MODEL}:generateContent`,
+      [key, process.env.GEMINI_API_KEY_FALLBACK].filter((k): k is string => !!k),
+      (apiKey) => ({
+        method: 'POST',
+        headers: { 'x-goog-api-key': apiKey, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ file_data: { mime_type: activeFile.mimeType ?? mime, file_uri: activeFile.uri } }, { text: instruction }] }],
+          generationConfig: { maxOutputTokens: opts.maxOutputTokens ?? 8192, temperature: 0.2 },
+        }),
+      }),
+      `gemini/${VIDEO_MODEL}:video`,
+    );
+    if (!gen.ok) throwHttp({ name: 'gemini' } as Provider, gen.status, await gen.text());
+    const data = (await gen.json()) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+    return (data.candidates?.[0]?.content?.parts ?? []).map((p) => p.text ?? '').join('').trim();
+  } finally {
+    // Best-effort cleanup — free-tier File API has a storage cap; files also
+    // auto-expire after 48h, so a leaked file is bounded either way.
+    fetch(`${GEMINI_NATIVE}/${activeFile.name}`, { method: 'DELETE', headers: { 'x-goog-api-key': key } }).catch(() => {});
+  }
 }
 
 export interface ModelCallInput {

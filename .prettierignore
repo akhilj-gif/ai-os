@@ -1,0 +1,9 @@
+**/dist
+**/node_modules
+**/.next
+**/.userdata
+**/.auth
+logs
+pnpm-lock.yaml
+infra/migrations
+**/*.md

@@ -5,6 +5,7 @@
 //      highest-confidence one; the rest are superseded (auditable, not deleted)
 // Extracting semantic facts from episodic logs is a later, richer pass.
 import type pg from 'pg';
+import { consolidateInsights } from './cognition.js';
 
 const DEDUP_COSINE = 0.95; // cosine similarity above which two memories are "the same"
 const DECAY_AFTER_DAYS = 14; // unconfirmed records start decaying after this
@@ -15,7 +16,13 @@ export interface ReflectionReport {
   expired: number;
   decayed: number;
   deduped: number;
+  /** recurring failures promoted to durable known-issue procedures (Phase 5) */
+  promoted: number;
+  /** generalized insights synthesized from experience (Phase 6 consolidation) */
+  insights: number;
 }
+
+const RECUR_COSINE = 0.9; // two failures this similar = the SAME failure recurred
 
 export async function runReflection(pool: pg.Pool): Promise<ReflectionReport> {
   // 1. Expire records whose TTL has passed.
@@ -47,6 +54,7 @@ export async function runReflection(pool: pg.Pool): Promise<ReflectionReport> {
      FROM memory_records a
      JOIN memory_records b
        ON a.type = b.type
+      AND a.type <> 'failure'  -- never dedup failures: a recurrence is signal for promotion, not noise
       AND a.id <> b.id
       AND a.superseded_by IS NULL AND b.superseded_by IS NULL
       AND a.embedding IS NOT NULL AND b.embedding IS NOT NULL
@@ -68,5 +76,41 @@ export async function runReflection(pool: pg.Pool): Promise<ReflectionReport> {
     }
   }
 
-  return { expired: expired.rowCount ?? 0, decayed: decayed.rowCount ?? 0, deduped };
+  // 4. Failure-pattern promotion (Phase 5 — the Learning half of reflection):
+  //    when the SAME failure has happened more than once (near-duplicate failure
+  //    memories), promote it to a durable procedural "known issue" so it's
+  //    recalled with authority on future tasks and stops recurring. Subject-keyed
+  //    on the older failure's id so re-runs reinforce rather than duplicate.
+  const recurring = await pool.query<{ keep_id: string; content: string }>(
+    `SELECT DISTINCT ON (older.id) older.id AS keep_id, older.content AS content
+     FROM memory_records older
+     JOIN memory_records newer
+       ON older.type = 'failure' AND newer.type = 'failure'
+      AND older.id <> newer.id
+      AND older.superseded_by IS NULL AND newer.superseded_by IS NULL
+      AND older.embedding IS NOT NULL AND newer.embedding IS NOT NULL
+      AND older.created_at < newer.created_at
+      AND (1 - (older.embedding <=> newer.embedding)) > $1
+     ORDER BY older.id
+     LIMIT 20`,
+    [RECUR_COSINE],
+  );
+  let promoted = 0;
+  for (const { keep_id, content } of recurring.rows) {
+    const subject = `known-issue:${keep_id.slice(0, 8)}`;
+    const exists = await pool.query(`SELECT 1 FROM memory_records WHERE subject = $1 AND superseded_by IS NULL`, [subject]);
+    if ((exists.rowCount ?? 0) > 0) continue; // already promoted
+    await pool.query(
+      `INSERT INTO memory_records (type, content, source, confidence, subject, tags)
+       VALUES ('procedural', $1, $2, 0.95, $3, ARRAY['known-issue'])`,
+      [`RECURRING ISSUE (seen more than once) — ${content}`, JSON.stringify({ user_stated: false }), subject],
+    );
+    promoted++;
+  }
+
+  // 5. Consolidation ("dreaming", Phase 6): abstract recent experience into
+  //    generalized insights. Best-effort — an LLM hiccup never fails the pass.
+  const { synthesized } = await consolidateInsights(pool).catch(() => ({ synthesized: 0 }));
+
+  return { expired: expired.rowCount ?? 0, decayed: decayed.rowCount ?? 0, deduped, promoted, insights: synthesized };
 }

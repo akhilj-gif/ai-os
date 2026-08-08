@@ -92,7 +92,10 @@ export class DockerSandbox implements SandboxRunner {
 
         const killer = setTimeout(() => {
           timedOut = true;
-          spawn('docker', ['kill', name], { windowsHide: true });
+          // Best-effort kill; a no-op error handler prevents a failed-to-spawn
+          // `docker kill` (EAGAIN/ENOENT under load) from crashing the process.
+          // --rm + the run child's own close/error handlers do the real cleanup.
+          spawn('docker', ['kill', name], { windowsHide: true }).on('error', () => {});
         }, spec.timeoutMs);
 
         child.on('close', (code) => {

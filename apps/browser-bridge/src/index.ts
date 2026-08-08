@@ -16,7 +16,7 @@
 import { fileURLToPath } from 'node:url';
 import Fastify from 'fastify';
 import { chromium, type BrowserContext, type Page } from 'playwright';
-import { DEFAULT_BROWSER_BRIDGE_PORT } from './contract.js';
+import { DEFAULT_BROWSER_BRIDGE_PORT, type ElementRef } from './contract.js';
 import { findInPage } from './find-in-page.js';
 
 // Playwright's own error messages (e.g. locator timeouts) embed ANSI dim/reset
@@ -43,11 +43,37 @@ async function ensurePage(): Promise<Page> {
   return page;
 }
 
+const SNAPSHOT_MAX = 30;
+/** A fresh, compact list of the page's interactive elements (with refs). Returned
+ *  after navigate/act so the model always knows the CURRENT page's controls
+ *  without a separate /find — refs are re-tagged each call, so these are valid
+ *  right now (the stale-ref trap). */
+async function snapshot(p: Page): Promise<ElementRef[]> {
+  try {
+    const all = (await p.evaluate(findInPage, '')) as ElementRef[];
+    return all.slice(0, SNAPSHOT_MAX);
+  } catch {
+    return [];
+  }
+}
+
+/** Let a page settle after a navigation/interaction: DOM ready always, then a
+ *  BEST-EFFORT networkidle so SPA/async content that arrives after the initial
+ *  response is present before we snapshot or the next step runs. */
+async function settle(p: Page): Promise<void> {
+  await p.waitForLoadState('domcontentloaded', { timeout: 10_000 }).catch(() => undefined);
+  await p.waitForLoadState('networkidle', { timeout: 3_500 }).catch(() => undefined);
+}
+
 async function main(): Promise<void> {
   const app = Fastify({ logger: true });
   const token = process.env.BROWSER_BRIDGE_TOKEN;
+  if (!token) {
+    app.log.warn('SECURITY: BROWSER_BRIDGE_TOKEN is not set — the browser bridge is UNAUTHENTICATED (anyone on loopback can drive your logged-in Chromium). Set it in .env and restart.');
+  }
 
   app.addHook('onRequest', async (req, reply) => {
+    if (req.url.split('?')[0] === '/health') return; // health is unauthenticated (liveness only)
     if (token && req.headers['x-bridge-token'] !== token) return reply.code(401).send({ error: 'bad bridge token' });
   });
 
@@ -57,14 +83,53 @@ async function main(): Promise<void> {
     const { url } = (req.body ?? {}) as { url?: string };
     if (!url || !/^https?:\/\//i.test(url)) return reply.code(400).send({ error: 'absolute http/https url required' });
     const p = await ensurePage();
-    await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    return { url: p.url(), title: await p.title() };
+    // One retry: transient DNS/timeout on the first hit is common; a second
+    // attempt after a beat succeeds far more often than it fails again.
+    try {
+      await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    } catch (err) {
+      await p.waitForTimeout(800);
+      try {
+        await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      } catch {
+        return reply.code(502).send({ error: `could not load ${url}: ${(err instanceof Error ? err.message : 'navigation failed').replace(ANSI_RE, '').slice(0, 200)}` });
+      }
+    }
+    await settle(p);
+    // Return the page's controls immediately — the model can act without a
+    // separate /read + /find round-trip.
+    return { url: p.url(), title: await p.title(), elements: await snapshot(p) };
   });
 
   app.post('/read', async () => {
     const p = await ensurePage();
     const text = (await p.evaluate(() => document.body?.innerText ?? '')).slice(0, MAX_TEXT);
-    return { url: p.url(), title: await p.title(), text };
+    // Structured read: text AND the current interactive elements in one call.
+    return { url: p.url(), title: await p.title(), text, elements: await snapshot(p) };
+  });
+
+  // Wait for the page to reach a condition before the next step — the fix for
+  // "acted before the element existed" on dynamic/SPA pages.
+  app.post('/wait', async (req, reply) => {
+    const { selector, text, state, timeoutMs } = (req.body ?? {}) as { selector?: string; text?: string; state?: string; timeoutMs?: number };
+    const p = await ensurePage();
+    const timeout = Math.min(Math.max(Number(timeoutMs) || 10_000, 500), 30_000);
+    try {
+      if (selector) await p.locator(selector).first().waitFor({ state: 'visible', timeout });
+      else if (text) await p.getByText(text, { exact: false }).first().waitFor({ state: 'visible', timeout });
+      else await p.waitForLoadState((state as 'load' | 'networkidle') || 'networkidle', { timeout });
+      return { ok: true, url: p.url(), title: await p.title(), elements: await snapshot(p) };
+    } catch (err) {
+      return reply.code(504).send({ error: `wait timed out (${timeout}ms): ${(err instanceof Error ? err.message : '').replace(ANSI_RE, '').slice(0, 160) || 'condition not met'}` });
+    }
+  });
+
+  // Screenshot the current viewport (JPEG, base64) — for visual verification via
+  // the OS's vision model ("is the confirmation shown?").
+  app.post('/screenshot', async () => {
+    const p = await ensurePage();
+    const buf = await p.screenshot({ type: 'jpeg', quality: 55 });
+    return { url: p.url(), title: await p.title(), dataUrl: `data:image/jpeg;base64,${buf.toString('base64')}` };
   });
 
   app.post('/find', async (req) => {
@@ -119,8 +184,10 @@ async function main(): Promise<void> {
       const message = err instanceof Error ? err.message : 'action failed';
       return reply.code(500).send({ error: message.replace(ANSI_RE, '').slice(0, 300) });
     }
-    await p.waitForLoadState('domcontentloaded', { timeout: 10_000 }).catch(() => undefined);
-    return { ok: true, action, url: p.url(), title: await p.title() };
+    await settle(p);
+    // Return the post-action page state + fresh controls, so the model sees the
+    // result of what it did and can take the next step without a stale ref.
+    return { ok: true, action, url: p.url(), title: await p.title(), elements: await snapshot(p) };
   });
 
   process.on('unhandledRejection', (e) => app.log.error({ err: e instanceof Error ? e.message : e }, 'unhandledRejection'));

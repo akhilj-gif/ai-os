@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 // Load the workspace-root .env regardless of which package cwd we run under.
 dotenv.config({ path: fileURLToPath(new URL('../../../.env', import.meta.url)) });
 
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import { captureScreen } from '@ai-os/tools';
 import Fastify from 'fastify';
 import pg from 'pg';
 import { Redis } from 'ioredis';
@@ -42,8 +43,8 @@ import {
   type RemoteCursor,
   type Schedule,
 } from '@ai-os/kernel';
-import { MemoryService } from '@ai-os/memory';
-import { failoverChain, transcribe, synthesize, callModel } from '@ai-os/model-router';
+import { MemoryService, recordExperience, updateKnowledgeGraph, memoryAnalytics, cognitiveBriefing, consolidateInsights } from '@ai-os/memory';
+import { failoverChain, transcribe, synthesize, callModel, describeImages } from '@ai-os/model-router';
 import { composeRegistry, packPrompts, loadEnabledPacks, installPack, setPackEnabled, listPacks, PACKS, uberConfigured, uberAuthorizeUrl, exchangeUberCode, forgePack, installDynamicPack, listStagedPacks } from '@ai-os/packs';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
@@ -107,13 +108,43 @@ const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', {
 });
 const trace = new TraceStore(pool);
 
-const app = Fastify({ logger: true });
+// 20MB: chat attachments (images) travel as base64 JSON, well above Fastify's 1MB default.
+const app = Fastify({ logger: true, bodyLimit: 20 * 1024 * 1024 });
 
 declare module 'fastify' {
   interface FastifyRequest {
     traceId: string;
   }
 }
+
+// API authentication (2026-07-26 security hardening). Every endpoint requires a
+// shared secret (x-aios-token === AIOS_API_TOKEN) EXCEPT /health and the OAuth
+// browser-redirect routes (which the browser opens directly and cannot carry a
+// header — they have their own CSRF state guard). This closes the loopback
+// self-approval hole: without it any local process could POST /pending/:id/decide
+// or /chat and act as the user. The UI reaches the API only through the Vite/Next
+// proxies, which inject the header server-side (the browser never sees the token).
+const API_TOKEN = (process.env.AIOS_API_TOKEN ?? '').trim();
+let warnedNoAuth = false;
+const authExempt = (path: string): boolean => path === '/health' || path.startsWith('/oauth/');
+
+// Coarse per-IP rate-limit backstop (2026-07-26 audit). The API is loopback-only
+// so this is effectively one bucket; the ceiling is far above any real UI burst
+// and only ever trips on a runaway/abusive caller flooding the kernel.
+const RL_WINDOW_MS = 10_000;
+const RL_MAX = 1500;
+const rlBuckets = new Map<string, { count: number; resetAt: number }>();
+
+// Single error envelope (2026-07-26 hardening): any uncaught throw becomes a
+// consistent {error, traceId} response tied to the request's trace, instead of
+// Fastify's default 500 leaking raw pg/error text. Thrown errors that carry a
+// 4xx/5xx statusCode keep it; everything else is a clean, non-leaking 500.
+app.setErrorHandler((error, req, reply) => {
+  const err = error as { statusCode?: number; message?: string };
+  const status = typeof err.statusCode === 'number' && err.statusCode >= 400 && err.statusCode < 600 ? err.statusCode : 500;
+  req.log.error({ err: error, traceId: req.traceId }, 'unhandled request error');
+  return reply.code(status).send({ error: status === 500 ? 'internal error' : (err.message ?? 'error'), traceId: req.traceId });
+});
 
 app.addHook('onRequest', async (req, reply) => {
   req.traceId = (req.headers['x-trace-id'] as string | undefined) ?? newTraceId();
@@ -124,6 +155,32 @@ app.addHook('onRequest', async (req, reply) => {
     event: 'http.request',
     payload: { method: req.method, url: req.url },
   });
+
+  // Rate-limit backstop (runs before auth so unauthenticated floods are capped too).
+  const now = Date.now();
+  const bucket = rlBuckets.get(req.ip);
+  if (!bucket || now > bucket.resetAt) {
+    rlBuckets.set(req.ip, { count: 1, resetAt: now + RL_WINDOW_MS });
+  } else if (++bucket.count > RL_MAX) {
+    return reply.code(429).send({ error: 'rate limit exceeded' });
+  }
+
+  const path = req.url.split('?')[0]!;
+  if (authExempt(path)) return;
+  if (!API_TOKEN) {
+    // Fail-open ONLY when no token is configured, so a fresh install isn't bricked
+    // — but make it loud so it is never silently insecure (the ADR-0021 bridge bug).
+    if (!warnedNoAuth) {
+      warnedNoAuth = true;
+      req.log.warn('SECURITY: AIOS_API_TOKEN is not set — API authentication is DISABLED. Set it in .env and restart to secure every endpoint.');
+    }
+    return;
+  }
+  const provided = req.headers['x-aios-token'];
+  if (provided !== API_TOKEN) {
+    trace.recordSafe({ traceId: req.traceId, component: 'api', event: 'http.unauthorized', payload: { method: req.method, path } });
+    return reply.code(401).send({ error: 'unauthorized: missing or invalid x-aios-token' });
+  }
 });
 
 app.get('/health', async () => {
@@ -217,6 +274,7 @@ app.get('/oauth/google/callback', async (req, reply) => {
   }
   const res = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
+    signal: AbortSignal.timeout(10_000),
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       client_id: process.env.GOOGLE_CLIENT_ID ?? '',
@@ -383,11 +441,113 @@ async function completeChatTask(taskId: string, agentMode: 'auto' | 'force' | 'o
       })
     : await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true, history: prior, precomputedMemory });
   await addMessage(pool, { sessionId, role: 'assistant', content: result.text, taskId });
+
+  // Learn from doing (Memory OS Phase 1): distill this task's execution into an
+  // episodic memory (+ a failure memory with cause/prevention if it failed), so
+  // similar future tasks recall the experience. Fire-and-forget — it must never
+  // hold up the reply, and it's internally best-effort (mirrors extractAndStore).
+  void recordExperience(pool, { taskId, replyText: result.text }).catch((err) =>
+    console.warn('[api] experience capture failed (non-fatal):', err instanceof Error ? err.message : err),
+  );
+
+  // Knowledge Graph (Memory OS Phase 3): extract entities + relations from the
+  // exchange into kg_nodes/kg_edges so the OS can reason over connections.
+  // Fire-and-forget; the task goal is the user's actual intent for this task.
+  void pool
+    .query<{ goal: string; trace_id: string }>(`SELECT goal, trace_id FROM tasks WHERE id = $1`, [taskId])
+    .then(({ rows }) => {
+      const t = rows[0];
+      if (t) return updateKnowledgeGraph(pool, { taskId, traceId: t.trace_id, userText: t.goal, assistantText: result.text });
+    })
+    .catch((err) => console.warn('[api] knowledge-graph update failed (non-fatal):', err instanceof Error ? err.message : err));
+}
+
+interface ChatAttachment {
+  name: string;
+  mime: string;
+  dataUrl: string; // data:<mime>;base64,<...> — read client-side via FileReader
+}
+
+// Thorough vision instruction: OCR + structured extraction (tables → markdown,
+// charts described with their data), object/UI notes, and multi-image compare.
+// Gemini 2.5 Flash handles all of these; the digest becomes the executor's
+// goal text, so richer here = better answers downstream.
+function visionInstruction(userText: string, imageCount: number): string {
+  return [
+    userText ? `The user asks: "${userText}"` : '',
+    'Analyze the image(s) thoroughly:',
+    '- Transcribe ALL visible text verbatim (OCR), preserving layout/order.',
+    '- Render any tables as markdown tables; describe charts/graphs with their data points.',
+    '- Note key objects, people, UI elements, or data shown.',
+    imageCount > 1 ? '- Address each image in order, and compare them if the request implies a comparison.' : '',
+    userText ? 'Then answer the user’s question directly from what you see.' : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+// Turns uploaded images/files into text the existing (text-only) executor can
+// reason over: images go through real Gemini vision, small text-like files are
+// decoded inline. No executor/kernel changes needed — this only shapes the
+// goal text that runTask() already reads verbatim (executor.ts:196).
+async function describeAttachments(attachments: ChatAttachment[], userText: string, reused = false): Promise<string> {
+  const images = attachments.filter((a) => a.mime.startsWith('image/'));
+  const files = attachments.filter((a) => !a.mime.startsWith('image/'));
+  const parts: string[] = [];
+  const tag = reused ? 'Image attachment(s), previously shown' : 'Image attachment(s)';
+  if (images.length) {
+    try {
+      const desc = await describeImages(images, visionInstruction(userText, images.length));
+      parts.push(`[${tag}: ${images.map((i) => i.name).join(', ')}]\n${desc}`);
+    } catch (err) {
+      parts.push(`[${tag}: ${images.map((i) => i.name).join(', ')} — could not be analyzed: ${err instanceof Error ? err.message : String(err)}]`);
+    }
+  }
+  for (const f of files) {
+    try {
+      const base64 = f.dataUrl.slice(f.dataUrl.indexOf(',') + 1);
+      const content = Buffer.from(base64, 'base64').toString('utf8').slice(0, 8000);
+      parts.push(`[File attachment: ${f.name}]\n${content}`);
+    } catch {
+      parts.push(`[File attachment: ${f.name} — could not be read as text]`);
+    }
+  }
+  return [userText, ...parts].filter(Boolean).join('\n\n');
+}
+
+// Multi-turn image memory: keep the most recent turn's images per session so
+// a follow-up ("zoom the top-left", "what's in the 2nd row") can re-run vision
+// on the SAME image instead of losing it after one reply. In-memory + bounded
+// (20 min TTL) — a convenience cache, not durable state.
+const RECENT_IMAGES = new Map<string, { images: ChatAttachment[]; at: number }>();
+const RECENT_IMAGE_TTL_MS = 20 * 60 * 1000;
+// Precise on purpose: an explicit visual noun or a spatial/zoom verb — NOT bare
+// "it/this" (which would re-analyze the old image on unrelated follow-ups).
+const VISUAL_REF_RE = /\b(image|picture|photo|pic|screenshot|diagram|chart|graph|logo|shown|zoom|crop|(top|bottom)[- ]?(left|right)|the (top|bottom|left|right|first|second|third|last))\b/i;
+
+function rememberImages(sessionId: string, attachments: ChatAttachment[]): void {
+  const images = attachments.filter((a) => a.mime.startsWith('image/'));
+  if (images.length) RECENT_IMAGES.set(sessionId, { images, at: Date.now() });
+}
+function recallImages(sessionId: string): ChatAttachment[] | null {
+  const e = RECENT_IMAGES.get(sessionId);
+  if (!e) return null;
+  if (Date.now() - e.at > RECENT_IMAGE_TTL_MS) {
+    RECENT_IMAGES.delete(sessionId);
+    return null;
+  }
+  return e.images;
 }
 
 app.post('/chat', async (req) => {
-  const { text, sessionId, agentMode } = (req.body ?? {}) as { text?: string; sessionId?: string; agentMode?: 'auto' | 'force' | 'off' };
-  if (!text?.trim()) return { error: 'text is required' };
+  const { text, sessionId, agentMode, attachments } = (req.body ?? {}) as {
+    text?: string;
+    sessionId?: string;
+    agentMode?: 'auto' | 'force' | 'off';
+    attachments?: ChatAttachment[];
+  };
+  const trimmed = text?.trim() ?? '';
+  if (!trimmed && !attachments?.length) return { error: 'text or an attachment is required' };
   // Robustness: a passed sessionId must be a real session, else fall back to the
   // default — a bad/unknown id used to FK-violate on addMessage and silently 500.
   let session = await ensureDefaultSession(pool);
@@ -396,12 +556,23 @@ app.post('/chat', async (req) => {
     if (ok.rowCount) session = sessionId;
   }
 
+  // Attachments → vision digest; remember the images for follow-ups. With no
+  // new attachment but a visual reference, re-run vision on the last images.
+  let goal = trimmed;
+  if (attachments?.length) {
+    rememberImages(session, attachments);
+    goal = await describeAttachments(attachments, trimmed);
+  } else if (trimmed && VISUAL_REF_RE.test(trimmed)) {
+    const prior = recallImages(session);
+    if (prior) goal = await describeAttachments(prior, trimmed, true);
+  }
+
   const { rows } = await pool.query<{ id: string }>(
     `INSERT INTO tasks (goal, status, created_by, trace_id) VALUES ($1, 'draft', 'user', $2) RETURNING id`,
-    [text.trim(), req.traceId],
+    [goal, req.traceId],
   );
   const taskId = rows[0]!.id;
-  await addMessage(pool, { sessionId: session, role: 'user', content: text.trim(), taskId });
+  await addMessage(pool, { sessionId: session, role: 'user', content: goal, taskId });
 
   await completeChatTask(taskId, agentMode ?? 'auto');
   const msgs = await listMessages(pool, session);
@@ -514,6 +685,289 @@ app.get('/memory', async (req) => {
   return { count: records.length, records };
 });
 
+// Memory OS Phase 5: analytics snapshot for the dashboard.
+app.get('/memory/analytics', async () => memoryAnalytics(pool));
+
+// Memory OS Phase 6 — the Cognitive Layer. The OS thinks about what it knows:
+// a forward-looking briefing (predictions / proactive suggestions / questions),
+// and on-demand consolidation of experience into generalized insights.
+// The briefing is an LLM call, so it's cached (10 min) — it must not fire on
+// every page load; "Think now" (consolidate) invalidates it for a fresh one.
+let briefingCache: { at: number; data: Awaited<ReturnType<typeof cognitiveBriefing>> } | null = null;
+app.get('/cognition/briefing', async (req) => {
+  const refresh = (req.query as { refresh?: string }).refresh === '1';
+  if (!refresh && briefingCache && Date.now() - briefingCache.at < 10 * 60 * 1000) return briefingCache.data;
+  const data = await cognitiveBriefing(pool, { traceId: req.traceId });
+  briefingCache = { at: Date.now(), data };
+  return data;
+});
+app.post('/cognition/consolidate', async (req) => {
+  const r = await consolidateInsights(pool, { traceId: req.traceId });
+  briefingCache = null; // new insights → next briefing regenerates fresh
+  trace.recordSafe({ traceId: req.traceId, component: 'memory', event: 'cognition.consolidated', payload: { synthesized: r.synthesized } });
+  return r;
+});
+
+// ---------------------------------------------------------------------------
+// Tier 2 — runtime settings + autopilot (graduated-trust autonomy).
+// ---------------------------------------------------------------------------
+async function getSetting(key: string, fallback = 'off'): Promise<string> {
+  const { rows } = await pool.query<{ value: string }>(`SELECT value FROM os_settings WHERE key = $1`, [key]);
+  return rows[0]?.value ?? fallback;
+}
+async function setSetting(key: string, value: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO os_settings (key, value) VALUES ($1, $2)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    [key, value],
+  );
+}
+
+app.get('/settings', async () => {
+  const { rows } = await pool.query<{ key: string; value: string }>(`SELECT key, value FROM os_settings ORDER BY key`);
+  return { settings: Object.fromEntries(rows.map((r) => [r.key, r.value])) };
+});
+app.put('/settings/:key', async (req) => {
+  const { key } = req.params as { key: string };
+  const { value } = (req.body ?? {}) as { value?: string };
+  if (typeof value !== 'string') return { error: 'value (string) is required' };
+  await setSetting(key, String(value));
+  return { ok: true, key, value };
+});
+
+// Autopilot: when enabled ('read'), the OS runs its OWN top read-safe foresight
+// suggestions in READ-ONLY mode (executor refuses any mutate/send/spend), so it
+// makes itself useful unattended without ever taking an irreversible action.
+// Returns what it did; each run becomes an episode that feeds cognition back.
+// Autonomy governor (Tier 4-2): a hard daily ceiling on UNATTENDED activity
+// (autopilot cycles + standing-goal advances = tasks created_by='trigger'), so a
+// loop or a bad day can never burn the machine's quota or spam actions. Checked
+// before every autonomous run; the user's own requests are never counted/capped.
+const AUTONOMY_DEFAULT_MAX = 20;
+async function autonomyBudget(): Promise<{ used: number; max: number; ok: boolean }> {
+  const parsed = Number(await getSetting('autonomy_daily_max', String(AUTONOMY_DEFAULT_MAX)));
+  const max = Number.isFinite(parsed) && parsed >= 0 ? parsed : AUTONOMY_DEFAULT_MAX; // 0 is valid = pause all autonomy
+  const used = Number(
+    (await pool.query<{ n: string }>(`SELECT count(*) AS n FROM tasks WHERE created_by = 'trigger' AND created_at::date = now()::date`)).rows[0]?.n ?? 0,
+  );
+  return { used, max, ok: used < max };
+}
+app.get('/governor', async () => autonomyBudget());
+
+async function runAutopilotCycle(traceId: string): Promise<{ mode: string; ran: Array<{ action: string; status: string; text: string }>; note?: string }> {
+  const mode = await getSetting('autopilot');
+  // 'read' = read-only (writes refused); 'propose' = graduated write autonomy
+  // (writes QUEUE as pending approvals for the user to review, never auto-run).
+  if (mode !== 'read' && mode !== 'propose') return { mode, ran: [] };
+  const budget = await autonomyBudget();
+  if (!budget.ok) return { mode, ran: [], note: `daily autonomy budget reached (${budget.used}/${budget.max}) — try again tomorrow or raise it in Settings` };
+  const readOnly = mode === 'read';
+  const briefing = await cognitiveBriefing(pool, { traceId });
+  const actions = briefing.suggestions.filter((s) => s.action).slice(0, 2);
+  const ran: Array<{ action: string; status: string; text: string }> = [];
+  for (const s of actions) {
+    const { rows } = await pool.query<{ id: string }>(
+      `INSERT INTO tasks (goal, status, created_by, trace_id) VALUES ($1, 'draft', 'trigger', $2) RETURNING id`,
+      [s.action, traceId],
+    );
+    const taskId = rows[0]!.id;
+    const r = await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true, readOnly });
+    ran.push({ action: s.action!, status: r.status, text: r.text.slice(0, 400) });
+    void recordExperience(pool, { taskId, replyText: r.text }).catch(() => undefined);
+  }
+  if (ran.length) {
+    await pool.query(`INSERT INTO notifications (kind, title, body) VALUES ('autopilot', $1, $2)`, [
+      `🤖 Autopilot ran ${ran.length} read-only action${ran.length === 1 ? '' : 's'}`,
+      ran.map((r) => `• ${r.action}\n  → ${r.text}`).join('\n\n'),
+    ]);
+  }
+  return { mode, ran };
+}
+app.post('/cognition/autopilot', async (req) => runAutopilotCycle(req.traceId));
+
+// ---------------------------------------------------------------------------
+// Tier 2-C — Standing agents: long-horizon goals the OS advances one safe
+// (read-only) step at a time, between sessions. Advancing runs the executor in
+// readOnly mode, so a step can research/inspect/draft but never mutate/send.
+// ---------------------------------------------------------------------------
+interface StandingGoalRow { id: string; goal: string; status: string; cadence_minutes: number; progress: string; steps: number; last_advanced_at: string | null; }
+
+async function advanceStandingGoal(g: StandingGoalRow, traceId: string): Promise<{ step: string; status: string }> {
+  const prompt =
+    `You are advancing a LONG-HORIZON standing goal one small step at a time — this run does the SINGLE next useful READ-ONLY step (research, inspect, gather, draft), then reports.\n\n` +
+    `GOAL: ${g.goal}\n\nPROGRESS SO FAR:\n${g.progress || '(nothing yet — this is the first step)'}\n\n` +
+    `Do the next read-only step now. Then reply with 1-2 sentences: what you did this step and what the next step should be. If the goal needs a mutating/sending/spending action, DESCRIBE it for the user to approve — do not attempt it.`;
+  const { rows } = await pool.query<{ id: string }>(
+    `INSERT INTO tasks (goal, status, created_by, trace_id) VALUES ($1, 'draft', 'trigger', $2) RETURNING id`,
+    [prompt, traceId],
+  );
+  const taskId = rows[0]!.id;
+  const r = await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true, readOnly: true });
+  const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
+  const entry = `[${stamp}] ${r.text.slice(0, 400).replace(/\s+/g, ' ')}`;
+  await pool.query(
+    `UPDATE standing_goals SET progress = (CASE WHEN progress = '' THEN $2 ELSE progress || E'\\n' || $2 END), steps = steps + 1, last_advanced_at = now() WHERE id = $1`,
+    [g.id, entry],
+  );
+  return { step: entry, status: r.status };
+}
+
+/** Advance every active standing goal whose cadence is due. Gated on autopilot. */
+async function advanceDueStandingGoals(traceId: string): Promise<number> {
+  const mode = await getSetting('autopilot');
+  if (mode !== 'read' && mode !== 'propose') return 0;
+  if (!(await autonomyBudget()).ok) return 0; // respect the daily autonomy ceiling
+  const { rows } = await pool.query<StandingGoalRow>(
+    `SELECT * FROM standing_goals
+     WHERE status = 'active'
+       AND (last_advanced_at IS NULL OR last_advanced_at < now() - (cadence_minutes || ' minutes')::interval)
+     ORDER BY last_advanced_at ASC NULLS FIRST LIMIT 2`,
+  );
+  for (const g of rows) await advanceStandingGoal(g, traceId).catch((e) => console.warn('[standing] advance failed:', e instanceof Error ? e.message : e));
+  return rows.length;
+}
+
+app.get('/standing', async () => {
+  const { rows } = await pool.query(`SELECT id, goal, status, cadence_minutes, steps, progress, last_advanced_at, created_at FROM standing_goals ORDER BY created_at DESC`);
+  return { goals: rows };
+});
+app.post('/standing', async (req) => {
+  const { goal, cadenceMinutes } = (req.body ?? {}) as { goal?: string; cadenceMinutes?: number };
+  if (!goal?.trim()) return { error: 'goal is required' };
+  const { rows } = await pool.query<{ id: string }>(
+    `INSERT INTO standing_goals (goal, cadence_minutes) VALUES ($1, $2) RETURNING id`,
+    [goal.trim(), Number.isFinite(cadenceMinutes) ? Math.max(30, Number(cadenceMinutes)) : 360],
+  );
+  return { ok: true, id: rows[0]!.id };
+});
+app.patch('/standing/:id', async (req) => {
+  const { id } = req.params as { id: string };
+  const { status } = (req.body ?? {}) as { status?: string };
+  if (!['active', 'paused', 'done'].includes(String(status))) return { error: 'status must be active|paused|done' };
+  await pool.query(`UPDATE standing_goals SET status = $2 WHERE id = $1`, [id, status]);
+  return { ok: true };
+});
+// Advance ONE goal now (manual — user-initiated, so it runs regardless of cadence/autopilot).
+app.post('/standing/:id/advance', async (req) => {
+  const { id } = req.params as { id: string };
+  const { rows } = await pool.query<StandingGoalRow>(`SELECT * FROM standing_goals WHERE id = $1`, [id]);
+  if (!rows[0]) return { error: 'no such standing goal' };
+  return advanceStandingGoal(rows[0], req.traceId);
+});
+
+// ---------------------------------------------------------------------------
+// Tier 2-B — proactive delivery: push undelivered notifications (morning
+// briefing, watch alerts, autopilot summaries) to the user's WhatsApp
+// self-chat, so the OS reaches out FIRST. Gated by proactive_delivery=on and
+// only when the bridge is paired. Best-effort — bridge down = try again later.
+// ---------------------------------------------------------------------------
+async function deliverProactiveNotifications(): Promise<{ sent: number; skipped?: string }> {
+  if ((await getSetting('proactive_delivery')) !== 'on') return { sent: 0, skipped: 'disabled' };
+  const base = process.env.WHATSAPP_BRIDGE_URL ?? 'http://127.0.0.1:4100';
+  const token = process.env.WHATSAPP_BRIDGE_TOKEN;
+  const headers = { 'content-type': 'application/json', ...(token ? { 'x-bridge-token': token } : {}) };
+  const health = (await fetch(`${base}/health`, { headers, signal: AbortSignal.timeout(8000) })
+    .then((r) => (r.ok ? r.json() : null))
+    .catch(() => null)) as { paired?: boolean; me?: string } | null;
+  if (!health?.paired || !health.me) return { sent: 0, skipped: 'bridge not paired' };
+  const self = health.me.includes('@') ? health.me : `${health.me}@s.whatsapp.net`;
+  const { rows } = await pool.query<{ id: string; title: string; body: string }>(
+    `SELECT id, title, body FROM notifications WHERE delivered_wa = false ORDER BY created_at LIMIT 5`,
+  );
+  let sent = 0;
+  for (const n of rows) {
+    const text = `🔔 ${n.title}\n\n${n.body}`.slice(0, 1500);
+    const ok = await fetch(`${base}/send`, { method: 'POST', headers, body: JSON.stringify({ chatId: self, text }), signal: AbortSignal.timeout(10_000) })
+      .then((r) => r.ok)
+      .catch(() => false);
+    await pool.query(`UPDATE notifications SET delivered_wa = $2 WHERE id = $1`, [n.id, ok]);
+    if (ok) sent++;
+  }
+  return { sent };
+}
+app.post('/notifications/deliver', async () => deliverProactiveNotifications());
+
+// ---------------------------------------------------------------------------
+// Tier 4-3 — Continuous perception: watch the screen on a light cadence, but
+// only spend a vision call when it MEANINGFULLY changes (hash-diff gate, same
+// idea as the watch job). Opt-in (screen_watch=on), privacy-sensitive → off by
+// default. A noticed change becomes a notification (and can reach WhatsApp via
+// proactive delivery). Manual trigger forces one analysis regardless.
+// ---------------------------------------------------------------------------
+let lastScreenHash: string | null = null;
+async function screenWatchTick(opts: { force?: boolean } = {}): Promise<{ analyzed: boolean; changed: boolean; note?: string; analysis?: string }> {
+  if (!opts.force && (await getSetting('screen_watch')) !== 'on') return { analyzed: false, changed: false, note: 'disabled' };
+  const buf = await captureScreen();
+  if (!buf) return { analyzed: false, changed: false, note: 'no capture (no active desktop session?)' };
+  const hash = createHash('sha256').update(buf).digest('hex');
+  const first = lastScreenHash === null;
+  const changed = hash !== lastScreenHash;
+  lastScreenHash = hash;
+  // Baseline (first tick) and unchanged frames cost nothing — only a real change
+  // (or a manual/forced run) spends a vision call.
+  if (!opts.force && (first || !changed)) return { analyzed: false, changed, note: first ? 'baseline captured' : 'no change' };
+  const analysis = await describeImages(
+    [{ mime: 'image/png', dataUrl: `data:image/png;base64,${buf.toString('base64')}` }],
+    'Concisely: what is on the screen right now, and is there anything that may need attention (an error, a message, a task waiting)?',
+  );
+  await pool.query(`INSERT INTO notifications (kind, title, body) VALUES ('screen', $1, $2)`, ['👁 Screen update noticed', analysis.slice(0, 1500)]);
+  return { analyzed: true, changed: true, analysis: analysis.slice(0, 400) };
+}
+app.post('/perception/screen-watch', async () => screenWatchTick({ force: true }));
+
+// ---------------------------------------------------------------------------
+// Tier 3 — Graduated trust: the OS learns which actions you consistently
+// approve (from pending_actions history) and lets you PROMOTE a tool to
+// auto-approve, so autonomy widens based on your demonstrated trust. Money
+// ('spend') can never be promoted; every promotion is one-click revocable.
+// ---------------------------------------------------------------------------
+const PROMOTE_THRESHOLD = 3; // approvals with zero rejections before a tool is "promotable"
+
+app.get('/trust/ladder', async () => {
+  const { rows } = await pool.query<{ tool: string; trust_class: string; auto_approve: boolean; approvals: number; rejections: number }>(
+    `SELECT p.tool,
+            COALESCE(tp.trust_class::text, max(p.trust_class)) AS trust_class,
+            COALESCE(bool_or(tp.auto_approve), false) AS auto_approve,
+            count(*) FILTER (WHERE p.status = 'executed')::int AS approvals,
+            count(*) FILTER (WHERE p.status = 'rejected')::int AS rejections
+     FROM pending_actions p
+     LEFT JOIN trust_policies tp ON tp.tool = p.tool
+     GROUP BY p.tool, tp.trust_class, tp.auto_approve
+     ORDER BY approvals DESC, p.tool`,
+  );
+  const ladder = rows.map((r) => ({
+    ...r,
+    promotable: !r.auto_approve && r.trust_class !== 'spend' && r.approvals >= PROMOTE_THRESHOLD && r.rejections === 0,
+  }));
+  return { ladder, threshold: PROMOTE_THRESHOLD };
+});
+
+app.post('/trust/promote', async (req) => {
+  const { tool } = (req.body ?? {}) as { tool?: string };
+  if (!tool) return { error: 'tool is required' };
+  // Resolve the tool's class from its policy or its decision history.
+  const cls =
+    (await pool.query<{ c: string }>(`SELECT trust_class::text AS c FROM trust_policies WHERE tool = $1`, [tool])).rows[0]?.c ??
+    (await pool.query<{ c: string }>(`SELECT max(trust_class) AS c FROM pending_actions WHERE tool = $1`, [tool])).rows[0]?.c;
+  if (!cls) return { error: `unknown tool "${tool}"` };
+  if (cls === 'spend') return { error: 'spend-class actions (money) can never be auto-approved — they always require confirmation.' };
+  await pool.query(
+    `INSERT INTO trust_policies (tool, trust_class, auto_approve) VALUES ($1, $2::trust_class, true)
+     ON CONFLICT (tool) DO UPDATE SET auto_approve = true, updated_at = now()`,
+    [tool, cls],
+  );
+  trace.recordSafe({ traceId: req.traceId, component: 'trust', event: 'trust.promoted', payload: { tool, trustClass: cls } });
+  return { ok: true, tool, trustClass: cls, autoApprove: true };
+});
+
+app.post('/trust/demote', async (req) => {
+  const { tool } = (req.body ?? {}) as { tool?: string };
+  if (!tool) return { error: 'tool is required' };
+  await pool.query(`UPDATE trust_policies SET auto_approve = false, updated_at = now() WHERE tool = $1`, [tool]);
+  trace.recordSafe({ traceId: req.traceId, component: 'trust', event: 'trust.demoted', payload: { tool } });
+  return { ok: true, tool, autoApprove: false };
+});
+
 app.delete('/memory/:id', async (req, reply) => {
   const { id } = req.params as { id: string };
   const ok = await memory.remove(id);
@@ -581,7 +1035,10 @@ app.post('/code', async (req, reply) => {
   if (!instruction?.trim() || !files || !testCmd?.trim()) {
     return reply.code(400).send({ error: 'instruction, files and testCmd are required' });
   }
-  return runCodingTask(pool, { instruction: instruction.trim(), files, testCmd: testCmd.trim(), language, egress, maxRounds });
+  // Clamp maxRounds (2026-07-26 audit): unbounded rounds = unbounded Docker-sandbox
+  // spawns + planning-tier LLM calls from a single request.
+  const safeMaxRounds = Math.min(Math.max(Math.floor(Number(maxRounds) || 3), 1), 6);
+  return runCodingTask(pool, { instruction: instruction.trim(), files, testCmd: testCmd.trim(), language, egress, maxRounds: safeMaxRounds });
 });
 
 // ---------------------------------------------------------------------------
@@ -912,6 +1369,15 @@ app.put('/policies/:tool', async (req, reply) => {
   const { trustClass, autoApprove } = (req.body ?? {}) as { trustClass?: string; autoApprove?: boolean };
   const valid = ['read', 'write', 'irreversible', 'spend'];
   if (trustClass !== undefined && !valid.includes(trustClass)) return reply.code(400).send({ error: 'invalid trustClass' });
+  // Spend can NEVER be auto-approved — money always needs a human. Mirrors the
+  // /trust/promote guard, which PUT /policies previously bypassed (2026-07-26 audit).
+  if (autoApprove === true) {
+    const cur = await pool.query<{ trust_class: string }>(`SELECT trust_class FROM trust_policies WHERE tool = $1`, [tool]);
+    const effectiveClass = trustClass ?? cur.rows[0]?.trust_class;
+    if (effectiveClass === 'spend') {
+      return reply.code(400).send({ error: 'spend-class tools can never be auto-approved — money always requires explicit approval' });
+    }
+  }
   const res = await pool.query(
     `UPDATE trust_policies
      SET trust_class = COALESCE($2, trust_class), auto_approve = COALESCE($3, auto_approve), updated_at = now()
@@ -1094,10 +1560,15 @@ void (async () => {
 })();
 await app.listen({ port, host: '127.0.0.1' });
 
+// Stay-up guards (mirror the bridges): log, never exit — one rejected background
+// promise or a stray throw must not crash the whole gateway (2026-07-26 audit).
+process.on('unhandledRejection', (reason) => app.log.error({ reason }, 'unhandledRejection'));
+process.on('uncaughtException', (err) => app.log.error({ err }, 'uncaughtException'));
+
 void (async () => {
   const orphans = await findOrphanedTasks(pool);
   for (const taskId of orphans) void resumeTaskById(taskId, 'boot'); // fire-and-forget, concurrent — matches the pre-refactor dispatch
-})();
+})().catch((err) => app.log.error({ err }, 'boot-resume failed'));
 
 // M7: the scheduler heartbeat. Ticks every SCHEDULER_POLL_MS (default 30s); due
 // jobs run their fixed pipelines; zombies from a previous crash are reaped on the
@@ -1242,4 +1713,50 @@ if ((process.env.AIOS_WA_REMOTE ?? 'on') !== 'off') {
       });
   }, Number(process.env.AIOS_WA_POLL_MS) || 12_000);
   app.log.info({ trigger: WA_TRIGGER }, 'whatsapp remote control enabled (self-chat commands)');
+}
+
+// Tier 2-C: advance due standing goals in the background — read-only, and only
+// when autopilot is on (advanceDueStandingGoals gates both). Checked every 30
+// min; the per-goal cadence (default 6h) does the real pacing, so free-tier
+// quota impact is minimal. AIOS_STANDING=off disables it.
+if (process.env.AIOS_STANDING !== 'off') {
+  let standingInFlight = false;
+  setInterval(() => {
+    if (standingInFlight) return;
+    standingInFlight = true;
+    advanceDueStandingGoals(newTraceId())
+      .then((n) => { if (n) app.log.info({ advanced: n }, 'standing goals advanced'); })
+      .catch((err) => app.log.debug({ err: err instanceof Error ? err.message : err }, 'standing advance skipped'))
+      .finally(() => { standingInFlight = false; });
+  }, Number(process.env.AIOS_STANDING_POLL_MS) || 30 * 60_000);
+  app.log.info('standing-goal autonomy enabled (read-only, autopilot-gated)');
+}
+
+// Tier 2-B: push proactive notifications to WhatsApp on a light cadence (gated
+// by proactive_delivery=on + a paired bridge). AIOS_PROACTIVE=off disables it.
+if (process.env.AIOS_PROACTIVE !== 'off') {
+  let deliverInFlight = false;
+  setInterval(() => {
+    if (deliverInFlight) return;
+    deliverInFlight = true;
+    deliverProactiveNotifications()
+      .then((r) => { if (r.sent) app.log.info(r, 'proactive notifications delivered to WhatsApp'); })
+      .catch((err) => app.log.debug({ err: err instanceof Error ? err.message : err }, 'proactive delivery skipped'))
+      .finally(() => { deliverInFlight = false; });
+  }, Number(process.env.AIOS_PROACTIVE_POLL_MS) || 5 * 60_000);
+}
+
+// Tier 4-3: continuous screen perception — capture on a light cadence, analyze
+// only on a real change (screenWatchTick gates on the screen_watch setting).
+// AIOS_SCREEN_WATCH=off disables the loop entirely.
+if (process.env.AIOS_SCREEN_WATCH !== 'off') {
+  let screenInFlight = false;
+  setInterval(() => {
+    if (screenInFlight) return;
+    screenInFlight = true;
+    screenWatchTick()
+      .then((r) => { if (r.analyzed) app.log.info({ analysis: r.analysis }, 'screen-watch noticed a change'); })
+      .catch((err) => app.log.debug({ err: err instanceof Error ? err.message : err }, 'screen-watch skipped'))
+      .finally(() => { screenInFlight = false; });
+  }, Number(process.env.AIOS_SCREEN_WATCH_MS) || 90_000);
 }

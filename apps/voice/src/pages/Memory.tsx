@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import PageContainer from '../components/PageContainer';
 import { Search, Trash2 } from 'lucide-react';
-import { api, type MemoryRecord } from '../api/client';
+import { api, type MemoryRecord, type MemoryAnalytics } from '../api/client';
 
 const TYPE_COLORS: Record<string, string> = {
   preference: 'text-[#3B82F6] border-[#3B82F6]/40',
@@ -11,15 +11,17 @@ const TYPE_COLORS: Record<string, string> = {
   project: 'text-[#F2C14E] border-[#F2C14E]/40',
   episodic: 'text-[#98A4B8] border-[#98A4B8]/40',
   document: 'text-[#00D4FF] border-[#00D4FF]/40',
+  failure: 'text-[#F87171] border-[#F87171]/40',
 };
 
 export default function Memory() {
   const [records, setRecords] = useState<MemoryRecord[]>([]);
   const [q, setQ] = useState('');
   const [mode, setMode] = useState<string | null>(null);
+  const [stats, setStats] = useState<MemoryAnalytics | null>(null);
 
   const load = () => api.memory().then((d) => { setRecords(d.records); setMode(null); }).catch(() => undefined);
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); api.memoryAnalytics().then(setStats).catch(() => undefined); }, []);
 
   async function search() {
     if (!q.trim()) return load();
@@ -58,6 +60,29 @@ export default function Memory() {
           </div>
         </div>
 
+        {stats && !mode && (
+          <div className="mb-5 shrink-0">
+            <div className="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-6 gap-2.5 mb-3">
+              <Stat label="Memories" value={stats.total} accent="#3B82F6" />
+              <Stat label="Graph nodes" value={stats.graph.nodes} accent="#00D4FF" />
+              <Stat label="Graph links" value={stats.graph.edges} accent="#00D4FF" />
+              <Stat label="Skills" value={stats.skills} accent="#B57EDC" />
+              <Stat label="Projects" value={stats.projects} accent="#F2C14E" />
+              <Stat label="New · 7d" value={stats.createdLast7d} accent="#22C55E" />
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {Object.entries(stats.byType).map(([t, n]) => (
+                <span key={t} className={`text-[11px] font-medium px-2 py-0.5 rounded-md border ${TYPE_COLORS[t] ?? 'text-[#98A4B8] border-white/20'}`}>{t} · {n}</span>
+              ))}
+              {stats.knownIssues > 0 && <span className="text-[11px] px-2 py-0.5 rounded-md border text-[#F87171] border-[#F87171]/40">known issues · {stats.knownIssues}</span>}
+              {stats.contradictions > 0 && <span className="text-[11px] px-2 py-0.5 rounded-md border text-[#F2C14E] border-[#F2C14E]/40">⚠ conflicts · {stats.contradictions}</span>}
+              <span className="text-[11px] text-[#5B6575] ml-auto">
+                confidence: <span className="text-[#22C55E]">{stats.confidence.high} high</span> · {stats.confidence.medium} med · {stats.confidence.low} low · <span className="text-[#5B6575]">{stats.superseded} archived</span>
+              </span>
+            </div>
+          </div>
+        )}
+
         {mode && (
           <div className="text-[12.5px] text-[#F2C14E] mb-4">
             search results · {mode} ·{' '}
@@ -91,5 +116,14 @@ export default function Memory() {
         </div>
       </div>
     </PageContainer>
+  );
+}
+
+function Stat({ label, value, accent }: { label: string; value: number; accent: string }) {
+  return (
+    <div className="rounded-[14px] bg-[#0B1118]/60 border border-white/[0.05] px-3.5 py-3">
+      <div className="text-[22px] font-semibold leading-none" style={{ color: accent }}>{value}</div>
+      <div className="text-[11px] text-[#98A4B8] mt-1.5">{label}</div>
+    </div>
   );
 }

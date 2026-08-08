@@ -34,6 +34,7 @@ export async function getGoogleAccessToken(pool: pg.Pool): Promise<string> {
 
   const res = await fetch(TOKEN_URL, {
     method: 'POST',
+    signal: AbortSignal.timeout(10_000),
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       client_id: process.env.GOOGLE_CLIENT_ID ?? '',
@@ -65,6 +66,7 @@ export async function googleApi<T = unknown>(
   const token = await getGoogleAccessToken(pool);
   const res = await fetch(url, {
     ...init,
+    signal: init?.signal ?? AbortSignal.timeout(10_000),
     headers: { ...(init?.headers ?? {}), authorization: `Bearer ${token}` },
   });
   if (!res.ok) {

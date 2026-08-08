@@ -5,7 +5,7 @@ import { useAIOS } from '../state/useAIOS';
 export default function QuickActions() {
   const { send } = useAIOS();
   return (
-    <div className="flex gap-4 mt-8 justify-center w-full max-w-[800px] mx-auto px-4">
+    <div className="flex gap-3 mt-4 justify-center w-full max-w-[800px] mx-auto px-4 shrink-0">
       <ActionCard
         icon={<Sun size={20} className="text-[#3B82F6]" />}
         title="What's on"
@@ -40,7 +40,7 @@ function ActionCard({ icon, title, subtitle, delay, onClick }: { icon: React.Rea
       whileHover={{ y: -2, scale: 1.01 }}
       whileTap={{ scale: 0.98 }}
       onClick={onClick}
-      className="flex items-center gap-4 px-5 py-4 rounded-[16px] bg-[#0B1118]/80 border border-white/[0.04] hover:bg-[#101722] hover:border-white/[0.1] transition-all group backdrop-blur-xl shadow-lg flex-1 text-left"
+      className="flex items-center gap-3 px-4 py-3 rounded-[16px] bg-[#0B1118]/80 border border-white/[0.04] hover:bg-[#101722] hover:border-white/[0.1] transition-all group backdrop-blur-xl shadow-lg flex-1 text-left"
     >
       <div className="text-[#3B82F6] flex-shrink-0 group-hover:scale-110 transition-transform duration-300">{icon}</div>
       <div className="flex flex-col">

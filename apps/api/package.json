@@ -12,6 +12,7 @@
     "@ai-os/model-router": "workspace:*",
     "@ai-os/packs": "workspace:*",
     "@ai-os/shared": "workspace:*",
+    "@ai-os/tools": "workspace:*",
     "dotenv": "^17.4.2",
     "fastify": "^5.9.0",
     "ioredis": "^5.11.1",

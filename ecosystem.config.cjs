@@ -7,7 +7,26 @@
 // api + bridge run TypeScript directly via `node --import tsx` (verified working);
 // web runs the Next dev server via its resolved bin. Logs → ./logs/*.log.
 const { join } = require('node:path');
+const fs = require('node:fs');
 const root = __dirname;
+
+// Read a single key out of the root .env WITHOUT a dotenv dependency (this file
+// runs at pm2-start time). Used to fan AIOS_API_TOKEN out to the UI processes:
+// the api loads .env itself, but the Vite/Next dev servers run with their own
+// cwd and would not otherwise see it — their proxies need it to authenticate.
+const readEnv = (key) => {
+  try {
+    const line = fs
+      .readFileSync(join(root, '.env'), 'utf8')
+      .split(/\r?\n/)
+      .find((l) => l.startsWith(`${key}=`));
+    return line ? line.slice(key.length + 1).trim() : '';
+  } catch {
+    return '';
+  }
+};
+const AIOS_API_TOKEN = readEnv('AIOS_API_TOKEN');
+const BROWSER_BRIDGE_TOKEN = readEnv('BROWSER_BRIDGE_TOKEN');
 
 const common = {
   autorestart: true,
@@ -16,6 +35,9 @@ const common = {
   restart_delay: 3_000,
   kill_timeout: 8_000, // give the process time to close sockets/DB on stop
   time: true, // timestamp log lines
+  // shared secrets: AIOS_API_TOKEN lets the UI proxies auth to the API;
+  // BROWSER_BRIDGE_TOKEN lets the api authenticate to the Playwright bridge.
+  env: { AIOS_API_TOKEN, BROWSER_BRIDGE_TOKEN },
 };
 
 module.exports = {
@@ -60,7 +82,7 @@ module.exports = {
       interpreter: 'node',
       interpreter_args: '--import tsx',
       cwd: root,
-      env: { BROWSER_HEADLESS: '1', BROWSER_BRIDGE_PORT: '4200' },
+      env: { AIOS_API_TOKEN, BROWSER_BRIDGE_TOKEN, BROWSER_HEADLESS: '1', BROWSER_BRIDGE_PORT: '4200' },
       out_file: join(root, 'logs/browser-bridge.log'),
       error_file: join(root, 'logs/browser-bridge.err.log'),
     },

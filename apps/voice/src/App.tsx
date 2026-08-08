@@ -3,8 +3,11 @@ import Sidebar from './components/Sidebar';
 import RightPanel from './components/RightPanel';
 import BackgroundEffects from './components/BackgroundEffects';
 import ApprovalPopup from './components/ApprovalPopup';
+import ProactiveVoice from './components/ProactiveVoice';
+import WakeWord from './components/WakeWord';
 import { AIOSProvider } from './state/useAIOS';
 import Home from './pages/Home';
+import Mind from './pages/Mind';
 import NewChat from './pages/NewChat';
 import Chats from './pages/Chats';
 import Tasks from './pages/Tasks';
@@ -15,7 +18,7 @@ import Settings from './pages/Settings';
 function Layout() {
   const location = useLocation();
   // Hide the right panel on specific full-width pages
-  const hideRightPanelPaths = ['/settings', '/memory', '/new', '/chats'];
+  const hideRightPanelPaths = ['/settings', '/memory', '/mind', '/new', '/chats'];
   const showRightPanel = !hideRightPanelPaths.includes(location.pathname);
 
   return (
@@ -27,6 +30,7 @@ function Layout() {
         <div className="flex-1 flex overflow-hidden relative min-w-0">
           <Routes>
             <Route path="/" element={<Home />} />
+            <Route path="/mind" element={<Mind />} />
             <Route path="/new" element={<NewChat />} />
             <Route path="/chats" element={<Chats />} />
             <Route path="/tasks" element={<Tasks />} />
@@ -40,6 +44,9 @@ function Layout() {
 
       {/* Approvals pop over EVERYTHING, on every page. */}
       <ApprovalPopup />
+      {/* Voice-out proactivity + hands-free wake word (opt-in, browser-only). */}
+      <ProactiveVoice />
+      <WakeWord />
     </div>
   );
 }

@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Typecheck · Lint · Format · Smokes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # Hard gate: types must be correct.
+      - name: Typecheck
+        run: pnpm typecheck
+
+      # Hard gate: the deterministic (no DB / no model) smoke suites.
+      - name: Smoke tests
+        run: pnpm test
+
+      # Advisory for now — a burn-down list, not a blocker (see eslint.config.js).
+      - name: Lint
+        run: pnpm lint
+        continue-on-error: true
+
+      - name: Format check
+        run: pnpm format:check
+        continue-on-error: true

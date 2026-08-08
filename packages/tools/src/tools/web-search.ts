@@ -53,10 +53,12 @@ export const webSearch: ToolDef = {
     if (!query) throw new Error('query is required');
     // args.maxResults ?? — not `|| 5` — because `|| ` can't tell "omitted"
     // from "explicitly 0"; both are falsy, so maxResults:0 silently became 5.
-    const requested = args.maxResults == null ? 5 : Number(args.maxResults);
+    const n = Number(args.maxResults);
+    const requested = args.maxResults == null || !Number.isFinite(n) ? 5 : n;
     const max = Math.min(Math.max(requested, 1), 10);
 
     const res = await fetch(`https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`, {
+      signal: AbortSignal.timeout(12_000), // match the codebase timeout convention — a hung peer must not stall the task
       headers: {
         'user-agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',

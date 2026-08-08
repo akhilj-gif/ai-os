@@ -23,6 +23,13 @@ export default defineConfig(() => {
           target: 'http://127.0.0.1:4000',
           changeOrigin: false,
           rewrite: (p: string) => p.replace(/^\/api/, ''),
+          // Inject the API auth token server-side so the browser never sees it
+          // (the API rejects any request without x-aios-token). PM2 provides
+          // AIOS_API_TOKEN to this process via ecosystem.config.cjs.
+          configure: (proxy) => {
+            const token = process.env.AIOS_API_TOKEN;
+            if (token) proxy.on('proxyReq', (proxyReq) => proxyReq.setHeader('x-aios-token', token));
+          },
         },
       },
     },

@@ -11,8 +11,15 @@ import { whatsappListChats, whatsappReadMessages, whatsappSearchContacts, whatsa
 import { xGetMe, xDraftPost, xPublishPost } from './tools/x.js';
 import { terminalRun, terminalExec } from './tools/terminal.js';
 import { fsList, fsRead, fsSearch, fsWrite, fsOpen } from './tools/files.js';
+import { screenCapture } from './tools/screen.js';
+import { projectCreate, projectList, projectRecord, projectRecall } from './tools/project.js';
+import { graphQuery } from './tools/graph.js';
+import { wmSet, wmGet, wmClear } from './tools/wm.js';
+import { httpGet, httpSend, openUrl } from './tools/http.js';
+import { clipboardRead, clipboardWrite, systemStatus } from './tools/desktop.js';
 import { mobilityEstimate, mobilityBook } from './tools/mobility.js';
-import { browserNavigate, browserRead, browserFind, browserExtract, browserAct } from './tools/browser.js';
+import { browserNavigate, browserRead, browserFind, browserExtract, browserAct, browserWait, browserScreenshot } from './tools/browser.js';
+import { videoAnalyze } from './tools/video.js';
 
 export type { ToolDef, ToolContext, ToolSchema } from './registry.js';
 export { ToolRegistry } from './registry.js';
@@ -33,10 +40,17 @@ export { whatsappListChats, whatsappReadMessages, whatsappSearchContacts, whatsa
 export { xGetMe, xDraftPost, xPublishPost, xMockOutbox, X_MAX_CHARS } from './tools/x.js';
 export { terminalRun, terminalExec, checkReadCommand, scrubbedEnv } from './tools/terminal.js';
 export { fsList, fsRead, fsSearch, fsWrite, fsOpen, confinePath } from './tools/files.js';
+export { screenCapture, captureScreen } from './tools/screen.js';
+export { projectCreate, projectList, projectRecord, projectRecall } from './tools/project.js';
+export { graphQuery } from './tools/graph.js';
+export { wmSet, wmGet, wmClear } from './tools/wm.js';
+export { httpGet, httpSend, openUrl } from './tools/http.js';
+export { clipboardRead, clipboardWrite, systemStatus } from './tools/desktop.js';
 export { mobilityEstimate, mobilityBook, mobilityMockOutbox, type RideOption, type Provider } from './tools/mobility.js';
 export { decideRide, DEFAULT_PREFS, type MobilityPrefs, type RideContext, type RideDecision } from './tools/mobility-decide.js';
 export { uberConfigured, uberAuthorizeUrl, exchangeUberCode, uberVehicleClass, encodeUberOption, decodeUberOption, isUberOption, mapUberEstimates, UberNotConnectedError, type UberPriceItem, type UberTimeItem, type Coords } from './tools/uber.js';
-export { browserNavigate, browserRead, browserFind, browserExtract, browserAct, browserMockActions } from './tools/browser.js';
+export { browserNavigate, browserRead, browserFind, browserExtract, browserAct, browserWait, browserScreenshot, browserMockActions } from './tools/browser.js';
+export { videoAnalyze } from './tools/video.js';
 
 export function buildRegistry(): ToolRegistry {
   const registry = new ToolRegistry();
@@ -66,6 +80,21 @@ export function buildRegistry(): ToolRegistry {
     fsSearch,
     fsWrite,
     fsOpen,
+    screenCapture,
+    projectCreate,
+    projectList,
+    projectRecord,
+    projectRecall,
+    graphQuery,
+    wmSet,
+    wmGet,
+    wmClear,
+    httpGet,
+    httpSend,
+    openUrl,
+    clipboardRead,
+    clipboardWrite,
+    systemStatus,
     mobilityEstimate,
     mobilityBook,
     browserNavigate,
@@ -73,6 +102,9 @@ export function buildRegistry(): ToolRegistry {
     browserFind,
     browserExtract,
     browserAct,
+    browserWait,
+    browserScreenshot,
+    videoAnalyze,
   ]) {
     registry.register(tool);
   }

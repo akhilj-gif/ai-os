@@ -10,3 +10,6 @@ apps/whatsapp-bridge/store.json
 logs/
 apps/browser-bridge/.userdata/
 packs-dynamic/
+
+# regenerable graphify knowledge-graph output
+graphify-out/

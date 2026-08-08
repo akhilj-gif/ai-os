@@ -51,11 +51,21 @@ const MAX_OUTPUT = 64_000; // head+tail cap per stream
 // etc.) can never actually execute here — don't add them.
 const READ_ALLOWLIST = new Set([
   'ls', 'dir', 'pwd', 'cd', 'cat', 'type', 'head', 'tail', 'wc', 'find', 'where', 'which',
-  'echo', 'date', 'whoami', 'hostname', 'uname', 'df', 'du', 'ps', 'env', 'printenv',
+  'echo', 'date', 'whoami', 'hostname', 'uname', 'df', 'du', 'ps', 'printenv',
   'tree', 'stat', 'file', 'grep', 'findstr',
 ]);
+// NB `env` is deliberately NOT allowlisted: `env FOO=bar somecmd` executes an
+// arbitrary command. Use `printenv` to read the environment. (2026-07-26 audit.)
+
 // git is allowed ONLY for read subcommands.
 const GIT_READ_SUBCMDS = new Set(['status', 'log', 'diff', 'show', 'branch', 'remote', 'config']);
+// `git config` can WRITE (git config x y) and even EXECUTE (aliases / core.pager),
+// so on the read path only these read-only forms are allowed (2026-07-26 audit).
+const GIT_CONFIG_READ_OK = /^\s*(--list|-l|--get|--get-all|--get-regexp|--get-urlmatch)\b/;
+// `find` actions run or destroy: -exec/-execdir/-ok/-okdir spawn commands (and
+// `-exec cmd {} +` needs no `;`, so it slips past the metachar filter),
+// -delete removes files, -fprint* write files. Refuse them on the read path.
+const FIND_DANGEROUS = /(^|\s)-(exec|execdir|ok|okdir|delete|fprint|fprintf|fprint0|fls)\b/i;
 
 // Anything that could chain, redirect, or spawn a subshell turns an allowlisted
 // head into an arbitrary-command vector — refuse it on the read path.
@@ -155,7 +165,14 @@ export function checkReadCommand(command: string): string | null {
   const head = tokens[0]!.toLowerCase();
   if (head === 'git') {
     const sub = (tokens[1] ?? '').toLowerCase();
-    return GIT_READ_SUBCMDS.has(sub) ? null : `git ${sub || '(none)'} is not a read-only subcommand — use terminal_exec for it`;
+    if (!GIT_READ_SUBCMDS.has(sub)) return `git ${sub || '(none)'} is not a read-only subcommand — use terminal_exec for it`;
+    if (sub === 'config' && !GIT_CONFIG_READ_OK.test(tokens.slice(2).join(' '))) {
+      return 'git config on the read path is limited to read flags (--list, --get, --get-all, --get-regexp) — use terminal_exec to change config';
+    }
+    return null;
+  }
+  if (head === 'find' && FIND_DANGEROUS.test(cmd)) {
+    return 'find with an action (-exec, -execdir, -ok, -delete, -fprint…) can run or destroy — use terminal_exec (needs approval) for it';
   }
   return READ_ALLOWLIST.has(head) ? null : `"${head}" is not on the read-only allowlist — use terminal_exec (needs your approval) to run it`;
 }

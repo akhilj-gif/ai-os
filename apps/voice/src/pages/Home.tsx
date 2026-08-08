@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { Menu, SlidersHorizontal, Sun } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useNavigate } from 'react-router-dom';
@@ -27,6 +27,17 @@ export default function Home() {
   const { voice, toggleVoice, messages, busy, conversation } = useAIOS();
   const navigate = useNavigate();
 
+  // Size the orb to the viewport so the hero + chat bar always fit on one
+  // screen (Windows display scaling shrinks the effective height, which was
+  // pushing the chat bar off the bottom).
+  const [orbSize, setOrbSize] = useState(320);
+  useEffect(() => {
+    const update = () => setOrbSize(Math.max(176, Math.min(285, Math.round(window.innerHeight * 0.27))));
+    update();
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
+  }, []);
+
   // Space = push-to-talk toggle (when not typing in a field).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -45,7 +56,7 @@ export default function Home() {
   return (
     <PageContainer>
       {/* Top Bar */}
-      <div className="flex items-center justify-between p-6 z-20">
+      <div className="flex items-center justify-between px-6 py-4 z-20 shrink-0">
         <motion.button
           whileHover={{ scale: 1.05, backgroundColor: 'rgba(255,255,255,0.08)' }}
           whileTap={{ scale: 0.95 }}
@@ -78,27 +89,27 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Content */}
-      <div className="flex-1 flex flex-col items-center justify-center px-8 z-10 relative mt-[-40px]">
+      {/* Content — scroll-safe so the chat bar below always stays pinned & visible */}
+      <div className="flex-1 min-h-0 overflow-y-auto scrollbar-hide flex flex-col items-center justify-center px-8 z-10 relative">
         <motion.div
           initial={{ opacity: 0, y: -20 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
-          className="text-center mb-10"
+          className="text-center mb-3 shrink-0"
         >
-          <h2 className="text-[36px] font-semibold tracking-tight text-[#F7F9FC] mb-2 drop-shadow-sm">{greeting()}</h2>
-          <p className="text-[20px] text-[#98A4B8] font-light">How can I help you today?</p>
+          <h2 className="text-[28px] font-semibold tracking-tight text-[#F7F9FC] mb-0.5 drop-shadow-sm">{greeting()}</h2>
+          <p className="text-[16px] text-[#98A4B8] font-light">How can I help you today?</p>
         </motion.div>
 
-        <AIOrb state={voice} onClick={() => void toggleVoice()} />
+        <AIOrb state={voice} onClick={() => void toggleVoice()} size={orbSize} />
         {conversation && (
-          <div className="mt-4 flex items-center gap-2 text-[12.5px] text-[#00D4FF]/80">
+          <div className="mt-3 flex items-center gap-2 text-[12.5px] text-[#00D4FF]/80 shrink-0">
             <span className="w-1.5 h-1.5 rounded-full bg-[#00D4FF] animate-pulse" />
             Conversation mode — the mic re-arms after each reply
           </div>
         )}
 
-        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.8, duration: 1 }} className="mt-10 text-center min-h-[64px]">
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.8, duration: 1 }} className="mt-3 text-center min-h-[40px] shrink-0">
           <AnimatePresence mode="wait">
             {voice !== 'idle' || busy ? (
               <motion.div key="status" initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }}>

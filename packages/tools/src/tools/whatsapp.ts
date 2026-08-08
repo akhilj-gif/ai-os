@@ -24,6 +24,7 @@ async function bridge<T>(path: string, init?: RequestInit): Promise<T> {
   } catch (err) {
     throw new Error(
       `whatsapp bridge unreachable at ${bridgeUrl()} (${err instanceof Error ? err.message : 'network error'}) — start it: pnpm --filter @ai-os/whatsapp-bridge start (or "mock")`,
+      { cause: err },
     );
   }
   if (!res.ok) throw new Error(`whatsapp bridge ${res.status}: ${(await res.text()).slice(0, 200)}`);

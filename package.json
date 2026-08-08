@@ -2,7 +2,7 @@
   "name": "ai-os",
   "private": true,
   "version": "0.0.1",
-  "description": "Personal AI Operating System \u2014 see docs/BLUEPRINT.md",
+  "description": "Personal AI Operating System — see docs/BLUEPRINT.md",
   "type": "module",
   "scripts": {
     "dev": "pnpm --parallel --filter @ai-os/api --filter @ai-os/web dev",
@@ -14,14 +14,22 @@
     "eval": "tsx evals/runner.ts",
     "reflect": "tsx packages/memory/src/reflect-job.ts",
     "hello": "tsx packages/kernel/src/hello.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx scripts/test.ts",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^26.1.0",
     "@types/pg": "^8.20.0",
+    "eslint": "^10.8.0",
     "pm2": "^7.0.3",
+    "prettier": "^3.9.6",
     "tsx": "^4.23.0",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.65.0"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

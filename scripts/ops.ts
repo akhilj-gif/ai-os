@@ -1,5 +1,21 @@
 // Shared ops helpers for the lifecycle scripts (up / status / down).
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+
+// The API now requires x-aios-token on non-exempt endpoints (e.g. /dashboard).
+// Lifecycle scripts don't load dotenv, so read the token straight from .env.
+const apiToken: string = (() => {
+  if (process.env.AIOS_API_TOKEN) return process.env.AIOS_API_TOKEN.trim();
+  try {
+    const line = readFileSync(new URL('../.env', import.meta.url), 'utf8')
+      .split(/\r?\n/)
+      .find((l) => l.startsWith('AIOS_API_TOKEN='));
+    return line ? line.slice('AIOS_API_TOKEN='.length).trim() : '';
+  } catch {
+    return '';
+  }
+})();
+const authHeaders = (): Record<string, string> => (apiToken ? { 'x-aios-token': apiToken } : {});
 
 export const C = {
   green: (s: string) => `\x1b[32m${s}\x1b[0m`,
@@ -46,7 +62,7 @@ export async function pgReady(): Promise<boolean> {
 
 export async function httpJson(url: string, timeoutMs = 4_000): Promise<{ ok: boolean; body: unknown }> {
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: authHeaders() });
     const body = await res.json().catch(() => null);
     return { ok: res.ok, body };
   } catch {
@@ -56,7 +72,7 @@ export async function httpJson(url: string, timeoutMs = 4_000): Promise<{ ok: bo
 
 export async function httpUp(url: string, timeoutMs = 4_000): Promise<boolean> {
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: authHeaders() });
     return res.status > 0;
   } catch {
     return false;

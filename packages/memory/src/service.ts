@@ -4,7 +4,7 @@
 import type pg from 'pg';
 import { embedOne } from '@ai-os/model-router';
 
-export type MemoryType = 'episodic' | 'semantic' | 'preference' | 'procedural' | 'project' | 'document';
+export type MemoryType = 'episodic' | 'semantic' | 'preference' | 'procedural' | 'project' | 'document' | 'failure';
 
 export interface MemorySource {
   task_id?: string;
@@ -42,6 +42,9 @@ export interface RecallOptions {
   tags?: string[];
   limit?: number;
   minRelevance?: number;
+  /** Project isolation: when true, records tagged `project:<slug>` are excluded
+   *  (global recall). Project-scoped recall instead passes tags: ['project:<slug>']. */
+  excludeProjects?: boolean;
 }
 
 export interface RecalledMemory extends MemoryRecord {
@@ -86,12 +89,51 @@ export class MemoryService {
     const rec = rows[0] as MemoryRecord;
 
     if (m.subject) {
-      // Conflict resolution: point prior active same-(type,subject) records at the new one.
-      await this.pool.query(
-        `UPDATE memory_records SET superseded_by = $1
-         WHERE subject = $2 AND type = $3 AND superseded_by IS NULL AND id <> $1`,
-        [rec.id, m.subject, m.type],
-      );
+      // Contradiction detection (§16): an AUTO-EXTRACTED fact that materially
+      // disagrees with an existing same-subject fact must NOT silently overwrite
+      // it. Flag both (tag `conflict:<subject>`) and leave both active so the
+      // assistant asks the user which is current. Only semantic facts, and only
+      // when the new one wasn't the user explicitly stating it — an explicit
+      // user statement RESOLVES the conflict (falls through to supersede).
+      let flaggedConflict = false;
+      if (m.type === 'semantic' && !m.source.user_stated) {
+        // A subject-keyed fact is single-valued, so a DIFFERENT existing value
+        // for the same subject is a contradiction — even when the two sentences
+        // embed almost identically ("lives in Delhi" vs "lives in Hyderabad"),
+        // which is exactly why cosine is the wrong test here. Compare content:
+        // conflict when neither string contains the other (a substring is just a
+        // rephrase/refinement → supersede, not a conflict).
+        const norm = (s: string): string => s.trim().toLowerCase().replace(/\s+/g, ' ');
+        const nNew = norm(m.content);
+        const existing = await this.pool.query<{ content: string }>(
+          `SELECT content FROM memory_records
+           WHERE subject = $1 AND type = 'semantic' AND superseded_by IS NULL AND id <> $2`,
+          [m.subject, rec.id],
+        );
+        const clashes = existing.rows.some((r) => {
+          const nOld = norm(r.content);
+          return nOld !== nNew && !nOld.includes(nNew) && !nNew.includes(nOld);
+        });
+        if (clashes) {
+          await this.pool.query(
+            `UPDATE memory_records
+             SET tags = array(SELECT DISTINCT unnest(tags || ARRAY[$2]))
+             WHERE subject = $1 AND type = 'semantic' AND superseded_by IS NULL`,
+            [m.subject, `conflict:${m.subject}`],
+          );
+          flaggedConflict = true;
+        }
+      }
+      if (!flaggedConflict) {
+        // Normal conflict resolution: point prior active same-(type,subject)
+        // records at the new one (an explicit user statement lands here too,
+        // resolving any earlier flagged conflict since only the winner survives).
+        await this.pool.query(
+          `UPDATE memory_records SET superseded_by = $1
+           WHERE subject = $2 AND type = $3 AND superseded_by IS NULL AND id <> $1`,
+          [rec.id, m.subject, m.type],
+        );
+      }
     }
     return rec;
   }
@@ -132,6 +174,9 @@ export class MemoryService {
     if (opts.types?.length) params.push(opts.types);
     const tagClause = opts.tags?.length ? `AND tags && $${++p}::text[]` : '';
     if (opts.tags?.length) params.push(opts.tags);
+    // Project isolation: exclude any record carrying a `project:*` tag so one
+    // project's universe never bleeds into global (or another project's) recall.
+    const projectClause = opts.excludeProjects ? `AND NOT EXISTS (SELECT 1 FROM unnest(tags) t WHERE t LIKE 'project:%')` : '';
     const minRelP = `$${++p}`;
     params.push(minRel);
     const limitP = `$${++p}`;
@@ -147,6 +192,7 @@ export class MemoryService {
           AND (expires_at IS NULL OR expires_at > now())
           ${typeClause}
           ${tagClause}
+          ${projectClause}
       )
       SELECT *, (relevance * confidence * recency) AS score
       FROM scored
@@ -189,6 +235,20 @@ export class MemoryService {
       [opts.limit ?? 500],
     );
     return rows as MemoryRecord[];
+  }
+
+  /** Unresolved contradictions (§16): subjects with ≥2 active semantic facts
+   *  flagged `conflict:*`. The assistant surfaces these and asks which is
+   *  current; an explicit user statement (remember with user_stated) resolves. */
+  async getContradictions(): Promise<Array<{ subject: string; options: string[] }>> {
+    const { rows } = await this.pool.query<{ subject: string; options: string[] }>(
+      `SELECT subject, array_agg(content ORDER BY last_confirmed_at DESC) AS options
+       FROM memory_records
+       WHERE superseded_by IS NULL AND type = 'semantic' AND subject IS NOT NULL
+         AND EXISTS (SELECT 1 FROM unnest(tags) t WHERE t LIKE 'conflict:%')
+       GROUP BY subject HAVING count(*) >= 2`,
+    );
+    return rows;
   }
 
   async remove(id: string): Promise<boolean> {

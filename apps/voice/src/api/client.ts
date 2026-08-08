@@ -2,6 +2,12 @@
 // same-origin proxy (/api/* → 127.0.0.1:4000/*) — the kernel sends no CORS
 // headers by design, so the UI must never call :4000 directly.
 
+export interface Attachment {
+  name: string;
+  mime: string;
+  dataUrl: string; // data:<mime>;base64,<...> — read client-side via FileReader
+}
+
 export interface Msg {
   id: string;
   role: 'user' | 'assistant';
@@ -52,6 +58,64 @@ export interface MemoryRecord {
   relevance?: number;
 }
 
+export interface MemoryAnalytics {
+  total: number;
+  superseded: number;
+  byType: Record<string, number>;
+  confidence: { high: number; medium: number; low: number };
+  createdLast7d: number;
+  projects: number;
+  workingMemory: number;
+  contradictions: number;
+  skills: number;
+  knownIssues: number;
+  graph: { nodes: number; edges: number; topNodes: Array<{ name: string; kind: string; mentions: number }> };
+}
+
+export interface Suggestion {
+  text: string;
+  action: string | null;
+}
+
+export interface CognitiveBriefing {
+  generatedAt: string;
+  context: { weekday: string; hour: number };
+  predictions: string[];
+  suggestions: Suggestion[];
+  questions: string[];
+  insights: string[];
+  signals: { episodes: number; failures: number; openTodos: number; contradictions: number; lowConfidence: number; entities: number };
+}
+
+export interface AppNotification {
+  id: string;
+  kind: string;
+  title: string;
+  body: string;
+  read: boolean;
+  created_at: string;
+}
+
+export interface TrustRung {
+  tool: string;
+  trust_class: string;
+  auto_approve: boolean;
+  approvals: number;
+  rejections: number;
+  promotable: boolean;
+}
+
+export interface StandingGoal {
+  id: string;
+  goal: string;
+  status: string;
+  cadence_minutes: number;
+  steps: number;
+  progress: string;
+  last_advanced_at: string | null;
+  created_at: string;
+}
+
 export interface JobRow {
   id: string;
   name: string;
@@ -71,11 +135,11 @@ async function j<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => j<{ ok: boolean; milestone: string }>('/health'),
 
-  chat: (text: string, sessionId: string) =>
+  chat: (text: string, sessionId: string, attachments?: Attachment[]) =>
     j<{ sessionId: string; taskId: string; reply: string }>('/chat', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text, sessionId }),
+      body: JSON.stringify({ text, sessionId, ...(attachments?.length ? { attachments } : {}) }),
     }),
 
   messages: (sessionId: string) =>
@@ -109,6 +173,31 @@ export const api = {
   task: (id: string) => j<TaskDetail>(`/tasks/${id}`),
 
   memory: () => j<{ records: MemoryRecord[] }>('/memory?includeSuperseded=false'),
+  memoryAnalytics: () => j<MemoryAnalytics>('/memory/analytics'),
+
+  cognitionBriefing: () => j<CognitiveBriefing>('/cognition/briefing'),
+  cognitionConsolidate: () => j<{ synthesized: number; insights: string[] }>('/cognition/consolidate', { method: 'POST' }),
+  cognitionAutopilot: () => j<{ mode: string; ran: Array<{ action: string; status: string; text: string }> }>('/cognition/autopilot', { method: 'POST' }),
+
+  standingList: () => j<{ goals: StandingGoal[] }>('/standing'),
+  standingCreate: (goal: string, cadenceMinutes?: number) =>
+    j<{ ok: boolean; id: string }>('/standing', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ goal, cadenceMinutes }) }),
+  standingAdvance: (id: string) => j<{ step: string; status: string }>(`/standing/${id}/advance`, { method: 'POST' }),
+  standingSetStatus: (id: string, status: string) =>
+    j<{ ok: boolean }>(`/standing/${id}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ status }) }),
+
+  trustLadder: () => j<{ ladder: TrustRung[]; threshold: number }>('/trust/ladder'),
+  trustPromote: (tool: string) => j<{ ok?: boolean; error?: string }>('/trust/promote', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tool }) }),
+  trustDemote: (tool: string) => j<{ ok: boolean }>('/trust/demote', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tool }) }),
+
+  governor: () => j<{ used: number; max: number; ok: boolean }>('/governor'),
+
+  notifications: (unreadOnly = false) => j<{ notifications: AppNotification[] }>(`/notifications${unreadOnly ? '?unread=1' : ''}`),
+  markNotificationRead: (id: string) => j<{ ok: boolean }>(`/notifications/${id}/read`, { method: 'POST' }),
+
+  settings: () => j<{ settings: Record<string, string> }>('/settings'),
+  setSetting: (key: string, value: string) =>
+    j<{ ok: boolean }>(`/settings/${key}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ value }) }),
   memorySearch: (q: string) => j<{ records: MemoryRecord[]; mode: string }>(`/memory/search?q=${encodeURIComponent(q)}`),
   memoryDelete: (id: string) => j<unknown>(`/memory/${id}`, { method: 'DELETE' }),
 

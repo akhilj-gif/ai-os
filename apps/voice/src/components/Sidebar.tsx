@@ -3,12 +3,13 @@ import {
   MessageSquarePlus, 
   MessageSquare, 
   CheckSquare, 
-  Database, 
-  Briefcase, 
-  Settings, 
-  ChevronDown, 
+  Database,
+  Briefcase,
+  Settings,
+  ChevronDown,
   Activity,
-  AudioLines
+  AudioLines,
+  Brain
 } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { useState } from 'react';
@@ -39,6 +40,7 @@ export default function Sidebar() {
       {/* Nav */}
       <nav className="flex flex-col gap-1.5 px-3 flex-1 mt-6">
          <NavItem icon={<Home size={20} />} label="Home" to="/" />
+         <NavItem icon={<Brain size={20} />} label="Mind" to="/mind" />
          <div className="h-4" /> {/* Spacer */}
          <NavItem icon={<MessageSquarePlus size={20} />} label="New Chat" to="/new" />
          <NavItem icon={<MessageSquare size={20} />} label="Chats" to="/chats" />

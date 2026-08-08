@@ -17,6 +17,10 @@ import { MemoryService } from '@ai-os/memory';
 export interface FailureSignal {
   failedTasks: Array<{ goal: string; error: string }>;
   totalFailed: number;
+  /** Memory OS signals (Tier 4): the OS's own distilled failure lessons and
+   *  generalized insights — richer learning fuel than raw trace errors alone. */
+  failureMemories: string[];
+  insights: string[];
 }
 
 export interface Playbook {
@@ -72,26 +76,43 @@ export async function gatherFailureSignals(pool: pg.Pool, limit = 15): Promise<F
     [limit * 4], // over-fetch, then drop infra noise below
   );
   const behavioral = rows.filter((r) => !INFRA_ERR.test(r.error ?? '')).slice(0, limit);
+  // Memory OS fuel: the OS's own distilled failure lessons + generalized insights.
+  const fm = await pool.query<{ content: string }>(
+    `SELECT content FROM memory_records WHERE type='failure' AND superseded_by IS NULL ORDER BY last_confirmed_at DESC LIMIT 12`,
+  );
+  const ins = await pool.query<{ content: string }>(
+    `SELECT content FROM memory_records WHERE 'insight' = ANY(tags) AND superseded_by IS NULL ORDER BY last_confirmed_at DESC LIMIT 8`,
+  );
   return {
     failedTasks: behavioral.map((r) => ({ goal: r.goal, error: r.error ?? '(no recorded error)' })),
     // "totalFailed" reflects the learnable population, not quota casualties.
     totalFailed: rows.filter((r) => !INFRA_ERR.test(r.error ?? '')).length,
+    failureMemories: fm.rows.map((r) => r.content).filter((c) => !INFRA_ERR.test(c)),
+    insights: ins.rows.map((r) => r.content),
   };
 }
 
-const PROPOSE_SYSTEM = `You are the reflection engine of a personal AI OS. Given recent FAILED tasks, propose small, GENERAL procedural "playbooks" that would help the agent avoid the same failure — durable guidance, not a fix for one task.
-Return STRICT JSON: {"candidates":[{"source":"failed-tasks","rationale":"one line: root cause → why this helps","playbook":{"subject":"kebab-case-topic","content":"one or two imperative sentences the agent should follow"}}]}
-Rules: at most 3 candidates; each playbook must be GENERAL (no task-specific ids/names) and ACTIONABLE; no prose outside the JSON; do not call tools.`;
+const PROPOSE_SYSTEM = `You are the reflection engine of a personal AI OS. From recent FAILED tasks, the OS's own distilled FAILURE LESSONS, and its generalized INSIGHTS, propose small, GENERAL procedural "playbooks" that make the agent behave better next time — durable guidance, not a fix for one task.
+Return STRICT JSON: {"candidates":[{"source":"failed-tasks|failure-memory|insight","rationale":"one line: root cause → why this helps","playbook":{"subject":"kebab-case-topic","content":"one or two imperative sentences the agent should follow"}}]}
+Rules: at most 3 candidates; each playbook must be GENERAL (no task-specific ids/names) and ACTIONABLE; prefer turning a recurring failure or a strong insight into a concrete behavior; no prose outside the JSON; do not call tools.`;
 
-/** The default LLM proposer — root-cause analysis over the failure signals. */
+/** The default LLM proposer — root-cause analysis over failures + Memory OS signals. */
 export function llmProposer(pool: pg.Pool, ids: { taskId: string; traceId: string }): Proposer {
   return async (signals) => {
-    if (signals.failedTasks.length === 0) return [];
-    const evidence = signals.failedTasks.map((t, i) => `${i + 1}. GOAL: ${t.goal}\n   ERROR: ${t.error.slice(0, 300)}`).join('\n');
+    // Propose if there's ANY learnable signal — failed tasks, distilled failure
+    // lessons, or insights (the OS can improve from what it learned, not only crashes).
+    if (signals.failedTasks.length === 0 && signals.failureMemories.length === 0 && signals.insights.length === 0) return [];
+    const evidence = [
+      signals.failedTasks.length ? `FAILED TASKS:\n${signals.failedTasks.map((t, i) => `${i + 1}. GOAL: ${t.goal}\n   ERROR: ${t.error.slice(0, 300)}`).join('\n')}` : '',
+      signals.failureMemories.length ? `DISTILLED FAILURE LESSONS:\n${signals.failureMemories.map((c) => `- ${c}`).join('\n')}` : '',
+      signals.insights.length ? `INSIGHTS:\n${signals.insights.map((c) => `- ${c}`).join('\n')}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
     const resp = await callModel({
       role: 'planning',
       system: PROPOSE_SYSTEM,
-      prompt: `Recent failures (${signals.totalFailed} total):\n${evidence}`,
+      prompt: `Learnable signals (${signals.totalFailed} behavioral failures total):\n${evidence}`,
       maxTokens: 1200,
       traceId: ids.traceId,
       taskId: ids.taskId,

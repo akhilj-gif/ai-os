@@ -102,7 +102,12 @@ export async function makePlan(
 
   const json = res.text.match(/\{[\s\S]*\}/)?.[0];
   if (!json) throw new Error(`planner returned no JSON: ${res.text.slice(0, 200)}`);
-  const parsed = JSON.parse(json) as Plan;
+  let parsed: Plan;
+  try {
+    parsed = JSON.parse(json) as Plan;
+  } catch {
+    throw new Error(`planner returned invalid JSON: ${json.slice(0, 200)}`);
+  }
 
   // Validation + fail-closed backstop: any tool step whose tool needs approval
   // must be gated. If the planner forgot, inject an approval step before it.

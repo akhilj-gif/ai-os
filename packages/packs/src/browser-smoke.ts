@@ -51,7 +51,11 @@ console.log('\n— act records to the mock log (no real web change) —');
 console.log('\n— pack manifest trust posture —');
 {
   const pack = PACKS.browser;
-  check('browser pack registered with all five tools', !!pack && pack.tools.length === 5);
+  const expectedTools = ['browser_navigate', 'browser_read', 'browser_find', 'browser_extract', 'browser_act', 'browser_wait', 'browser_screenshot'];
+  check(
+    'browser pack registers the full tool set',
+    !!pack && expectedTools.every((t) => pack.tools.some((x) => x.name === t)) && pack.tools.length === expectedTools.length,
+  );
   const reads = ['browser_navigate', 'browser_read', 'browser_find', 'browser_extract'];
   check('read family is read + auto', reads.every((t) => { const p = pack!.policies.find((x) => x.tool === t); return p?.trustClass === 'read' && p.autoApprove === true; }));
   const act = pack!.policies.find((p) => p.tool === 'browser_act');

@@ -8,6 +8,8 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@ai-os/memory": "workspace:*",
+    "@ai-os/model-router": "workspace:*",
     "@ai-os/shared": "workspace:*",
     "pg": "^8.22.0"
   }

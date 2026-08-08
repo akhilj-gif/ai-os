@@ -9,8 +9,13 @@
 //   POST /navigate { url }               → { url, title }
 //   POST /read     { }                   → { url, title, text }   (untrusted)
 //   POST /find     { query }             → { matches: ElementRef[] }
-//   POST /act      { action, ref, text } → { ok, url, title, ... }
+//   POST /act      { action, ref, text } → { ok, url, title, elements }
 //   POST /extract  { instruction }       → { url, instruction, text } (untrusted)
+//   POST /wait     { selector?, text?, state?, timeoutMs? } → { ok, url, title, elements }
+//   POST /screenshot { }                 → { url, title, dataUrl } (jpeg, untrusted)
+//
+// navigate/read/act/wait also return `elements: ElementRef[]` — a fresh snapshot
+// of the CURRENT page's interactive controls, so refs are never stale.
 //
 // The bridge enforces NO policy — the OS trust gate does (browser_act is
 // irreversible + approval-gated; page content is untrusted §8.3). Binds

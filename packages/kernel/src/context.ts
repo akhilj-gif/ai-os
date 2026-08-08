@@ -4,7 +4,7 @@
 // many-iteration task stays under budget. It stores nothing (that's the Memory
 // Service); it only ranks and assembles.
 import type pg from 'pg';
-import { MemoryService, type MemoryType } from '@ai-os/memory';
+import { MemoryService, graphForText, type MemoryType } from '@ai-os/memory';
 import type { ChatMessage } from '@ai-os/model-router';
 
 const approxTokens = (s: string): number => Math.ceil(s.length / 4);
@@ -18,17 +18,24 @@ export async function assembleMemoryContext(
   const budget = opts.budgetTokens ?? 1200;
   const memory = new MemoryService(pool);
 
-  const [prefs, recalled] = await Promise.all([
+  const [prefs, recalled, relations, contradictions] = await Promise.all([
     memory.getPreferences(),
     memory.recall({
       query: opts.goal,
-      types: ['semantic', 'procedural', 'project', 'episodic', 'document'] as MemoryType[],
+      types: ['semantic', 'procedural', 'project', 'episodic', 'document', 'failure'] as MemoryType[],
       tags: opts.tags,
       limit: 10,
+      // Global task context never pulls another project's memories (Phase 2
+      // isolation); project-scoped recall is explicit via the project pack.
+      excludeProjects: !opts.tags?.some((t) => t.startsWith('project:')),
     }),
+    // Knowledge-graph connections for any entity named in the goal (Phase 3).
+    graphForText(pool, opts.goal, 6).catch(() => []),
+    // Unresolved contradictions to confirm with the user (Phase 4, §16).
+    memory.getContradictions().catch(() => []),
   ]);
 
-  if (prefs.length === 0 && recalled.length === 0) return '';
+  if (prefs.length === 0 && recalled.length === 0 && relations.length === 0 && contradictions.length === 0) return '';
 
   const lines: string[] = [
     '## Memory — what you already know about this user',
@@ -47,7 +54,22 @@ export async function assembleMemoryContext(
   }
 
   if (recalled.length) {
-    const relevant = recalled.filter((r) => r.type !== 'preference');
+    // Failures get their own warning block — the whole point of failure memory
+    // is that the model treats a past mistake as something to actively avoid,
+    // not as one more neutral "fact".
+    const failures = recalled.filter((r) => r.type === 'failure');
+    const relevant = recalled.filter((r) => r.type !== 'preference' && r.type !== 'failure');
+
+    if (failures.length) {
+      lines.push('', '⚠ Past failures on similar tasks — do NOT repeat these; apply the prevention:');
+      for (const f of failures) {
+        const line = `- ${f.content}`;
+        if (used + approxTokens(line) > budget) break;
+        lines.push(line);
+        used += approxTokens(line);
+      }
+    }
+
     if (relevant.length) {
       lines.push('', 'Relevant to this task:');
       for (const r of relevant) {
@@ -56,6 +78,26 @@ export async function assembleMemoryContext(
         lines.push(line);
         used += approxTokens(line);
       }
+    }
+  }
+
+  if (contradictions.length) {
+    lines.push('', '⚠ Conflicting facts — if relevant, ask the user which is current (do not assume):');
+    for (const c of contradictions) {
+      const line = `- ${c.subject}: ${c.options.map((o) => `"${o}"`).join(' vs ')}`;
+      if (used + approxTokens(line) > budget) break;
+      lines.push(line);
+      used += approxTokens(line);
+    }
+  }
+
+  if (relations.length) {
+    lines.push('', 'Known connections (knowledge graph):');
+    for (const r of relations) {
+      const line = `- ${r.subject} → ${r.rel} → ${r.object}`;
+      if (used + approxTokens(line) > budget) break;
+      lines.push(line);
+      used += approxTokens(line);
     }
   }
 
