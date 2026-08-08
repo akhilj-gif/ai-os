@@ -3,19 +3,23 @@
 // services to pm2 (auto-restart on crash). Idempotent: safe to run repeatedly.
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { C, run, runLive, dockerDaemonUp, pgReady, httpUp, waitFor, API, BRIDGE, WEB } from './ops.js';
+import { C, run, runLive, dockerDaemonUp, dockerDesktopStart, pgReady, httpUp, waitFor, API, BRIDGE, WEB } from './ops.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 console.log(C.bold('\n▶ ai-os up\n'));
 
-// 1. Docker daemon must be running. (Option 2 does NOT auto-start Docker — that's
-//    the boot-on-login upgrade; here we give a clear instruction if it's down.)
+// 1. Docker daemon must be running. Auto-start Docker Desktop if it's down (so a
+//    boot-on-login / post-sleep recovery is hands-free); only bail if it never
+//    comes up.
 if (!(await dockerDaemonUp())) {
-  console.log(C.red('✗ Docker daemon is not responding.'));
-  console.log('  Start Docker Desktop, then re-run `pnpm up`.');
-  console.log(C.dim('  (If it is open but wedged: quit it, rename %LOCALAPPDATA%\\Docker\\run, relaunch.)'));
-  process.exit(1);
+  console.log(C.yellow('• Docker daemon down — launching Docker Desktop…'));
+  if (!(await dockerDesktopStart())) {
+    console.log(C.red('✗ Docker daemon did not come up.'));
+    console.log('  Start Docker Desktop manually, then re-run `pnpm os:up`.');
+    console.log(C.dim('  (If it is open but wedged: quit it, rename %LOCALAPPDATA%\\Docker\\run, relaunch.)'));
+    process.exit(1);
+  }
 }
 console.log(C.green('✓ Docker daemon up'));
 

@@ -108,3 +108,22 @@ export async function waitFor(label: string, check: () => Promise<boolean>, time
 export const BRIDGE = 'http://127.0.0.1:4100';
 export const API = 'http://127.0.0.1:4000';
 export const WEB = 'http://127.0.0.1:3000';
+
+/** If the Docker daemon is down, launch Docker Desktop and wait for it to come
+ *  up. Best-effort — returns true once the daemon responds, false on timeout.
+ *  The boot-on-login / supervisor path (os:up used to just bail here). */
+export async function dockerDesktopStart(timeoutMs = 150_000): Promise<boolean> {
+  if (await dockerDaemonUp()) return true;
+  const exe = process.env.AIOS_DOCKER_DESKTOP ?? 'C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe';
+  try {
+    spawn(exe, [], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+  } catch {
+    /* launch failed — still wait below in case it is already starting */
+  }
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await sleep(5_000);
+    if (await dockerDaemonUp()) return true;
+  }
+  return false;
+}
