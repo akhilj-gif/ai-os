@@ -17,6 +17,22 @@ const apiToken: string = (() => {
 })();
 const authHeaders = (): Record<string, string> => (apiToken ? { 'x-aios-token': apiToken } : {});
 
+/** The WhatsApp bridge uses its OWN shared secret (x-bridge-token), not the API
+ *  token — sending the wrong one made every supervisor bridge call 401 and
+ *  silently disabled the down-alert path. Read it from .env like the API token. */
+export const bridgeToken: string = (() => {
+  if (process.env.WHATSAPP_BRIDGE_TOKEN) return process.env.WHATSAPP_BRIDGE_TOKEN.trim();
+  try {
+    const line = readFileSync(new URL('../.env', import.meta.url), 'utf8')
+      .split(/\r?\n/)
+      .find((l) => l.startsWith('WHATSAPP_BRIDGE_TOKEN='));
+    return line ? line.slice('WHATSAPP_BRIDGE_TOKEN='.length).trim() : '';
+  } catch {
+    return '';
+  }
+})();
+export const bridgeHeaders = (): Record<string, string> => (bridgeToken ? { 'x-bridge-token': bridgeToken } : {});
+
 export const C = {
   green: (s: string) => `\x1b[32m${s}\x1b[0m`,
   red: (s: string) => `\x1b[31m${s}\x1b[0m`,

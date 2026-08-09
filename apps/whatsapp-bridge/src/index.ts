@@ -305,7 +305,11 @@ app.get('/health', async () => {
     const lid = pnToLid.get(pn);
     if (lid) selfChats.push(lid);
   }
-  return { ok: true, paired, needsRepair, me, selfChats, impl: 'baileys' };
+  // `ok` must mean READY, not merely "the process is listening". Reporting
+  // ok:true while paired:false is how an unpaired bridge stayed invisible for
+  // days (2026-08-09: 14k reconnect lines, every monitor green). Callers that
+  // only want liveness can look at the HTTP status.
+  return { ok: paired && !needsRepair, paired, needsRepair, me, selfChats, impl: 'baileys' };
 });
 app.get('/chats', async (req) => {
   const { limit: limitRaw, search } = req.query as { limit?: string; search?: string };

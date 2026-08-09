@@ -10,7 +10,7 @@
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { appendFileSync, mkdirSync, existsSync, statSync, writeFileSync, rmSync } from 'node:fs';
-import { API, BRIDGE, C, dockerDaemonUp, httpJson, httpUp, pm2List, run, sleep } from './ops.js';
+import { API, BRIDGE, C, bridgeHeaders, dockerDaemonUp, httpUp, pm2List, run, sleep } from './ops.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const APPS = ['ai-os-api', 'ai-os-bridge', 'ai-os-web', 'ai-os-browser', 'ai-os-voice'];
@@ -42,16 +42,35 @@ async function healthy(): Promise<boolean> {
   return APPS.every((a) => states[a] === 'online');
 }
 
+interface BridgeHealth {
+  ok?: boolean;
+  paired?: boolean;
+  needsRepair?: boolean;
+  selfChats?: string[];
+}
+
+/** Read the bridge's own health with ITS token (not the API token). */
+async function bridgeHealth(): Promise<BridgeHealth | null> {
+  try {
+    const res = await fetch(`${BRIDGE}/health`, { headers: bridgeHeaders(), signal: AbortSignal.timeout(6_000) });
+    if (!res.ok) return null;
+    return (await res.json()) as BridgeHealth;
+  } catch {
+    return null;
+  }
+}
+
 /** Best-effort WhatsApp self-chat alert. The bridge is pm2-supervised
- *  independently of the api, so it may be alive even when the api is down. */
+ *  independently of the api, so it may be alive even when the api is down.
+ *  (Previously this authenticated with the WRONG token and read an env var the
+ *  supervisor never loads, so it silently never sent anything.) */
 async function alert(text: string): Promise<void> {
   try {
-    const h = (await httpJson(`${BRIDGE}/health`)).body as { selfChats?: string[] } | null;
-    const to = h?.selfChats?.[0];
-    if (!to) return;
+    const to = (await bridgeHealth())?.selfChats?.[0];
+    if (!to) return; // unpaired — nothing we can deliver to; the log is the record
     await fetch(`${BRIDGE}/send`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', ...(process.env.WHATSAPP_BRIDGE_TOKEN ? { 'x-bridge-token': process.env.WHATSAPP_BRIDGE_TOKEN } : {}) },
+      headers: { 'content-type': 'application/json', ...bridgeHeaders() },
       body: JSON.stringify({ to, text }),
       signal: AbortSignal.timeout(8_000),
     });
@@ -60,7 +79,21 @@ async function alert(text: string): Promise<void> {
   }
 }
 
+/** Things a restart CANNOT fix — they need the human. Report them loudly every
+ *  pass instead of silently looping os:up (an expired WhatsApp session needs a
+ *  QR re-scan; restarting just churns). This is the gap that let the bridge sit
+ *  unpaired for days while every monitor said "healthy". */
+async function reportNeedsHuman(): Promise<void> {
+  const h = await bridgeHealth();
+  if (h && h.paired === false) {
+    log(C.yellow('⚠ WhatsApp bridge is UNPAIRED — re-scan the QR at http://127.0.0.1:4100/qr (restarting cannot fix this)'));
+  } else if (h?.needsRepair) {
+    log(C.yellow('⚠ WhatsApp bridge needs repair — open http://127.0.0.1:4100/qr'));
+  }
+}
+
 async function tick(): Promise<boolean> {
+  await reportNeedsHuman();
   if (await healthy()) {
     log(C.green('✓ healthy'));
     return true;
