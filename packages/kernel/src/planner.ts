@@ -3,6 +3,7 @@
 // is a DAG of typed steps the graph executor (graph.ts) then drives.
 import type pg from 'pg';
 import { callModel } from '@ai-os/model-router';
+import { parseModelJson } from '@ai-os/shared';
 import { buildRegistry, type ToolRegistry } from '@ai-os/tools';
 import { classifyTool, requiresApproval, type TrustPolicy } from '@ai-os/trust';
 import { assembleMemoryContext } from './context.js';
@@ -100,14 +101,8 @@ export async function makePlan(
     name: 'planner',
   });
 
-  const json = res.text.match(/\{[\s\S]*\}/)?.[0];
-  if (!json) throw new Error(`planner returned no JSON: ${res.text.slice(0, 200)}`);
-  let parsed: Plan;
-  try {
-    parsed = JSON.parse(json) as Plan;
-  } catch {
-    throw new Error(`planner returned invalid JSON: ${json.slice(0, 200)}`);
-  }
+  const parsed = parseModelJson<Plan>(res.text);
+  if (!parsed) throw new Error(`planner returned no parseable JSON: ${res.text.slice(0, 200)}`);
 
   // Validation + fail-closed backstop: any tool step whose tool needs approval
   // must be gated. If the planner forgot, inject an approval step before it.

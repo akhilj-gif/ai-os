@@ -5,6 +5,7 @@
 import { spawnSync } from 'node:child_process';
 
 const SMOKES = [
+  'packages/shared/src/json-smoke.ts', // model-output JSON extractor (used by 7 capture/plan paths)
   'packages/trust/src/smoke.ts', // trust gate + §8.3 injection defense (security-critical)
   'packages/packs/src/terminal-smoke.ts', // terminal allowlist (security-critical)
   'packages/packs/src/files-smoke.ts',

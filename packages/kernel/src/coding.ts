@@ -8,7 +8,7 @@ import type pg from 'pg';
 import { spawn } from 'node:child_process';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { dirname, resolve, sep } from 'node:path';
-import { newTraceId, TraceStore } from '@ai-os/shared';
+import { newTraceId, parseModelJson, TraceStore } from '@ai-os/shared';
 import { callModel } from '@ai-os/model-router';
 import { dockerSandbox } from '@ai-os/tools';
 
@@ -63,9 +63,8 @@ Only include files you change or add. Return COMPLETE file contents, not diffs. 
       taskId: ids.taskId,
       name: 'coding-propose',
     });
-    const json = resp.text.match(/\{[\s\S]*\}/)?.[0];
-    if (!json) throw new Error('proposer returned no JSON');
-    const parsed = JSON.parse(json) as ProposedFix;
+    const parsed = parseModelJson<ProposedFix>(resp.text);
+    if (!parsed) throw new Error('proposer returned no parseable JSON');
     return { rationale: parsed.rationale ?? '', files: parsed.files ?? [] };
   };
 }

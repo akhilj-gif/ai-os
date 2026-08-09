@@ -11,6 +11,7 @@
 // must never affect the task or its reply.
 import type pg from 'pg';
 import { callModel } from '@ai-os/model-router';
+import { parseModelJson } from '@ai-os/shared';
 import { MemoryService } from './service.js';
 
 const SYSTEM = `You distill a just-finished task of a personal AI OS into durable experiential memory.
@@ -30,7 +31,18 @@ interface Distilled {
   episode?: string;
   lesson?: string;
   failure?: { cause?: string; prevention?: string } | null;
-  procedure?: { subject?: string; steps?: string } | null;
+  // `steps` is asked for as "numbered steps", so models legitimately return
+  // EITHER a string or a JSON array of steps — accept both (a bare `.trim()`
+  // here used to throw "steps?.trim is not a function" and silently lose the
+  // skill, live-confirmed in api.err.log).
+  procedure?: { subject?: string; steps?: string | string[] } | null;
+}
+
+/** Model-output text that may arrive as a string, an array of lines, or junk. */
+function asText(v: unknown): string {
+  if (typeof v === 'string') return v.trim();
+  if (Array.isArray(v)) return v.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join('\n').trim();
+  return '';
 }
 
 /** Record experiential memory for a finished task. Returns how many memories it
@@ -103,8 +115,7 @@ export async function recordExperience(pool: pg.Pool, opts: { taskId: string; re
       taskId: opts.taskId,
       name: 'memory-experience',
     });
-    const json = res.text.match(/\{[\s\S]*\}/)?.[0];
-    if (json) d = JSON.parse(json) as Distilled;
+    d = parseModelJson<Distilled>(res.text) ?? d;
   } catch (err) {
     console.warn('[memory] experience distill failed (using baseline):', err instanceof Error ? err.message : err);
   }
@@ -134,12 +145,14 @@ export async function recordExperience(pool: pg.Pool, opts: { taskId: string; re
   // the prior version (it sharpens over time instead of duplicating). Recall
   // already surfaces `procedural` on similar tasks — next time the OS starts
   // from the known workflow.
-  if (!failed && Number(toolCount) >= 2 && d.procedure?.subject?.trim() && d.procedure?.steps?.trim()) {
-    const subject = d.procedure.subject.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48);
+  const procSubject = asText(d.procedure?.subject);
+  const procSteps = asText(d.procedure?.steps);
+  if (!failed && Number(toolCount) >= 2 && procSubject && procSteps) {
+    const subject = procSubject.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48);
     if (subject) {
       await memory.remember({
         type: 'procedural',
-        content: `How to ${subject.replace(/-/g, ' ')}: ${d.procedure.steps.trim()}`,
+        content: `How to ${subject.replace(/-/g, ' ')}: ${procSteps}`,
         subject: `skill:${subject}`,
         confidence: 0.75,
         source: { task_id: opts.taskId },

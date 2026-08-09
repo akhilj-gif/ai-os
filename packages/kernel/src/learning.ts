@@ -10,7 +10,7 @@
 import type pg from 'pg';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { newTraceId, TraceStore } from '@ai-os/shared';
+import { newTraceId, parseModelJson, TraceStore } from '@ai-os/shared';
 import { callModel } from '@ai-os/model-router';
 import { MemoryService } from '@ai-os/memory';
 
@@ -118,9 +118,8 @@ export function llmProposer(pool: pg.Pool, ids: { taskId: string; traceId: strin
       taskId: ids.taskId,
       name: 'learning-propose',
     });
-    const json = resp.text.match(/\{[\s\S]*\}/)?.[0];
-    if (!json) return [];
-    const parsed = JSON.parse(json) as { candidates?: ImprovementCandidate[] };
+    const parsed = parseModelJson<{ candidates?: ImprovementCandidate[] }>(resp.text);
+    if (!parsed) return [];
     return (parsed.candidates ?? []).filter((c) => c.playbook?.subject && c.playbook?.content);
   };
 }

@@ -3,6 +3,7 @@
 // an extraction failure must never break the task.
 import type pg from 'pg';
 import { callModel } from '@ai-os/model-router';
+import { parseModelJson } from '@ai-os/shared';
 import { MemoryService, type MemoryType } from './service.js';
 
 interface Extracted {
@@ -39,9 +40,8 @@ export async function extractAndStore(
       taskId: opts.taskId,
       name: 'memory-extract',
     });
-    const json = res.text.match(/\{[\s\S]*\}/)?.[0];
-    if (!json) return 0;
-    const parsed = JSON.parse(json) as { memories?: Extracted[] };
+    const parsed = parseModelJson<{ memories?: Extracted[] }>(res.text);
+    if (!parsed) return 0;
     const items = (parsed.memories ?? []).filter((m) => m.content && ['preference', 'semantic', 'project'].includes(m.type));
     let stored = 0;
     for (const item of items) {

@@ -9,6 +9,7 @@
 // empty, never throw.
 import type pg from 'pg';
 import { callModel } from '@ai-os/model-router';
+import { parseModelJson } from '@ai-os/shared';
 import { MemoryService } from './service.js';
 import { graphStats } from './graph.js';
 
@@ -30,13 +31,9 @@ function parseJsonObject<T>(text: string): T | null {
   let t = text.trim();
   const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fence) t = fence[1]!.trim();
-  const m = t.match(/\{[\s\S]*\}/);
-  if (!m) return null;
-  try {
-    return JSON.parse(m[0]) as T;
-  } catch {
-    return null;
-  }
+  // Shared extractor: balanced-object scan + truncation repair (a cut-off
+  // "thinking model" response used to lose the whole briefing).
+  return parseModelJson<T>(t);
 }
 
 export async function consolidateInsights(pool: pg.Pool, opts: { traceId?: string } = {}): Promise<{ synthesized: number; insights: string[] }> {

@@ -4,6 +4,7 @@
 // Best-effort + fire-and-forget, like the other capture paths: never blocks a task.
 import type pg from 'pg';
 import { callModel } from '@ai-os/model-router';
+import { parseModelJson } from '@ai-os/shared';
 
 const KINDS = ['person', 'project', 'tool', 'file', 'org', 'concept', 'event', 'other'];
 
@@ -46,14 +47,17 @@ export async function updateKnowledgeGraph(
       role: 'routing',
       system: SYSTEM,
       prompt: `USER:\n${opts.userText.slice(0, 900)}\n\nASSISTANT:\n${opts.assistantText.slice(0, 900)}`,
-      maxTokens: 400,
+      // 400 truncated the entity/relation array mid-element on real
+      // conversations (live: "Expected ',' or ']' … at position 1147"), which
+      // lost the whole graph update. parseModelJson also salvages a truncated
+      // response, so this is belt AND braces.
+      maxTokens: 1200,
       traceId: opts.traceId,
       taskId: opts.taskId,
       name: 'kg-extract',
     });
-    const json = res.text.match(/\{[\s\S]*\}/)?.[0];
-    if (!json) return { nodes: 0, edges: 0 };
-    const g = JSON.parse(json) as Graph;
+    const g = parseModelJson<Graph>(res.text);
+    if (!g) return { nodes: 0, edges: 0 };
 
     const ids = new Map<string, string>(); // norm(name) → node id
     for (const e of g.entities ?? []) {
