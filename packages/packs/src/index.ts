@@ -83,7 +83,7 @@ export {
   type StageResult,
   type StagedPackInfo,
 } from './dynamic.js';
-export { forgePack, FORGE_GUIDE, type ForgeResult } from './forge.js';
+export { forgePack, FORGE_GUIDE, type ForgeResult, type ForgeEvent } from './forge.js';
 
 export interface CapabilityPack {
   name: string;

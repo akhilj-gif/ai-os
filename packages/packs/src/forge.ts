@@ -48,6 +48,15 @@ export interface ForgeResult extends StageResult {
   source: string;
 }
 
+/** Progress of a forge run, so a caller can SHOW the loop instead of blocking on
+ *  it: generate → verify → (rejected → repair) → staged. The UI streams these. */
+export type ForgeEvent =
+  | { phase: 'generating'; round: number; maxRounds: number }
+  | { phase: 'generated'; round: number; model: string; chars: number; source: string }
+  | { phase: 'verifying'; round: number }
+  | { phase: 'rejected'; round: number; reason: string }
+  | { phase: 'repairing'; round: number };
+
 /** Extract the fenced code block (or fall back to the raw text). */
 function extractCode(text: string): string {
   const m = text.match(/```(?:ts|typescript|js|javascript)?\s*\n([\s\S]*?)```/);
@@ -58,11 +67,19 @@ function extractCode(text: string): string {
  *  Throws with the full failure list if the last round still fails. */
 export async function forgePack(
   request: string,
-  opts: { traceId: string; taskId?: string; staticPackNames: string[] },
+  opts: { traceId: string; taskId?: string; staticPackNames: string[]; onEvent?: (e: ForgeEvent) => void },
 ): Promise<ForgeResult> {
+  const emit = (e: ForgeEvent): void => {
+    try {
+      opts.onEvent?.(e);
+    } catch {
+      /* a broken listener must never fail the forge */
+    }
+  };
   let feedback = '';
   let lastErr = '';
   for (let round = 1; round <= MAX_ROUNDS; round++) {
+    emit({ phase: 'generating', round, maxRounds: MAX_ROUNDS });
     const res = await callModel({
       role: 'planning', // top tier — pack authorship is the hardest codegen we do
       traceId: opts.traceId,
@@ -75,12 +92,16 @@ export async function forgePack(
         (feedback ? `\nYour previous attempt was REJECTED by the verifier. Fix ALL of these and output the corrected full module:\n${feedback}` : ''),
     });
     const source = extractCode(res.text);
+    emit({ phase: 'generated', round, model: res.model, chars: source.length, source });
+    emit({ phase: 'verifying', round });
     try {
       const staged = await stagePack(source, opts.staticPackNames);
       return { ...staged, rounds: round, source };
     } catch (err) {
       lastErr = err instanceof Error ? err.message : String(err);
       feedback = lastErr;
+      emit({ phase: 'rejected', round, reason: lastErr.slice(0, 600) });
+      if (round < MAX_ROUNDS) emit({ phase: 'repairing', round: round + 1 });
     }
   }
   throw new Error(`forge failed after ${MAX_ROUNDS} rounds — last verifier output:\n${lastErr}`);

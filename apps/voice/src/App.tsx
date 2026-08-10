@@ -9,6 +9,7 @@ import { AIOSProvider } from './state/useAIOS';
 import Home from './pages/Home';
 import Mind from './pages/Mind';
 import Nexus from './pages/Nexus';
+import Forge from './pages/Forge';
 import NewChat from './pages/NewChat';
 import Chats from './pages/Chats';
 import Tasks from './pages/Tasks';
@@ -19,7 +20,7 @@ import Settings from './pages/Settings';
 function Layout() {
   const location = useLocation();
   // Hide the right panel on specific full-width pages
-  const hideRightPanelPaths = ['/settings', '/memory', '/mind', '/nexus', '/new', '/chats'];
+  const hideRightPanelPaths = ['/settings', '/memory', '/mind', '/nexus', '/forge', '/new', '/chats'];
   const showRightPanel = !hideRightPanelPaths.includes(location.pathname);
 
   return (
@@ -33,6 +34,7 @@ function Layout() {
             <Route path="/" element={<Home />} />
             <Route path="/mind" element={<Mind />} />
             <Route path="/nexus" element={<Nexus />} />
+            <Route path="/forge" element={<Forge />} />
             <Route path="/new" element={<NewChat />} />
             <Route path="/chats" element={<Chats />} />
             <Route path="/tasks" element={<Tasks />} />

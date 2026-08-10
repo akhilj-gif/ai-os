@@ -1265,6 +1265,66 @@ app.post('/packs/forge', async (req, reply) => {
   }
 });
 
+/** The forge, STREAMED (server-sent events) so the UI can show the loop as it
+ *  happens — draft → verify → rejected → repair → staged — instead of a spinner.
+ *  GET (not POST) because EventSource can only issue GETs; it cannot set headers
+ *  either, which is fine: the UI reaches this through the same-origin proxy that
+ *  injects the API token server-side. */
+app.get('/packs/forge/stream', async (req, reply) => {
+  const { request } = req.query as { request?: string };
+  if (!request?.trim()) return reply.code(400).send({ error: 'request is required' });
+
+  reply.hijack(); // we own the socket from here — Fastify must not also reply
+  reply.raw.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+    'x-accel-buffering': 'no', // never buffer an event stream in a proxy
+  });
+  const send = (e: unknown): void => {
+    try {
+      reply.raw.write(`data: ${JSON.stringify(e)}\n\n`);
+    } catch {
+      /* client went away */
+    }
+  };
+  // Heartbeat: a forge round can think for tens of seconds; comments keep the
+  // connection (and any intermediary) from deciding it is idle.
+  const beat = setInterval(() => {
+    try {
+      reply.raw.write(': ping\n\n');
+    } catch {
+      /* ignore */
+    }
+  }, 15_000);
+
+  try {
+    const res = await forgePack(request.trim(), {
+      traceId: req.traceId,
+      staticPackNames: Object.keys(PACKS),
+      onEvent: send,
+    });
+    send({
+      phase: 'staged',
+      name: res.name,
+      tools: res.toolNames,
+      description: res.description,
+      requires: res.requires,
+      rounds: res.rounds,
+      source: res.source,
+    });
+  } catch (err) {
+    send({ phase: 'failed', error: err instanceof Error ? err.message : String(err) });
+  } finally {
+    clearInterval(beat);
+    try {
+      reply.raw.end();
+    } catch {
+      /* already closed */
+    }
+  }
+});
+
 app.get('/packs/staged', async () => ({ staged: await listStagedPacks(Object.keys(PACKS)) }));
 
 app.post('/packs/staged/:name/install', async (req, reply) => {

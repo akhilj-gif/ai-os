@@ -209,7 +209,39 @@ export const api = {
   // Nexus (the Mind): the constellation + the live reasoning feed.
   mindGraph: () => j<MindGraph>('/mind/graph'),
   mindLive: (taskId?: string) => j<MindLive>(`/mind/live${taskId ? `?taskId=${encodeURIComponent(taskId)}` : ''}`),
+
+  // Pack Forge: the OS writes its own tools. Staged packs are INERT until installed.
+  packsStaged: () => j<{ staged: Array<{ name: string; tools?: string[]; description?: string }> }>('/packs/staged'),
+  packInstallStaged: (name: string) =>
+    j<{ installed: string; tools: string[] }>(`/packs/staged/${encodeURIComponent(name)}/install`, { method: 'POST' }),
+  /** Stream a forge run. Returns a cancel function. */
+  forgeStream: (request: string, onEvent: (e: ForgeEvent) => void): (() => void) => {
+    const es = new EventSource(`/api/packs/forge/stream?request=${encodeURIComponent(request)}`);
+    es.onmessage = (m) => {
+      try {
+        const e = JSON.parse(m.data) as ForgeEvent;
+        onEvent(e);
+        if (e.phase === 'staged' || e.phase === 'failed') es.close();
+      } catch {
+        /* ignore a malformed frame */
+      }
+    };
+    es.onerror = () => {
+      es.close();
+      onEvent({ phase: 'failed', error: 'connection to the forge was lost' });
+    };
+    return () => es.close();
+  },
 };
+
+export type ForgeEvent =
+  | { phase: 'generating'; round: number; maxRounds: number }
+  | { phase: 'generated'; round: number; model: string; chars: number; source: string }
+  | { phase: 'verifying'; round: number }
+  | { phase: 'rejected'; round: number; reason: string }
+  | { phase: 'repairing'; round: number }
+  | { phase: 'staged'; name: string; tools: string[]; description: string; requires: string[]; rounds: number; source: string }
+  | { phase: 'failed'; error: string };
 
 export interface MindNode {
   id: string;
