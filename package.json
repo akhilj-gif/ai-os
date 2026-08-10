@@ -11,6 +11,7 @@
     "os:status": "tsx scripts/status.ts",
     "os:logs": "pm2 logs",
     "os:watch": "tsx scripts/supervisor.ts",
+    "os:backup": "tsx scripts/backup.ts",
     "os:install-autostart": "tsx scripts/install-autostart.ts",
     "db:migrate": "tsx infra/migrate.ts",
     "eval": "tsx evals/runner.ts",

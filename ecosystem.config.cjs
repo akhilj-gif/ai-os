@@ -88,6 +88,29 @@ module.exports = {
     },
     {
       ...common,
+      // The self-healing supervisor, in --loop mode. It lives under pm2 rather
+      // than Windows Task Scheduler for two reasons proven the hard way:
+      //  (1) pm2 spawns it DETACHED with no console, so it never flashes a
+      //      cmd/conhost window at the user (Task Scheduler + a .cmd/.vbs shim
+      //      did, every few minutes);
+      //  (2) a Task Scheduler action running wscript reported Last Result 0
+      //      while doing NO work — a false green, the exact bug class this
+      //      supervisor exists to catch.
+      // Honest limitation: it cannot resurrect the pm2 daemon itself, so after a
+      // sleep/reboot that kills pm2, run `pnpm os:up` once. Everything else —
+      // health, needs-human reporting, the daily backup — it handles.
+      name: 'ai-os-supervisor',
+      script: join(root, 'scripts/supervisor.ts'),
+      args: '--loop',
+      interpreter: 'node',
+      interpreter_args: '--import tsx',
+      cwd: root,
+      env: { AIOS_API_TOKEN, BROWSER_BRIDGE_TOKEN, AIOS_SUPERVISOR_POLL_MS: '600000' },
+      out_file: join(root, 'logs/supervisor.log'),
+      error_file: join(root, 'logs/supervisor.err.log'),
+    },
+    {
+      ...common,
       // The voice-first UI (Akhil's design, apps/voice) — Vite dev server on
       // 3001, loopback only; /api proxies to the kernel on 4000.
       name: 'ai-os-voice',

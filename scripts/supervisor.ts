@@ -101,27 +101,68 @@ const STATE = join(root, 'logs', 'supervisor-state.json');
 const MAX_RECOVERIES = 3;
 const WINDOW_MS = 60 * 60_000;
 
-function recentRecoveries(): number[] {
+interface SupervisorState {
+  attempts?: number[];
+  lastBackup?: number;
+}
+function readState(): SupervisorState {
   try {
-    const raw = JSON.parse(readFileSync(STATE, 'utf8')) as { attempts?: number[] };
-    return (raw.attempts ?? []).filter((t) => Date.now() - t < WINDOW_MS);
+    return JSON.parse(readFileSync(STATE, 'utf8')) as SupervisorState;
   } catch {
-    return [];
+    return {};
   }
 }
-function noteRecovery(attempts: number[]): void {
+function writeState(s: SupervisorState): void {
   try {
     mkdirSync(join(root, 'logs'), { recursive: true });
-    writeFileSync(STATE, JSON.stringify({ attempts: [...attempts, Date.now()] }));
+    writeFileSync(STATE, JSON.stringify(s));
   } catch {
     /* best effort */
   }
 }
+function recentRecoveries(): number[] {
+  return (readState().attempts ?? []).filter((t) => Date.now() - t < WINDOW_MS);
+}
+function noteRecovery(attempts: number[]): void {
+  writeState({ ...readState(), attempts: [...attempts, Date.now()] });
+}
+
+/** Daily Postgres backup. The DB holds every memory, the knowledge graph and the
+ *  OAuth tokens — none of it reproducible from the repo. Runs at most once per
+ *  BACKUP_EVERY_MS, silently, and never blocks the health loop. */
+const BACKUP_EVERY_MS = 20 * 3600_000;
+async function backupIfDue(): Promise<void> {
+  const s = readState();
+  if (s.lastBackup && Date.now() - s.lastBackup < BACKUP_EVERY_MS) return;
+  const r = await run('pnpm', ['os:backup'], { cwd: root, timeoutMs: 300_000 });
+  if (r.code === 0) {
+    writeState({ ...readState(), lastBackup: Date.now() });
+    log(C.green('✓ daily backup written'));
+  } else {
+    log(C.red(`✗ backup FAILED: ${r.out.trim().split('\n').slice(-2).join(' ').slice(0, 200)}`));
+  }
+}
+
+/** A watchdog that can silently vanish is worse than none. If the scheduled task
+ *  is gone but the generated launcher is still present (i.e. autostart WAS
+ *  installed on purpose), put the task back. `os:install-autostart --uninstall`
+ *  removes the launcher too, so a deliberate uninstall stays uninstalled. */
+async function assertInstalled(): Promise<void> {
+  if (process.platform !== 'win32' || process.env.AIOS_SUPERVISOR_SELFHEAL === 'off') return;
+  const shim = join(root, 'scripts', 'aios-autostart.vbs');
+  if (!existsSync(shim)) return; // never installed (or intentionally removed) — respect that
+  const q = await run('schtasks', ['/query', '/tn', 'AI-OS-Supervisor'], { timeoutMs: 15_000 });
+  if (q.code === 0) return;
+  log(C.yellow('⚠ the AI-OS-Supervisor scheduled task is missing — reinstalling it'));
+  await run('pnpm', ['os:install-autostart'], { cwd: root, timeoutMs: 60_000 });
+}
 
 async function tick(): Promise<boolean> {
+  await assertInstalled();
   await reportNeedsHuman();
   if (await healthy()) {
     log(C.green('✓ healthy'));
+    await backupIfDue(); // only back up a healthy stack — never a half-broken one
     return true;
   }
   if (recoveryLocked()) {

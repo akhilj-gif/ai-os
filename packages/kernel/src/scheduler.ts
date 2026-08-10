@@ -53,6 +53,7 @@ const ZOMBIE_MS = 30 * 60_000; // running longer than this → process died mid-
 const DEFER_MS = 15 * 60_000; // retry delay after an INFRA (quota/network) failure
 const FAIL_RETRY_MS = 5 * 60_000; // base retry delay after a real failure
 const MAX_FAIL_RETRIES = 3; // then fall back to the natural cadence
+const ALERT_STREAK = 2; // consecutive failures before the user is told (then every 5th)
 
 const TZ = () => process.env.AIOS_TZ ?? 'Asia/Kolkata';
 
@@ -221,6 +222,18 @@ export async function tick(pool: pg.Pool, opts: TickOptions = {}): Promise<TickR
             [job.id, retryAt, now],
           );
         } // past the retry budget: keep the natural next_run_at — no tight loop
+        // TELL THE USER. Nothing did before: the "Anthropic pricing" watch failed
+        // 9 times and then decayed into 18 'missed' runs over 14 days in complete
+        // silence. Alert on the 2nd consecutive failure (once), then every 5th, so
+        // a dying automation is visible without becoming spam. Notifications are
+        // already delivered to the UI and (when paired) the WhatsApp self-chat.
+        if (streak === ALERT_STREAK || (streak > ALERT_STREAK && streak % 5 === 0)) {
+          await pool.query(`INSERT INTO notifications (kind, title, body, job_id) VALUES ('job-failure',$1,$2,$3)`, [
+            `Automation failing: ${job.name}`,
+            `${streak} consecutive failures. Latest error: ${msg.slice(0, 300)}`,
+            job.id,
+          ]);
+        }
         await trace.record({ traceId, component: 'scheduler', event: 'job.failed', payload: { job: job.name, streak, error: msg.slice(0, 200) } });
         report.ran.push({ job: job.name, runId, status: 'failed' });
       }
