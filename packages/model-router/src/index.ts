@@ -191,7 +191,13 @@ export function isInfraFailure(err: unknown): boolean {
   const status = (err as { status?: number })?.status;
   if (status === 429 || status === 503 || status === 413 || status === 529) return true;
   const msg = err instanceof Error ? err.message : String(err);
-  return /^INFRA_(RATELIMIT|NETWORK)/.test(msg);
+  if (/^INFRA_(RATELIMIT|NETWORK)/.test(msg)) return true;
+  // Provider CAPABILITY limits (2026-08-09): the request is fine, this backend
+  // just can't serve it — e.g. NVIDIA 500 "This model only supports single
+  // tool-calls at once!" or a provider rejecting a property another one emitted.
+  // Failing the task is the wrong answer when the next provider handles it fine,
+  // so treat these as infra and fall through the chain.
+  return /only supports single tool-call|is unsupported for assistant role|does not support tools/i.test(msg);
 }
 
 function routingTable(provider: Provider): Record<ModelRole, string> {
@@ -584,6 +590,32 @@ async function fetchWithRateLimitRetry(
   throw new Error(`INFRA_NETWORK: ${lastNetErr instanceof Error ? lastNetErr.message : 'exhausted retries'}`);
 }
 
+/** Strip everything a provider did not ask to receive back (2026-08-09).
+ *
+ *  Reasoning models return EXTRA keys on the assistant message — Groq's
+ *  `reasoning_content`, others `reasoning`/`thinking`/`refusal`. We persist the
+ *  whole message into tasks.checkpoints and replay it as history next turn, and
+ *  the provider then REJECTS its own output:
+ *    groq 400: 'reasoning_content' property is unsupported for assistant role
+ *  which kills the task outright. 86 stored task histories currently carry that
+ *  key, so this is a live landmine — and it detonates hardest on provider
+ *  failover, where one provider's extras are sent to another. Send only the
+ *  four fields the OpenAI chat contract defines. */
+const ALLOWED_MESSAGE_KEYS = new Set(['role', 'content', 'tool_calls', 'tool_call_id']);
+function sanitizeMessages(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((m) => {
+    const clean: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(m)) {
+      if (!ALLOWED_MESSAGE_KEYS.has(k) || v === undefined) continue;
+      // A null content is only legal on an assistant turn that carries tool_calls.
+      if (k === 'content' && v === null && !m.tool_calls?.length) continue;
+      clean[k] = v;
+    }
+    if (clean.content === undefined && !m.tool_calls?.length) clean.content = '';
+    return clean as unknown as ChatMessage;
+  });
+}
+
 /** Classify a non-ok HTTP response into a thrown Error. 429/503 (rate-limit
  *  exhaustion after retries) get a distinct INFRA_RATELIMIT marker so the eval
  *  gym can tell genuine quota exhaustion apart from a real 4xx/5xx bug whose
@@ -836,7 +868,7 @@ async function chatOn(provider: Provider, model: string, input: ChatInput, retry
           body: JSON.stringify({
             model,
             max_tokens: input.maxTokens ?? 2048,
-            messages: input.messages,
+            messages: sanitizeMessages(input.messages),
             ...(input.tools?.length
               ? {
                   tools: input.tools.map((t) => ({

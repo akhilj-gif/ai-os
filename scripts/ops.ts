@@ -44,9 +44,9 @@ export const C = {
 const isWin = process.platform === 'win32';
 
 /** Run a command, capture output. Never throws — returns {code, out}. */
-export function run(cmd: string, args: string[], opts: { cwd?: string; timeoutMs?: number } = {}): Promise<{ code: number; out: string }> {
+export function run(cmd: string, args: string[], opts: { cwd?: string; timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}): Promise<{ code: number; out: string }> {
   return new Promise((resolve) => {
-    const p = spawn(cmd, args, { cwd: opts.cwd, shell: isWin, windowsHide: true });
+    const p = spawn(cmd, args, { cwd: opts.cwd, env: opts.env, shell: isWin, windowsHide: true });
     let out = '';
     const cap = (d: Buffer) => (out += d.toString());
     p.stdout.on('data', cap);
@@ -130,6 +130,10 @@ export const WEB = 'http://127.0.0.1:3000';
  *  The boot-on-login / supervisor path (os:up used to just bail here). */
 export async function dockerDesktopStart(timeoutMs = 150_000): Promise<boolean> {
   if (await dockerDaemonUp()) return true;
+  // AIOS_NO_GUI: never pop a GUI window (set by the supervisor / any unattended
+  // caller). Docker Desktop is a windowed app, so launching it interrupts the
+  // user — only an explicit, human-invoked `pnpm os:up` may do that.
+  if (process.env.AIOS_NO_GUI === '1') return false;
   const exe = process.env.AIOS_DOCKER_DESKTOP ?? 'C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe';
   try {
     spawn(exe, [], { detached: true, stdio: 'ignore', windowsHide: true }).unref();

@@ -9,7 +9,7 @@
 // continuously in the foreground instead of one pass.
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { appendFileSync, mkdirSync, existsSync, statSync, writeFileSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdirSync, existsSync, readFileSync, statSync, writeFileSync, rmSync } from 'node:fs';
 import { API, BRIDGE, C, bridgeHeaders, dockerDaemonUp, httpUp, pm2List, run, sleep } from './ops.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -92,6 +92,32 @@ async function reportNeedsHuman(): Promise<void> {
   }
 }
 
+/** Recovery budget: at most MAX_RECOVERIES in WINDOW_MS. Without this, a stack
+ *  that cannot self-heal (an unpaired bridge, a crash-looping build) gets os:up
+ *  re-run on EVERY tick forever — which on Windows means repeatedly restarting
+ *  dev servers and flashing windows at the user. Thrashing is worse than being
+ *  down: after the budget, back off and let the human decide. */
+const STATE = join(root, 'logs', 'supervisor-state.json');
+const MAX_RECOVERIES = 3;
+const WINDOW_MS = 60 * 60_000;
+
+function recentRecoveries(): number[] {
+  try {
+    const raw = JSON.parse(readFileSync(STATE, 'utf8')) as { attempts?: number[] };
+    return (raw.attempts ?? []).filter((t) => Date.now() - t < WINDOW_MS);
+  } catch {
+    return [];
+  }
+}
+function noteRecovery(attempts: number[]): void {
+  try {
+    mkdirSync(join(root, 'logs'), { recursive: true });
+    writeFileSync(STATE, JSON.stringify({ attempts: [...attempts, Date.now()] }));
+  } catch {
+    /* best effort */
+  }
+}
+
 async function tick(): Promise<boolean> {
   await reportNeedsHuman();
   if (await healthy()) {
@@ -102,11 +128,23 @@ async function tick(): Promise<boolean> {
     log(C.yellow('• unhealthy, but a recovery is already in progress — skipping'));
     return true;
   }
-  log(C.yellow('• unhealthy — running recovery (pnpm os:up)'));
+  // NEVER launch Docker Desktop from here: it is a GUI app, so starting it pops
+  // a window in the user's face. Docker coming up is a human/OS-login concern.
+  if (!(await dockerDaemonUp())) {
+    log(C.yellow('⚠ Docker daemon is down — start Docker Desktop, then the OS can recover. (Not auto-launching it: that would pop a window.)'));
+    return false;
+  }
+  const attempts = recentRecoveries();
+  if (attempts.length >= MAX_RECOVERIES) {
+    log(C.red(`✗ recovery budget spent (${attempts.length} in the last hour) — backing off. Run \`pnpm os:up\` yourself and check logs/api.err.log.`));
+    return false;
+  }
+  log(C.yellow(`• unhealthy — running recovery (pnpm os:up) [${attempts.length + 1}/${MAX_RECOVERIES} this hour]`));
   try {
     writeFileSync(LOCK, new Date().toISOString());
-    if (!(await dockerDaemonUp())) log('  docker daemon down — os:up will launch Docker Desktop');
-    await run('pnpm', ['os:up'], { cwd: root, timeoutMs: 300_000 });
+    noteRecovery(attempts);
+    // AIOS_NO_GUI tells os:up not to launch any GUI app either (belt + braces).
+    await run('pnpm', ['os:up'], { cwd: root, timeoutMs: 300_000, env: { ...process.env, AIOS_NO_GUI: '1' } });
     await sleep(3_000);
   } finally {
     try {

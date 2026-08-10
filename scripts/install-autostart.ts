@@ -82,18 +82,29 @@ async function install(): Promise<void> {
   writeFileSync(SHIM, vbs);
   console.log(C.green(`✓ wrote silent shim ${SHIM}`));
 
-  // Boot-on-login (admin-free): a .vbs in the user's Startup folder. Windows
-  // runs .vbs via WScript, which has no console — silent by construction.
+  // Boot-on-login is OPT-IN (--logon). It is genuinely intrusive on Windows:
+  // bringing the stack up at login restarts dev servers and (if Docker is down)
+  // wants a GUI, which is how this feature ended up interrupting the user.
+  // Default now: periodic self-heal only, while you are already working.
   try {
     rmSync(STARTUP_CMD_LEGACY, { force: true }); // drop the old window-popping version
   } catch {
     /* not present */
   }
-  try {
-    writeFileSync(STARTUP_VBS, vbs);
-    console.log(C.green(`✓ logon launcher ${STARTUP_VBS}`));
-  } catch (e) {
-    console.log(C.red(`✗ could not write logon launcher: ${e instanceof Error ? e.message : String(e)}`));
+  if (process.argv.includes('--logon')) {
+    try {
+      writeFileSync(STARTUP_VBS, vbs);
+      console.log(C.green(`✓ logon launcher ${STARTUP_VBS}`));
+    } catch (e) {
+      console.log(C.red(`✗ could not write logon launcher: ${e instanceof Error ? e.message : String(e)}`));
+    }
+  } else {
+    try {
+      rmSync(STARTUP_VBS, { force: true });
+    } catch {
+      /* not present */
+    }
+    console.log(C.dim('· no logon launcher (pass --logon to start the OS when you sign in)'));
   }
 
   // Periodic self-heal (recovers after sleep). Points at the SHIM, so it runs
