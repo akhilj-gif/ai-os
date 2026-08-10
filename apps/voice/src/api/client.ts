@@ -205,7 +205,61 @@ export const api = {
   jobRun: (id: string) => j<unknown>(`/jobs/${id}/run-now`, { method: 'POST' }),
 
   google: () => j<{ connected: boolean; email?: string | null }>('/oauth/google/status'),
+
+  // Nexus (the Mind): the constellation + the live reasoning feed.
+  mindGraph: () => j<MindGraph>('/mind/graph'),
+  mindLive: (taskId?: string) => j<MindLive>(`/mind/live${taskId ? `?taskId=${encodeURIComponent(taskId)}` : ''}`),
 };
+
+export interface MindNode {
+  id: string;
+  label: string;
+  kind: string;
+  group: 'entity' | 'memory';
+  weight: number;
+  detail?: string;
+}
+export interface MindLink {
+  source: string;
+  target: string;
+  rel: string;
+  weight: number;
+}
+export interface MindGraph {
+  nodes: MindNode[];
+  links: MindLink[];
+  stats: { tasks: number; toolCalls: number; memories: number; entities: number; relations: number; messages: number };
+}
+export interface MindStep {
+  id: string;
+  local_id: number | null;
+  title: string | null;
+  kind: string;
+  status: string;
+  model_used: string | null;
+  tokens: number | null;
+  error: string | null;
+  tool: string | null;
+  created_at: string;
+}
+export interface MindToolCall {
+  id: string;
+  step_id: string;
+  tool: string;
+  trust_class: string;
+  approved_by: string | null;
+  duration_ms: number | null;
+  args: string | null;
+  result: string | null;
+  created_at: string;
+}
+export interface MindLive {
+  task: { id: string; goal: string; status: string; spent: Record<string, number> | null; created_at: string; updated_at: string } | null;
+  steps: MindStep[];
+  toolCalls: MindToolCall[];
+  children: Array<{ id: string; goal: string; status: string }>;
+  recent: Array<{ id: string; goal: string; status: string; updated_at: string }>;
+}
 
 /** Human one-liner for an approval popup, per tool. */
 export function describeAction(p: PendingAction): string {

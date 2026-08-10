@@ -1355,6 +1355,142 @@ app.get('/tasks/:id/trace', async (req, reply) => {
 });
 
 // ---------------------------------------------------------------------------
+// "Nexus" (the Mind) — the OS made visible. Two feeds:
+//   GET /mind/graph → ONE constellation of everything the OS knows, assembled
+//     from the knowledge graph (entities + relations) AND durable memories,
+//     cross-linked where a memory actually mentions an entity. The raw kg is
+//     sparse on its own; fused with memories it becomes the real picture.
+//   GET /mind/live  → the reasoning timeline of a task (default: the active or
+//     most recent one) — steps, tool calls, trust decisions, agent children.
+// Both are read-only projections; no new tables.
+// ---------------------------------------------------------------------------
+interface MindNode { id: string; label: string; kind: string; group: 'entity' | 'memory'; weight: number; detail?: string }
+interface MindLink { source: string; target: string; rel: string; weight: number }
+
+app.get('/mind/graph', async () => {
+  const [ents, rels, mems, stats] = await Promise.all([
+    pool.query<{ id: string; kind: string; name: string; mentions: number }>(
+      `SELECT id, kind, name, mentions FROM kg_nodes ORDER BY mentions DESC, last_seen_at DESC LIMIT 90`,
+    ),
+    pool.query<{ src: string; rel: string; dst: string; weight: number }>(`SELECT src, rel, dst, weight FROM kg_edges`),
+    pool.query<{ id: string; type: string; subject: string | null; content: string; confidence: number; tags: string[] }>(
+      `SELECT id, type, subject, left(content, 110) AS content, confidence, tags
+       FROM memory_records WHERE superseded_by IS NULL ORDER BY last_confirmed_at DESC LIMIT 70`,
+    ),
+    pool.query(
+      `SELECT (SELECT count(*) FROM tasks) AS tasks,
+              (SELECT count(*) FROM tool_calls) AS tool_calls,
+              (SELECT count(*) FROM memory_records WHERE superseded_by IS NULL) AS memories,
+              (SELECT count(*) FROM kg_nodes) AS entities,
+              (SELECT count(*) FROM kg_edges) AS relations,
+              (SELECT count(*) FROM messages) AS messages`,
+    ),
+  ]);
+
+  const nodes: MindNode[] = [];
+  const links: MindLink[] = [];
+  const present = new Set<string>();
+
+  for (const e of ents.rows) {
+    nodes.push({ id: e.id, label: e.name, kind: e.kind, group: 'entity', weight: Math.max(1, e.mentions) });
+    present.add(e.id);
+  }
+  for (const r of rels.rows) {
+    if (present.has(r.src) && present.has(r.dst)) links.push({ source: r.src, target: r.dst, rel: r.rel, weight: r.weight ?? 1 });
+  }
+
+  // Memories become nodes, and link to any entity they actually name — this is
+  // what turns two disconnected clouds into one mind.
+  const named = ents.rows
+    .map((e) => ({ id: e.id, needle: e.name.toLowerCase() }))
+    .filter((e) => e.needle.length >= 3);
+  const byTag = new Map<string, string[]>();
+  for (const m of mems.rows) {
+    const label = m.subject?.trim() || m.content.replace(/\s+/g, ' ').slice(0, 42);
+    nodes.push({
+      id: m.id,
+      label,
+      kind: m.type,
+      group: 'memory',
+      weight: Math.max(1, Math.round((m.confidence ?? 1) * 3)),
+      detail: m.content.replace(/\s+/g, ' '),
+    });
+    present.add(m.id);
+    const hay = `${m.subject ?? ''} ${m.content}`.toLowerCase();
+    for (const e of named) if (hay.includes(e.needle)) links.push({ source: m.id, target: e.id, rel: 'mentions', weight: 1 });
+    for (const t of m.tags ?? []) {
+      if (!byTag.has(t)) byTag.set(t, []);
+      byTag.get(t)!.push(m.id);
+    }
+  }
+  // Cluster memories that share a tag (star from the first) so themes are visible.
+  let clustered = 0;
+  for (const [tag, ids] of byTag) {
+    if (ids.length < 2 || clustered >= 8) continue;
+    clustered++;
+    for (let i = 1; i < ids.length; i++) links.push({ source: ids[0]!, target: ids[i]!, rel: tag, weight: 1 });
+  }
+
+  const s = stats.rows[0] as Record<string, string>;
+  return {
+    nodes,
+    links,
+    stats: {
+      tasks: Number(s.tasks),
+      toolCalls: Number(s.tool_calls),
+      memories: Number(s.memories),
+      entities: Number(s.entities),
+      relations: Number(s.relations),
+      messages: Number(s.messages),
+    },
+  };
+});
+
+app.get('/mind/live', async (req) => {
+  const { taskId } = req.query as { taskId?: string };
+  const chosen = taskId
+    ? (await pool.query(`SELECT * FROM tasks WHERE id = $1`, [taskId])).rows[0]
+    : (
+        await pool.query(
+          `SELECT * FROM tasks WHERE status <> 'draft'
+           ORDER BY (status IN ('running','planning','awaiting_approval')) DESC, updated_at DESC LIMIT 1`,
+        )
+      ).rows[0];
+
+  const recent = (
+    await pool.query(
+      `SELECT id, goal, status, updated_at FROM tasks WHERE status <> 'draft' AND parent_task_id IS NULL
+       ORDER BY updated_at DESC LIMIT 8`,
+    )
+  ).rows;
+  if (!chosen) return { task: null, steps: [], toolCalls: [], children: [], recent };
+
+  const [steps, calls, children] = await Promise.all([
+    pool.query(
+      `SELECT id, local_id, title, kind, status, model_used, tokens, error, tool, created_at
+       FROM steps WHERE task_id = $1 ORDER BY created_at`,
+      [chosen.id],
+    ),
+    pool.query(
+      `SELECT tc.id, tc.tool, tc.trust_class, tc.approved_by, tc.duration_ms, tc.created_at, s.id AS step_id,
+              left(tc.args::text, 220) AS args, left(tc.result::text, 220) AS result
+       FROM tool_calls tc JOIN steps s ON s.id = tc.step_id
+       WHERE s.task_id = $1 ORDER BY tc.created_at`,
+      [chosen.id],
+    ),
+    pool.query(`SELECT id, goal, status FROM tasks WHERE parent_task_id = $1 ORDER BY created_at`, [chosen.id]),
+  ]);
+
+  return {
+    task: { id: chosen.id, goal: chosen.goal, status: chosen.status, spent: chosen.spent, created_at: chosen.created_at, updated_at: chosen.updated_at },
+    steps: steps.rows,
+    toolCalls: calls.rows,
+    children: children.rows,
+    recent,
+  };
+});
+
+// ---------------------------------------------------------------------------
 // Trust policies (M5 §8.1): policies are data — the user can tighten/loosen per tool.
 // ---------------------------------------------------------------------------
 app.get('/policies', async () => {
