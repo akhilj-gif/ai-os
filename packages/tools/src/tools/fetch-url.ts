@@ -3,6 +3,7 @@
 // MCP server. Output is UNTRUSTED external content (§8.3) — the trust gate blocks
 // mutations once it's in context.
 import type { ToolDef } from '../registry.js';
+import { ssrfSafeFetch } from '@ai-os/shared';
 
 const MAX_BYTES = 2_000_000; // don't ingest huge pages
 const MAX_TEXT = 12_000; // cap extracted text fed to the model
@@ -63,8 +64,9 @@ export const fetchUrl: ToolDef = {
   async execute(args) {
     const url = String(args.url ?? '').trim();
     if (!/^https?:\/\//i.test(url)) throw new Error('url must be an absolute http(s) URL');
-    const res = await fetch(url, {
-      redirect: 'follow',
+    // Validates the resolved IP + every redirect hop, not just the scheme
+    // (2026-08-12 variant-analysis hunt — same root cause as http_get/http_send).
+    const res = await ssrfSafeFetch(url, {
       headers: {
         'user-agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',

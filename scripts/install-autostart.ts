@@ -22,8 +22,6 @@ const WRAPPER = join(root, 'scripts', 'aios-autostart.cmd');
 const SHIM = join(root, 'scripts', 'aios-autostart.vbs');
 const STARTUP_VBS = join(process.env.APPDATA ?? '', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'AI-OS.vbs');
 const STARTUP_CMD_LEGACY = join(process.env.APPDATA ?? '', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'AI-OS.cmd');
-// Every 3 minutes was needlessly chatty; 10 still recovers fast after a sleep.
-const INTERVAL_MIN = Number(process.env.AIOS_SUPERVISOR_INTERVAL_MIN) || 10;
 
 async function uninstall(): Promise<void> {
   for (const t of [LOGON_TASK, WATCH_TASK]) {

@@ -78,6 +78,9 @@ importers:
 
   apps/browser-bridge:
     dependencies:
+      '@ai-os/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
       fastify:
         specifier: ^5.9.0
         version: 5.9.0

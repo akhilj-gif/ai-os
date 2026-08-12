@@ -16,6 +16,7 @@
 import { fileURLToPath } from 'node:url';
 import Fastify from 'fastify';
 import { chromium, type BrowserContext, type Page } from 'playwright';
+import { assertPublicHttpUrl } from '@ai-os/shared';
 import { DEFAULT_BROWSER_BRIDGE_PORT, type ElementRef } from './contract.js';
 import { findInPage } from './find-in-page.js';
 
@@ -34,10 +35,32 @@ const USER_DATA_DIR = process.env.BROWSER_USER_DATA_DIR ?? fileURLToPath(new URL
 let context: BrowserContext | null = null;
 let page: Page | null = null;
 
+// SSRF guard (2026-08-12, variant-analysis hunt): /navigate previously checked
+// only the URL scheme, so a model-issued goto could reach 127.0.0.1, another
+// loopback bridge, or (once this ever runs on a cloud VM) the metadata
+// endpoint. A route handler is the right layer for a REAL browser rather than
+// a one-time check before p.goto: Playwright fires a new request through this
+// handler for the entry URL AND for every redirect hop the server sends, so a
+// public URL that later 302s into a private one is caught too — a check made
+// only before the initial goto would miss that. Scoped to top-level document
+// navigations only; page subresources (scripts/images/xhr from an already-
+// approved page) are a different, broader threat model and out of scope here.
 async function ensurePage(): Promise<Page> {
   if (context && page && !page.isClosed()) return page;
   context = await chromium.launchPersistentContext(USER_DATA_DIR, { headless: HEADLESS, viewport: { width: 1280, height: 800 } });
   page = context.pages()[0] ?? (await context.newPage());
+  await page.route('**/*', async (route) => {
+    const req = route.request();
+    if (req.resourceType() !== 'document' || req.frame() !== page!.mainFrame()) return route.continue();
+    try {
+      await assertPublicHttpUrl(req.url());
+      return route.continue();
+    } catch {
+      // Playwright throws if the route already resolved by the time abort()
+      // runs (a race with continue() elsewhere) — the request is gone either way.
+      return route.abort('blockedbyclient').catch(() => {});
+    }
+  });
   const start = process.env.AIOS_BROWSER_START_URL;
   if (start) await page.goto(start, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
   return page;

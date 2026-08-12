@@ -8,6 +8,7 @@
 // mutation they might try to trigger.
 import { spawn } from 'node:child_process';
 import type { ToolDef } from '../registry.js';
+import { ssrfSafeFetch } from '@ai-os/shared';
 
 const MAX_BODY = 16_000; // cap returned text so a huge page can't blow the context
 const TIMEOUT_MS = 15_000;
@@ -19,12 +20,14 @@ function badUrl(raw: unknown): string | null {
 }
 
 async function doFetch(method: string, url: string, headers?: Record<string, string>, body?: string) {
-  const res = await fetch(url, {
+  // ssrfSafeFetch validates the resolved IP (not just the URL string) on the
+  // entry URL AND every redirect hop — a scheme check alone let this reach
+  // 127.0.0.1 or a cloud metadata endpoint (2026-08-12 variant-analysis hunt).
+  const res = await ssrfSafeFetch(url, {
     method,
     headers: headers ?? undefined,
     body: body ?? undefined,
     signal: AbortSignal.timeout(TIMEOUT_MS),
-    redirect: 'follow',
   });
   const contentType = res.headers.get('content-type') ?? '';
   const text = (await res.text()).slice(0, MAX_BODY);
