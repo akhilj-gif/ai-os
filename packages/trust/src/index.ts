@@ -74,7 +74,18 @@ export class TrustGate {
     return {
       tool,
       trustClass: row.trust_class,
-      autoApprove: row.auto_approve,
+      // Defense in depth (2026-08-12, sharp-edges hunt): every caller of classify()
+      // — the executor and the graph runner — trusted this column directly with no
+      // backstop. NB this deliberately checks 'spend' only, NOT
+      // requiresApproval(trustClass) (which also covers 'irreversible'):
+      // irreversible tools are MEANT to become auto-approved once promoted via
+      // demonstrated trust (Tier 3, "graduated trust" — see /trust/promote) —
+      // requiresApproval() answers "does this class need approval BY DEFAULT",
+      // a different question from "can this class ever be promoted". Only money
+      // is permanently exempt from promotion, so only 'spend' is stripped here,
+      // unconditionally, regardless of what any endpoint managed to persist —
+      // this is the one function every TrustDecision is built from.
+      autoApprove: row.auto_approve && row.trust_class !== 'spend',
       unknownTool: false,
     };
   }

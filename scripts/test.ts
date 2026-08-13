@@ -6,8 +6,10 @@ import { spawnSync } from 'node:child_process';
 
 const SMOKES = [
   'packages/shared/src/json-smoke.ts', // model-output JSON extractor (used by 7 capture/plan paths)
-  'packages/trust/src/smoke.ts', // trust gate + §8.3 injection defense (security-critical)
+  'packages/shared/src/ssrf-smoke.ts', // SSRF block-list, incl. pinned regressions for 2 real bypasses (security-critical)
+  'packages/trust/src/smoke.ts', // trust gate + §8.3 injection defense + classify() invariants (security-critical)
   'packages/packs/src/terminal-smoke.ts', // terminal allowlist (security-critical)
+  'packages/packs/src/forge-scan-smoke.ts', // Pack Forge AST gate — 16 pinned code-exec vectors (security-critical)
   'packages/packs/src/files-smoke.ts',
   'packages/packs/src/browser-smoke.ts',
   'packages/model-router/src/failover-smoke.ts',

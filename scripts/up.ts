@@ -45,6 +45,20 @@ await run('npx', ['pm2', 'delete', join(root, 'ecosystem.config.cjs')], { cwd: r
 const start = await runLive('npx', ['pm2', 'start', join(root, 'ecosystem.config.cjs')], { cwd: root });
 if (start !== 0) { console.log(C.red('✗ pm2 failed to start the services')); process.exit(1); }
 
+// 5.5. Log rotation (2026-08-13 DoS sweep): every pm2 app logs to a plain
+//      logs/*.log with no cap — bridge.log alone reached 42MB with zero
+//      rotation, an unbounded-disk-growth path to eventually taking down the
+//      whole machine (Postgres included). pm2-logrotate is a pm2 module, not
+//      a repo file, so it doesn't survive a fresh `pm2 kill`/reinstall unless
+//      re-asserted here. `pm2 install` and `pm2 set` are both idempotent — a
+//      no-op if already configured this way.
+console.log('\n▶ log rotation');
+await run('npx', ['pm2', 'install', 'pm2-logrotate'], { cwd: root, timeoutMs: 60_000 });
+for (const [k, v] of [['max_size', '10M'], ['retain', '10'], ['compress', 'true']]) {
+  await run('npx', ['pm2', 'set', `pm2-logrotate:${k}`, v!], { cwd: root, timeoutMs: 15_000 });
+}
+console.log(C.green('✓ pm2-logrotate: 10M/file, 10 rotations, compressed'));
+
 // 6. Health-gate: wait for API + bridge to answer (web dev server is slower — soft check).
 console.log('\n▶ health');
 const apiOk = await waitFor('api', () => httpUp(`${API}/health`), 45_000);

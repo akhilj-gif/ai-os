@@ -9,10 +9,23 @@ const SECRET_ENV_NAMES = [
   'GEMINI_API_KEY',
   'GEMINI_API_KEY_FALLBACK',
   'GROQ_API_KEY',
+  'NVIDIA_API_KEY',
+  'X_API_KEY',
   'GOOGLE_CLIENT_SECRET',
   'GOOGLE_CLIENT_ID',
+  'UBER_CLIENT_SECRET',
   'DATABASE_URL',
   'LANGFUSE_SECRET_KEY',
+  // Bridge/API bearer tokens (2026-08-13, secrets-redaction audit): these
+  // authenticate to the OS's own HTTP surfaces (server.ts, browser-bridge,
+  // whatsapp-bridge, the mobility bridge) — read via process.env in their
+  // respective entrypoints but never listed here, so any of them landing in
+  // a tool result or error message would have reached the audit log in the
+  // clear instead of being scrubbed like every other credential.
+  'AIOS_API_TOKEN',
+  'BROWSER_BRIDGE_TOKEN',
+  'WHATSAPP_BRIDGE_TOKEN',
+  'MOBILITY_BRIDGE_TOKEN',
 ] as const;
 
 // Structural patterns for known secret shapes — catch values even when they don't

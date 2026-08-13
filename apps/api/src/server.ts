@@ -11,7 +11,7 @@ import { captureScreen } from '@ai-os/tools';
 import Fastify from 'fastify';
 import pg from 'pg';
 import { Redis } from 'ioredis';
-import { TraceStore, newTraceId } from '@ai-os/shared';
+import { TraceStore, newTraceId, timingSafeEqualStr } from '@ai-os/shared';
 import {
   runHelloWorldTask,
   runTask,
@@ -118,7 +118,7 @@ declare module 'fastify' {
 }
 
 // API authentication (2026-07-26 security hardening). Every endpoint requires a
-// shared secret (x-aios-token === AIOS_API_TOKEN) EXCEPT /health and the OAuth
+// shared secret (x-aios-token === AIOS_API_TOKEN) EXCEPT /health and the 4 OAuth
 // browser-redirect routes (which the browser opens directly and cannot carry a
 // header — they have their own CSRF state guard). This closes the loopback
 // self-approval hole: without it any local process could POST /pending/:id/decide
@@ -126,7 +126,15 @@ declare module 'fastify' {
 // proxies, which inject the header server-side (the browser never sees the token).
 const API_TOKEN = (process.env.AIOS_API_TOKEN ?? '').trim();
 let warnedNoAuth = false;
-const authExempt = (path: string): boolean => path === '/health' || path.startsWith('/oauth/');
+// A bare `path.startsWith('/oauth/')` prefix (2026-08-13 endpoint-authz audit)
+// swept up /oauth/google/status and /oauth/uber/status too — plain JSON reads
+// the UI already calls through the token-injecting proxy like every other
+// endpoint, not browser-redirect targets. That left the connected Google
+// account's email + granted scopes readable by any unauthenticated local
+// caller — exactly the "any local process" hole this file's auth exists to
+// close. Only the 4 routes a browser navigates to directly get the exemption.
+const OAUTH_EXEMPT_PATHS = new Set(['/oauth/google', '/oauth/google/callback', '/oauth/uber', '/oauth/uber/callback']);
+const authExempt = (path: string): boolean => path === '/health' || OAUTH_EXEMPT_PATHS.has(path);
 
 // Coarse per-IP rate-limit backstop (2026-07-26 audit). The API is loopback-only
 // so this is effectively one bucket; the ceiling is far above any real UI burst
@@ -177,7 +185,8 @@ app.addHook('onRequest', async (req, reply) => {
     return;
   }
   const provided = req.headers['x-aios-token'];
-  if (provided !== API_TOKEN) {
+  // Constant-time compare (2026-08-12, sharp-edges hunt) — was a plain !==.
+  if (!timingSafeEqualStr(String(provided ?? ''), API_TOKEN)) {
     trace.recordSafe({ traceId: req.traceId, component: 'api', event: 'http.unauthorized', payload: { method: req.method, path } });
     return reply.code(401).send({ error: 'unauthorized: missing or invalid x-aios-token' });
   }
@@ -212,7 +221,7 @@ app.get('/health', async () => {
 
 // M8 settings: which providers/models the router will use, in failover order
 // (ADR-0011). Names and model ids only — never key material.
-app.get('/system/models', async () => {
+app.get('/system/models', async (_req, reply) => {
   try {
     const chain = failoverChain();
     return {
@@ -228,7 +237,7 @@ app.get('/system/models', async () => {
       })),
     };
   } catch (err) {
-    return { pinned: null, chain: [], error: err instanceof Error ? err.message : String(err) };
+    return reply.code(500).send({ pinned: null, chain: [], error: err instanceof Error ? err.message : String(err) });
   }
 });
 
@@ -539,7 +548,7 @@ function recallImages(sessionId: string): ChatAttachment[] | null {
   return e.images;
 }
 
-app.post('/chat', async (req) => {
+app.post('/chat', async (req, reply) => {
   const { text, sessionId, agentMode, attachments } = (req.body ?? {}) as {
     text?: string;
     sessionId?: string;
@@ -547,7 +556,7 @@ app.post('/chat', async (req) => {
     attachments?: ChatAttachment[];
   };
   const trimmed = text?.trim() ?? '';
-  if (!trimmed && !attachments?.length) return { error: 'text or an attachment is required' };
+  if (!trimmed && !attachments?.length) return reply.code(400).send({ error: 'text or an attachment is required' });
   // Robustness: a passed sessionId must be a real session, else fall back to the
   // default — a bad/unknown id used to FK-violate on addMessage and silently 500.
   let session = await ensureDefaultSession(pool);
@@ -576,8 +585,8 @@ app.post('/chat', async (req) => {
 
   await completeChatTask(taskId, agentMode ?? 'auto');
   const msgs = await listMessages(pool, session);
-  const reply = msgs.filter((m) => m.task_id === taskId && m.role === 'assistant').at(-1);
-  return { sessionId: session, taskId, reply: reply?.content ?? '' };
+  const assistantMsg = msgs.filter((m) => m.task_id === taskId && m.role === 'assistant').at(-1);
+  return { sessionId: session, taskId, reply: assistantMsg?.content ?? '' };
 });
 
 // ---------------------------------------------------------------------------
@@ -727,10 +736,10 @@ app.get('/settings', async () => {
   const { rows } = await pool.query<{ key: string; value: string }>(`SELECT key, value FROM os_settings ORDER BY key`);
   return { settings: Object.fromEntries(rows.map((r) => [r.key, r.value])) };
 });
-app.put('/settings/:key', async (req) => {
+app.put('/settings/:key', async (req, reply) => {
   const { key } = req.params as { key: string };
   const { value } = (req.body ?? {}) as { value?: string };
-  if (typeof value !== 'string') return { error: 'value (string) is required' };
+  if (typeof value !== 'string') return reply.code(400).send({ error: 'value (string) is required' });
   await setSetting(key, String(value));
   return { ok: true, key, value };
 });
@@ -831,27 +840,27 @@ app.get('/standing', async () => {
   const { rows } = await pool.query(`SELECT id, goal, status, cadence_minutes, steps, progress, last_advanced_at, created_at FROM standing_goals ORDER BY created_at DESC`);
   return { goals: rows };
 });
-app.post('/standing', async (req) => {
+app.post('/standing', async (req, reply) => {
   const { goal, cadenceMinutes } = (req.body ?? {}) as { goal?: string; cadenceMinutes?: number };
-  if (!goal?.trim()) return { error: 'goal is required' };
+  if (!goal?.trim()) return reply.code(400).send({ error: 'goal is required' });
   const { rows } = await pool.query<{ id: string }>(
     `INSERT INTO standing_goals (goal, cadence_minutes) VALUES ($1, $2) RETURNING id`,
     [goal.trim(), Number.isFinite(cadenceMinutes) ? Math.max(30, Number(cadenceMinutes)) : 360],
   );
   return { ok: true, id: rows[0]!.id };
 });
-app.patch('/standing/:id', async (req) => {
+app.patch('/standing/:id', async (req, reply) => {
   const { id } = req.params as { id: string };
   const { status } = (req.body ?? {}) as { status?: string };
-  if (!['active', 'paused', 'done'].includes(String(status))) return { error: 'status must be active|paused|done' };
+  if (!['active', 'paused', 'done'].includes(String(status))) return reply.code(400).send({ error: 'status must be active|paused|done' });
   await pool.query(`UPDATE standing_goals SET status = $2 WHERE id = $1`, [id, status]);
   return { ok: true };
 });
 // Advance ONE goal now (manual — user-initiated, so it runs regardless of cadence/autopilot).
-app.post('/standing/:id/advance', async (req) => {
+app.post('/standing/:id/advance', async (req, reply) => {
   const { id } = req.params as { id: string };
   const { rows } = await pool.query<StandingGoalRow>(`SELECT * FROM standing_goals WHERE id = $1`, [id]);
-  if (!rows[0]) return { error: 'no such standing goal' };
+  if (!rows[0]) return reply.code(404).send({ error: 'no such standing goal' });
   return advanceStandingGoal(rows[0], req.traceId);
 });
 
@@ -923,6 +932,29 @@ app.post('/perception/screen-watch', async () => screenWatchTick({ force: true }
 // ---------------------------------------------------------------------------
 const PROMOTE_THRESHOLD = 3; // approvals with zero rejections before a tool is "promotable"
 
+/** The ONE earned-trust check: has this tool been approved >= PROMOTE_THRESHOLD
+ *  times with zero rejections? Shared by /trust/promote AND PUT /policies/:tool
+ *  (2026-08-12, sharp-edges hunt — the two endpoints previously enforced this
+ *  inconsistently: /trust/promote didn't check it at all, and PUT /policies/:tool
+ *  had no concept of it, so setting auto_approve=true on an irreversible-class
+ *  tool via the raw policy endpoint skipped earned trust entirely). Money
+ *  ('spend') is handled separately and unconditionally — this function is never
+ *  consulted for it; see the DB CHECK constraint in migration 0025. */
+async function hasEarnedTrust(tool: string): Promise<{ ok: boolean; reason?: string }> {
+  const { rows } = await pool.query<{ approvals: number; rejections: number }>(
+    `SELECT count(*) FILTER (WHERE status = 'executed')::int AS approvals,
+            count(*) FILTER (WHERE status = 'rejected')::int AS rejections
+     FROM pending_actions WHERE tool = $1`,
+    [tool],
+  );
+  const { approvals, rejections } = rows[0] ?? { approvals: 0, rejections: 0 };
+  if (rejections > 0) return { ok: false, reason: `"${tool}" has ${rejections} rejection(s) on record — cannot auto-approve a tool the user has declined` };
+  if (approvals < PROMOTE_THRESHOLD) {
+    return { ok: false, reason: `"${tool}" has only ${approvals} approval(s) on record — needs ${PROMOTE_THRESHOLD} with zero rejections first` };
+  }
+  return { ok: true };
+}
+
 app.get('/trust/ladder', async () => {
   const { rows } = await pool.query<{ tool: string; trust_class: string; auto_approve: boolean; approvals: number; rejections: number }>(
     `SELECT p.tool,
@@ -942,15 +974,25 @@ app.get('/trust/ladder', async () => {
   return { ladder, threshold: PROMOTE_THRESHOLD };
 });
 
-app.post('/trust/promote', async (req) => {
+app.post('/trust/promote', async (req, reply) => {
   const { tool } = (req.body ?? {}) as { tool?: string };
-  if (!tool) return { error: 'tool is required' };
+  if (!tool) return reply.code(400).send({ error: 'tool is required' });
   // Resolve the tool's class from its policy or its decision history.
   const cls =
     (await pool.query<{ c: string }>(`SELECT trust_class::text AS c FROM trust_policies WHERE tool = $1`, [tool])).rows[0]?.c ??
     (await pool.query<{ c: string }>(`SELECT max(trust_class) AS c FROM pending_actions WHERE tool = $1`, [tool])).rows[0]?.c;
-  if (!cls) return { error: `unknown tool "${tool}"` };
-  if (cls === 'spend') return { error: 'spend-class actions (money) can never be auto-approved — they always require confirmation.' };
+  if (!cls) return reply.code(404).send({ error: `unknown tool "${tool}"` });
+  // Money can NEVER be promoted, unconditionally, regardless of track record —
+  // this is the one permanent exception (Tier 3 comment above, and the DB CHECK
+  // constraint in migration 0025 backstops it). Irreversible tools ARE meant to
+  // become promotable (that is the entire point of graduated trust — read/write
+  // tools are already auto-approved by default and need no promotion) — but only
+  // once they've earned it, which this endpoint previously never checked at all
+  // (2026-08-12, sharp-edges hunt: any caller could promote any non-spend tool
+  // with zero approval history).
+  if (cls === 'spend') return reply.code(400).send({ error: 'spend-class actions (money) can never be auto-approved — they always require confirmation.' });
+  const trust = await hasEarnedTrust(tool);
+  if (!trust.ok) return reply.code(400).send({ error: trust.reason });
   await pool.query(
     `INSERT INTO trust_policies (tool, trust_class, auto_approve) VALUES ($1, $2::trust_class, true)
      ON CONFLICT (tool) DO UPDATE SET auto_approve = true, updated_at = now()`,
@@ -960,9 +1002,9 @@ app.post('/trust/promote', async (req) => {
   return { ok: true, tool, trustClass: cls, autoApprove: true };
 });
 
-app.post('/trust/demote', async (req) => {
+app.post('/trust/demote', async (req, reply) => {
   const { tool } = (req.body ?? {}) as { tool?: string };
-  if (!tool) return { error: 'tool is required' };
+  if (!tool) return reply.code(400).send({ error: 'tool is required' });
   await pool.query(`UPDATE trust_policies SET auto_approve = false, updated_at = now() WHERE tool = $1`, [tool]);
   trace.recordSafe({ traceId: req.traceId, component: 'trust', event: 'trust.demoted', payload: { tool } });
   return { ok: true, tool, autoApprove: false };
@@ -998,9 +1040,9 @@ app.get('/memory/search', async (req) => {
 // ---------------------------------------------------------------------------
 // Research engine (M6): ask a question → cited report over fetched web sources.
 // ---------------------------------------------------------------------------
-app.post('/research', async (req) => {
+app.post('/research', async (req, reply) => {
   const { question } = (req.body ?? {}) as { question?: string };
-  if (!question?.trim()) return { error: 'question is required' };
+  if (!question?.trim()) return reply.code(400).send({ error: 'question is required' });
   return runResearch(pool, { question: question.trim(), registry: packRegistry() });
 });
 
@@ -1565,13 +1607,30 @@ app.put('/policies/:tool', async (req, reply) => {
   const { trustClass, autoApprove } = (req.body ?? {}) as { trustClass?: string; autoApprove?: boolean };
   const valid = ['read', 'write', 'irreversible', 'spend'];
   if (trustClass !== undefined && !valid.includes(trustClass)) return reply.code(400).send({ error: 'invalid trustClass' });
-  // Spend can NEVER be auto-approved — money always needs a human. Mirrors the
-  // /trust/promote guard, which PUT /policies previously bypassed (2026-07-26 audit).
-  if (autoApprove === true) {
-    const cur = await pool.query<{ trust_class: string }>(`SELECT trust_class FROM trust_policies WHERE tool = $1`, [tool]);
+  // Spend can NEVER be auto-approved — money always needs a human (2026-07-26
+  // audit). Irreversible tools CAN be auto-approved, but only with the same
+  // earned trust /trust/promote requires — this raw policy endpoint previously
+  // had no concept of that at all (2026-08-12, sharp-edges hunt).
+  //
+  // Evaluated on the EFFECTIVE resulting state, not just this call's fields, so
+  // the real Settings UI's two-separate-requests pattern (one PUT per control —
+  // apps/web/app/settings/page.tsx) can't bypass either rule: toggle auto ON
+  // while the tool is 'write' (fine, no threshold needed), then reclassify that
+  // same tool to 'irreversible' or 'spend' via the dropdown ALONE — that second
+  // call omits autoApprove, but effectiveAutoApprove falls back to the row's
+  // already-true value, so the resulting state is still checked here. Migration
+  // 0025's DB CHECK constraint backstops the 'spend' case unconditionally, in
+  // case a future code path reaches this table by any other route.
+  if (autoApprove !== undefined || trustClass !== undefined) {
+    const cur = await pool.query<{ trust_class: string; auto_approve: boolean }>(`SELECT trust_class, auto_approve FROM trust_policies WHERE tool = $1`, [tool]);
     const effectiveClass = trustClass ?? cur.rows[0]?.trust_class;
-    if (effectiveClass === 'spend') {
+    const effectiveAutoApprove = autoApprove ?? cur.rows[0]?.auto_approve ?? false;
+    if (effectiveAutoApprove && effectiveClass === 'spend') {
       return reply.code(400).send({ error: 'spend-class tools can never be auto-approved — money always requires explicit approval' });
+    }
+    if (effectiveAutoApprove && effectiveClass === 'irreversible') {
+      const trust = await hasEarnedTrust(tool);
+      if (!trust.ok) return reply.code(400).send({ error: trust.reason });
     }
   }
   const res = await pool.query(
@@ -1588,9 +1647,9 @@ app.put('/policies/:tool', async (req, reply) => {
 // ---------------------------------------------------------------------------
 // Planner + Task Graph (M4): plan a goal, inspect the graph, control the run.
 // ---------------------------------------------------------------------------
-app.post('/plan', async (req) => {
+app.post('/plan', async (req, reply) => {
   const { text } = (req.body ?? {}) as { text?: string };
-  if (!text?.trim()) return { error: 'text is required' };
+  if (!text?.trim()) return reply.code(400).send({ error: 'text is required' });
   return planAndStart(pool, { goal: text.trim(), registry: packRegistry() });
 });
 
@@ -1632,19 +1691,19 @@ app.post('/tasks/:id/resume', async (req) => {
   return resumeTask(pool, id, { registry: packRegistry() });
 });
 
-app.post('/tasks/:id/redirect', async (req) => {
+app.post('/tasks/:id/redirect', async (req, reply) => {
   const { id } = req.params as { id: string };
   const { directive } = (req.body ?? {}) as { directive?: string };
-  if (!directive?.trim()) return { error: 'directive is required' };
+  if (!directive?.trim()) return reply.code(400).send({ error: 'directive is required' });
   await redirectTask(pool, id, directive.trim());
   return { ok: true };
 });
 
-app.post('/tasks/:id/approve', async (req) => {
+app.post('/tasks/:id/approve', async (req, reply) => {
   const { id } = req.params as { id: string };
   const { stepId, decision, note } = (req.body ?? {}) as { stepId?: string; decision?: 'approved' | 'rejected'; note?: string };
   if (!stepId || (decision !== 'approved' && decision !== 'rejected')) {
-    return { error: 'stepId and decision (approved|rejected) are required' };
+    return reply.code(400).send({ error: 'stepId and decision (approved|rejected) are required' });
   }
   return decideApproval(pool, id, stepId, decision, note, { registry: packRegistry() });
 });
