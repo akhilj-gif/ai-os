@@ -16,6 +16,7 @@ export const FORGE_GUIDE = `You write a single self-contained TypeScript module:
 
 HARD RULES (a static scanner rejects violations — there is no human to argue with):
 - The ENTIRE module is exactly one \`export default { ... }\` object literal. No imports, no require, no other statements before/after.
+- The manifest is read by PARSING your module, never by running it, so everything outside an \`execute\` body must be a PLAIN LITERAL: a string, number, boolean, null, array, or nested object. No computed keys (\`[expr]:\`), no getters/setters, no spread (\`...\`), no template interpolation (\`\\\`a\${b}\\\`\`), no function calls, no \`new\`, no \`await\`. ALL logic goes inside \`async execute() { ... }\` — that is the only place code may exist.
 - Allowed globals ONLY: fetch, JSON, Date, Math, URL, URLSearchParams, encodeURIComponent, String/Number/Array/Object. NOTHING else — no process, no eval, no Function, no globalThis, no node: modules, no filesystem.
 - Prefer FREE, KEYLESS public APIs (this version cannot hold secrets). If the capability truly needs an API key, do not fake it — return an error explaining what key is needed and list it in "requires".
 - Every fetch must have a timeout: AbortSignal.timeout(10000). Handle non-OK responses with a clear returned { error: "..." } — never throw raw.

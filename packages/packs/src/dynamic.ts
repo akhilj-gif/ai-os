@@ -15,10 +15,14 @@
 //     may not touch process/env/eval/require/dynamic-import, and is size-capped.
 //     A scan can be fooled in principle — which is why the floor + human
 //     install approval exist. Keyed APIs (secrets) are deliberately v2.
-import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, renameSync, rmSync } from 'node:fs';
+// (no renameSync/rmSync: staging used to write a temp file, import it, and
+// rename-or-delete based on the result — that dance existed only to contain the
+// import. Staging no longer imports anything, so it just writes the file.)
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import ts from 'typescript';
 import type pg from 'pg';
 import type { ToolDef } from '@ai-os/tools';
 import { newTraceId } from '@ai-os/shared';
@@ -51,12 +55,182 @@ const FORBIDDEN: Array<{ re: RegExp; why: string }> = [
   { re: /__proto__|constructor\s*\[/, why: 'prototype tampering is not allowed' },
 ];
 
-/** Returns human-readable violations (empty = clean). Exported for the smoke. */
+// ---------------------------------------------------------------------------
+// AST manifest extraction — the structural gate. Parses, never executes.
+//
+// This REPLACED a text-based check (comment-stripping + brace-balancing) that
+// asked only "is the module exactly one `export default { … }` with nothing
+// outside it". That question turned out to be the wrong one. It treats the
+// object literal as inert DATA, and a JS object literal is not data: it runs
+// arbitrary code at CONSTRUCTION time (computed keys, any expression in value
+// position, template interpolation, spread, IIFEs) and at PROPERTY-READ time
+// (getters). All of that lives INSIDE the braces, so "nothing outside" never
+// saw it, and none of it needs a FORBIDDEN keyword.
+//
+// That was not theoretical: on 2026-08-13 all six of those vectors were shown
+// to pass the old scan with zero violations AND actually execute — via
+// listStagedPacks(), the path this file itself describes as read-only and
+// approval-free. `fetch` is an intentionally allowed global, so that is a
+// working exfiltration primitive reachable by merely LISTING staged packs.
+//
+// The fix is not more blocklist entries — it is to stop importing untrusted
+// source in order to read its metadata. We now parse the module and extract
+// the manifest from the syntax tree, enforcing a genuine ALLOWLIST: every
+// value must be a plain literal, and the ONLY executable thing permitted
+// anywhere is a function under the key `execute` (which runs only when the
+// tool is actually called, long after a human approved the install). This
+// finally matches the "ALLOWLIST posture" the header comment always claimed.
+// ---------------------------------------------------------------------------
+
+/** Marker for "a function appeared here" — replaced by an inert placeholder
+ *  before validation, so nothing from the source is ever callable. */
+const FN = Symbol('pack-fn');
+
+function nodeToValue(node: ts.Node, key: string, errors: string[], path: string): unknown {
+  // `x as const` / `x satisfies T` are TYPE-level only — fully erased before
+  // anything runs, so unwrapping them adds no execution surface, and a model
+  // writing TypeScript reaches for them often enough that rejecting would cost
+  // pointless repair rounds. The wrapped expression is still checked below.
+  if (ts.isAsExpression(node) || ts.isSatisfiesExpression(node)) {
+    return nodeToValue(node.expression, key, errors, path);
+  }
+  if (ts.isFunctionExpression(node) || ts.isArrowFunction(node)) {
+    if (key !== 'execute') {
+      errors.push(`${path}: a function is only allowed as \`execute\``);
+      return undefined;
+    }
+    return FN;
+  }
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+  if (ts.isNumericLiteral(node)) return Number(node.text);
+  if (node.kind === ts.SyntaxKind.TrueKeyword) return true;
+  if (node.kind === ts.SyntaxKind.FalseKeyword) return false;
+  if (node.kind === ts.SyntaxKind.NullKeyword) return null;
+  if (ts.isPrefixUnaryExpression(node) && node.operator === ts.SyntaxKind.MinusToken && ts.isNumericLiteral(node.operand)) {
+    return -Number(node.operand.text);
+  }
+  if (ts.isArrayLiteralExpression(node)) {
+    return node.elements.map((el, i) => {
+      if (ts.isSpreadElement(el)) {
+        errors.push(`${path}[${i}]: spread (...) is not allowed — it evaluates an expression while the array is built`);
+        return undefined;
+      }
+      return nodeToValue(el, '', errors, `${path}[${i}]`);
+    });
+  }
+  if (ts.isObjectLiteralExpression(node)) return objectToValue(node, errors, path);
+  errors.push(
+    `${path}: only literal data is allowed here, found ${ts.SyntaxKind[node.kind]} — any expression in a value position executes the moment the module is imported`,
+  );
+  return undefined;
+}
+
+function objectToValue(obj: ts.ObjectLiteralExpression, errors: string[], path: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const prop of obj.properties) {
+    if (ts.isGetAccessorDeclaration(prop) || ts.isSetAccessorDeclaration(prop)) {
+      errors.push(`${path || '<root>'}: get/set accessors are not allowed — a getter runs code every time the property is READ`);
+      continue;
+    }
+    if (ts.isSpreadAssignment(prop)) {
+      errors.push(`${path || '<root>'}: spread (...) is not allowed — it evaluates an expression while the object is built`);
+      continue;
+    }
+    if (ts.isShorthandPropertyAssignment(prop)) {
+      errors.push(`${path || '<root>'}: shorthand properties are not allowed — name the value explicitly`);
+      continue;
+    }
+    const nameNode = prop.name;
+    if (!nameNode || ts.isComputedPropertyName(nameNode)) {
+      errors.push(`${path || '<root>'}: computed property keys are not allowed — the key expression runs at construction time`);
+      continue;
+    }
+    const key = ts.isIdentifier(nameNode) || ts.isStringLiteral(nameNode) ? nameNode.text : null;
+    if (key === null) {
+      errors.push(`${path || '<root>'}: unsupported property key`);
+      continue;
+    }
+    const childPath = path ? `${path}.${key}` : key;
+    if (ts.isMethodDeclaration(prop)) {
+      if (key !== 'execute') {
+        errors.push(`${childPath}: a method is only allowed as \`execute\``);
+        continue;
+      }
+      out[key] = FN;
+      continue;
+    }
+    if (!ts.isPropertyAssignment(prop)) {
+      errors.push(`${childPath}: unsupported property form`);
+      continue;
+    }
+    out[key] = nodeToValue(prop.initializer, key, errors, childPath);
+  }
+  return out;
+}
+
+/** Swap the FN marker for an inert placeholder. validateManifest only checks
+ *  that `execute` IS a function; it never calls it, and neither do we — the
+ *  real one is bound later, post-approval, in loadDynamicPack. */
+function hydrate(v: unknown): unknown {
+  if (v === FN) return async () => undefined;
+  if (Array.isArray(v)) return v.map(hydrate);
+  if (v && typeof v === 'object') {
+    return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, hydrate(x)]));
+  }
+  return v;
+}
+
+/** Parse `source` and pull the manifest out of the syntax tree WITHOUT
+ *  importing or evaluating one byte of it. The returned manifest's execute
+ *  functions are inert placeholders — it is metadata for review/validation
+ *  only, never a runnable pack. */
+export function extractManifestFromSource(src: string): { manifest?: DynamicManifest; errors: string[] } {
+  const errors: string[] = [];
+  const sf = ts.createSourceFile('pack.mts', src, ts.ScriptTarget.ESNext, true, ts.ScriptKind.TS);
+  const exportDefaults = sf.statements.filter((s): s is ts.ExportAssignment => ts.isExportAssignment(s) && !s.isExportEquals);
+  if (exportDefaults.length !== 1) {
+    errors.push('module must be exactly one `export default { … }` object literal');
+    return { errors };
+  }
+  if (sf.statements.length !== 1) {
+    errors.push(
+      'module must contain NOTHING besides `export default { … }` — no other top-level statement is allowed (it would run on every stage/list/install, before any approval)',
+    );
+  }
+  // Unwrap type-only wrappers here too, so `export default { … } as const` is
+  // accepted for the same reason it is accepted on a property value: erased
+  // before anything runs, and common in model-written TypeScript.
+  let expr: ts.Expression = exportDefaults[0]!.expression;
+  while (ts.isAsExpression(expr) || ts.isSatisfiesExpression(expr) || ts.isParenthesizedExpression(expr)) {
+    expr = expr.expression;
+  }
+  if (!ts.isObjectLiteralExpression(expr)) {
+    errors.push('`export default` must be a plain object literal');
+    return { errors };
+  }
+  const raw = hydrate(objectToValue(expr, errors, ''));
+  if (errors.length) return { errors };
+  return { manifest: raw as DynamicManifest, errors: [] };
+}
+
+/** Returns human-readable violations (empty = clean). Exported for the smoke.
+ *
+ *  Three layers, in order of strength:
+ *    1. a size cap;
+ *    2. the AST allowlist (extractManifestFromSource) — the load-bearing one:
+ *       the module must parse to exactly one `export default { … }` whose every
+ *       value is a plain literal, with executable code permitted ONLY under
+ *       `execute`. This is what makes it safe to read a pack's metadata, since
+ *       we now read it from the syntax tree instead of importing the file;
+ *    3. the FORBIDDEN keyword regexes — kept as cheap defense-in-depth for the
+ *       inside of `execute` bodies (which the allowlist deliberately does not
+ *       constrain, since they are real code by design). Scanned against the raw
+ *       source including comments/strings: a false positive is the safe
+ *       direction, and the forge's repair loop just rewrites. */
 export function scanPackSource(src: string): string[] {
   const out: string[] = [];
   if (src.length > MAX_SOURCE_CHARS) out.push(`source is ${src.length} chars — cap is ${MAX_SOURCE_CHARS}`);
-  // `export default` must be the ONLY export/statement surface we accept.
-  if (!/export\s+default\s*\{/.test(src)) out.push('module must be exactly one `export default { … }` object literal');
+  out.push(...extractManifestFromSource(src).errors);
   for (const f of FORBIDDEN) {
     // The scan runs on the whole file including comments/strings — false
     // positives are acceptable (rejecting is the safe direction; the forge
@@ -158,31 +332,39 @@ export interface StageResult {
 export async function stagePack(source: string, staticPackNames: string[]): Promise<StageResult> {
   const violations = scanPackSource(source);
   if (violations.length) throw new Error(`safety scan rejected the pack:\n- ${violations.join('\n- ')}`);
+  // Metadata comes from the SYNTAX TREE, not from importing the file. Staging
+  // happens before any human has seen the pack, so it must not execute it.
+  const { manifest, errors } = validateManifest({ default: extractManifestFromSource(source).manifest }, staticPackNames);
+  if (!manifest) throw new Error(`manifest invalid:\n- ${errors.join('\n- ')}`);
   const dir = dynamicPacksDir();
   mkdirSync(dir, { recursive: true });
-  const tmp = join(dir, `.staging-${randomUUID().slice(0, 8)}.mts`);
-  writeFileSync(tmp, source, 'utf8');
-  try {
-    const mod = await importPackFile(tmp);
-    const { manifest, errors } = validateManifest(mod, staticPackNames);
-    if (!manifest) throw new Error(`manifest invalid:\n- ${errors.join('\n- ')}`);
-    const finalPath = join(dir, `${manifest.name}.pack.mts`);
-    renameSync(tmp, finalPath);
-    return {
-      name: manifest.name,
-      file: finalPath,
-      toolNames: manifest.tools.map((t) => t.name),
-      description: manifest.description,
-      requires: manifest.requires,
-    };
-  } catch (err) {
-    rmSync(tmp, { force: true });
-    throw err;
-  }
+  const finalPath = join(dir, `${manifest.name}.pack.mts`);
+  writeFileSync(finalPath, source, 'utf8');
+  return {
+    name: manifest.name,
+    file: finalPath,
+    toolNames: manifest.tools.map((t) => t.name),
+    description: manifest.description,
+    requires: manifest.requires,
+  };
 }
 
 /** Import a STAGED pack file and register it into DYNAMIC (floor applied).
- *  Does not touch the DB — install/enable state lives there. */
+ *  Does not touch the DB — install/enable state lives there.
+ *
+ *  This is the ONE path that still genuinely imports the file, because it needs
+ *  the real `execute` functions to bind into the registry — metadata can be
+ *  read from the AST but a callable function cannot. Two things make that
+ *  acceptable where it was not acceptable for stage/list:
+ *    - it runs at INSTALL (post-approval) and at boot for an already-installed
+ *      pack, i.e. only for source a human has accepted; and
+ *    - the AST allowlist re-checked on the line below means the module body can
+ *      no longer DO anything when it is imported. Every value is a literal, so
+ *      construction is inert and there are no getters to fire; the only code
+ *      that exists is inside `execute`, which runs when the tool is called and
+ *      is separately gated by the trust floor (autoApprove=false) below.
+ *  So the import no longer grants execution — it only retrieves functions whose
+ *  invocation stays behind the approval queue. */
 export async function loadDynamicPack(name: string, staticPackNames: string[]): Promise<CapabilityPack> {
   const file = join(dynamicPacksDir(), `${name}.pack.mts`);
   if (!existsSync(file)) throw new Error(`no staged pack file: ${file}`);
@@ -216,8 +398,16 @@ export async function listStagedPacks(staticPackNames: string[]): Promise<Staged
     const name = f.replace(/\.pack\.mts$/, '');
     const source = readFileSync(join(dir, f), 'utf8');
     try {
-      const mod = await importPackFile(join(dir, f));
-      const { manifest, errors } = validateManifest(mod, staticPackNames);
+      // NEVER imports (2026-08-13). This function exists to render staged packs
+      // for human review — an explicitly read-only, pre-approval action — and it
+      // used to import() every file on disk to read its name, executing all of
+      // them on every call, cache-busted so a fresh execution each time. Reading
+      // metadata out of the syntax tree gets the same information with no
+      // execution at all, which is the whole reason extractManifestFromSource
+      // exists. A file that fails the scan is reported, not run.
+      const violations = scanPackSource(source);
+      if (violations.length) throw new Error(violations.join('; '));
+      const { manifest, errors } = validateManifest({ default: extractManifestFromSource(source).manifest }, staticPackNames);
       if (!manifest) throw new Error(errors.join('; '));
       out.push({ name, description: manifest.description, toolNames: manifest.tools.map((t) => t.name), requires: manifest.requires, source });
     } catch (err) {
