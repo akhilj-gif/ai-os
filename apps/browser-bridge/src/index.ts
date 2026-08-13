@@ -16,7 +16,7 @@
 import { fileURLToPath } from 'node:url';
 import Fastify from 'fastify';
 import { chromium, type BrowserContext, type Page } from 'playwright';
-import { assertPublicHttpUrl } from '@ai-os/shared';
+import { assertPublicHttpUrl, timingSafeEqualStr } from '@ai-os/shared';
 import { DEFAULT_BROWSER_BRIDGE_PORT, type ElementRef } from './contract.js';
 import { findInPage } from './find-in-page.js';
 
@@ -45,13 +45,28 @@ let page: Page | null = null;
 // only before the initial goto would miss that. Scoped to top-level document
 // navigations only; page subresources (scripts/images/xhr from an already-
 // approved page) are a different, broader threat model and out of scope here.
-async function ensurePage(): Promise<Page> {
-  if (context && page && !page.isClosed()) return page;
-  context = await chromium.launchPersistentContext(USER_DATA_DIR, { headless: HEADLESS, viewport: { width: 1280, height: 800 } });
-  page = context.pages()[0] ?? (await context.newPage());
-  await page.route('**/*', async (route) => {
+//
+// Registered on the CONTEXT, not the one tracked Page (2026-08-12,
+// differential-review self-check — a live Playwright repro proved
+// page.route() gives a popup opened via window.open()/target="_blank" ZERO
+// coverage: the popup's own top-level navigation never reaches the handler at
+// all, no encoding tricks needed). context.route() applies to every page the
+// context ever creates, existing or future.
+//
+// Validates EVERY 'document'-type request, main-frame or iframe, rather than
+// trying to identify "is this a top-level navigation" — an earlier version
+// called req.frame() to check that, but a live repro of the SAME popup
+// scenario proved req.frame() THROWS for a popup's very first navigation
+// request (the frame object isn't wired up yet when the request is issued —
+// a genuine Playwright race, not a coding mistake). An uncaught throw inside
+// a route handler is worse than the bypass being fixed. Treating every
+// document request the same sidesteps the race entirely and, as a bonus,
+// also covers iframe navigations to an internal target, which the frame-
+// identity check would have excluded.
+function installSsrfGuard(ctx: BrowserContext): void {
+  ctx.route('**/*', async (route) => {
     const req = route.request();
-    if (req.resourceType() !== 'document' || req.frame() !== page!.mainFrame()) return route.continue();
+    if (req.resourceType() !== 'document') return route.continue();
     try {
       await assertPublicHttpUrl(req.url());
       return route.continue();
@@ -61,6 +76,13 @@ async function ensurePage(): Promise<Page> {
       return route.abort('blockedbyclient').catch(() => {});
     }
   });
+}
+
+async function ensurePage(): Promise<Page> {
+  if (context && page && !page.isClosed()) return page;
+  context = await chromium.launchPersistentContext(USER_DATA_DIR, { headless: HEADLESS, viewport: { width: 1280, height: 800 } });
+  installSsrfGuard(context);
+  page = context.pages()[0] ?? (await context.newPage());
   const start = process.env.AIOS_BROWSER_START_URL;
   if (start) await page.goto(start, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
   return page;
@@ -90,14 +112,16 @@ async function settle(p: Page): Promise<void> {
 
 async function main(): Promise<void> {
   const app = Fastify({ logger: true });
-  const token = process.env.BROWSER_BRIDGE_TOKEN;
+  // .trim() so a whitespace-only value doesn't slip past this warning (2026-08-12,
+  // sharp-edges hunt — same class as the whatsapp-bridge blank-token fix).
+  const token = (process.env.BROWSER_BRIDGE_TOKEN ?? '').trim() || undefined;
   if (!token) {
     app.log.warn('SECURITY: BROWSER_BRIDGE_TOKEN is not set — the browser bridge is UNAUTHENTICATED (anyone on loopback can drive your logged-in Chromium). Set it in .env and restart.');
   }
 
   app.addHook('onRequest', async (req, reply) => {
     if (req.url.split('?')[0] === '/health') return; // health is unauthenticated (liveness only)
-    if (token && req.headers['x-bridge-token'] !== token) return reply.code(401).send({ error: 'bad bridge token' });
+    if (token && !timingSafeEqualStr(String(req.headers['x-bridge-token'] ?? ''), token)) return reply.code(401).send({ error: 'bad bridge token' });
   });
 
   app.get('/health', async () => ({ ok: true, impl: 'playwright', url: page && !page.isClosed() ? page.url() : 'about:blank', headless: HEADLESS }));

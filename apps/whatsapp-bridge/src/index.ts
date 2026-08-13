@@ -21,6 +21,7 @@ import qrcodeTerminal from 'qrcode-terminal';
 import QRCode from 'qrcode';
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, type WAMessage } from '@whiskeysockets/baileys';
 import { DEFAULT_BRIDGE_PORT, type BridgeChat, type BridgeMessage } from './contract.js';
+import { timingSafeEqualStr } from '@ai-os/shared';
 
 const AUTH_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '.auth');
 mkdirSync(AUTH_DIR, { recursive: true });
@@ -264,12 +265,26 @@ async function connect(): Promise<void> {
 }
 
 const app = Fastify({ logger: false });
-const token = process.env.WHATSAPP_BRIDGE_TOKEN;
+// .trim() so a blank/whitespace-only value in .env (it ships that way in
+// .env.example) is treated as UNSET, not as "" — the bridge's sibling checks
+// (apps/api, apps/browser-bridge) already got this fix; this one hadn't
+// (2026-08-12, sharp-edges hunt). Without it, `token && ...` short-circuits
+// false on "", so EVERY request is accepted with no header at all — silently,
+// the same fail-open class ADR-0021 already fixed once for this exact bridge
+// (via a missing dotenv.config() call) via a different trigger.
+const token = (process.env.WHATSAPP_BRIDGE_TOKEN ?? '').trim() || undefined;
+if (!token) {
+  console.warn('SECURITY: WHATSAPP_BRIDGE_TOKEN is not set — the WhatsApp bridge is UNAUTHENTICATED (anyone on loopback can read/send on your paired account). Set it in .env and restart.');
+}
 app.addHook('onRequest', async (req, reply) => {
   // The QR pairing page is pre-auth bootstrap (localhost, shown before any
   // session exists) — exempt it so a browser with no token header can load it.
   if (req.url === '/' || req.url.startsWith('/qr')) return;
-  if (token && req.headers['x-bridge-token'] !== token) return reply.code(401).send({ error: 'bad bridge token' });
+  // Constant-time compare (2026-08-12, sharp-edges hunt) — real-world exploitability
+  // is low given loopback-only binding, but the fix is one line per site.
+  if (token && !timingSafeEqualStr(String(req.headers['x-bridge-token'] ?? ''), token)) {
+    return reply.code(401).send({ error: 'bad bridge token' });
+  }
 });
 
 // Browser-friendly pairing page (served at / and /qr). Renders the live QR as

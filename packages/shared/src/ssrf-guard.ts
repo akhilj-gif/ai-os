@@ -12,6 +12,7 @@
 // approved public URL 302 into a private one after the check already passed.
 import { lookup } from 'node:dns/promises';
 import { isIPv4, isIPv6 } from 'node:net';
+import { Agent, fetch as undiciFetch } from 'undici';
 
 /** IPv4 ranges that must never be reachable from a model-issued fetch:
  *  loopback, private (RFC1918), link-local (incl. cloud metadata), CGNAT,
@@ -46,18 +47,58 @@ function isBlockedV4(ip: string): boolean {
   });
 }
 
+/** Expand a bracket-stripped IPv6 address into its 8 uint16 groups, handling
+ *  `::` compression and an optional trailing IPv4 dotted-quad (RFC 4291
+ *  §2.5.5). Returns null if the address doesn't parse. Numeric, not string
+ *  matching — see the comment on isBlockedV6 for why that distinction is the
+ *  whole fix here. */
+function parseV6Groups(ip: string): number[] | null {
+  let head = ip;
+  const lastColon = ip.lastIndexOf(':');
+  const maybeV4 = ip.slice(lastColon + 1);
+  if (isIPv4(maybeV4)) {
+    // A trailing dotted-quad (the classic ::ffff:a.b.c.d mapped form, or the
+    // rarer explicit ::a.b.c.d) — fold it into two hex groups before parsing.
+    const [a, b, c, d] = maybeV4.split('.').map(Number);
+    head = `${ip.slice(0, lastColon + 1)}${(((a! << 8) | b!) >>> 0).toString(16)}:${(((c! << 8) | d!) >>> 0).toString(16)}`;
+  }
+  const parts = head.split('::');
+  if (parts.length > 2) return null;
+  const left = parts[0] ? parts[0].split(':').filter(Boolean) : [];
+  const right = parts.length === 2 && parts[1] ? parts[1].split(':').filter(Boolean) : [];
+  if (parts.length === 1) {
+    if (left.length !== 8) return null;
+    return left.map((g) => parseInt(g, 16));
+  }
+  const missing = 8 - left.length - right.length;
+  if (missing < 0) return null;
+  return [...left, ...Array(missing).fill('0'), ...right].map((g) => parseInt(g || '0', 16));
+}
+
 /** IPv6: loopback (::1), unspecified (::), unique-local (fc00::/7 — the v6
- *  analog of RFC1918), and link-local (fe80::/10 — the v6 analog of
- *  169.254.0.0/16, same metadata-endpoint risk). Also catches an
- *  IPv4-mapped (::ffff:a.b.c.d) address hiding a blocked v4 target. */
+ *  analog of RFC1918), link-local (fe80::/10 — the v6 analog of
+ *  169.254.0.0/16, same metadata-endpoint risk), and any form (mapped
+ *  ::ffff:a.b.c.d OR the deprecated IPv4-compatible ::a.b.c.d) carrying a
+ *  blocked v4 address in its low 32 bits.
+ *
+ *  This checks the address NUMERICALLY, not by string pattern — a live
+ *  differential-review pass (2026-08-12) proved the previous regex-based
+ *  version missed the deprecated compatible form: Node's URL parser
+ *  normalizes `[::169.254.169.254]` to hostname `[::a9fe:a9fe]` (hex groups)
+ *  BEFORE this function ever sees it, so a string match for a trailing
+ *  dotted-quad can never fire on that input — the address has to be parsed
+ *  into groups and checked by value instead. */
 function isBlockedV6(ip: string): boolean {
-  const lower = ip.toLowerCase();
-  if (lower === '::1' || lower === '::') return true;
-  const mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (mapped) return isBlockedV4(mapped[1]!);
-  const first = lower.split(':')[0]!;
-  if (/^fe[89ab][0-9a-f]$/.test(first)) return true; // fe80::/10 link-local
-  if (/^f[cd][0-9a-f]{2}$/.test(first)) return true; // fc00::/7 unique-local
+  const parsed = parseV6Groups(ip.toLowerCase());
+  if (!parsed || parsed.length !== 8) return true; // unparseable → fail closed, never fail open
+  const [g0, g1, g2, g3, g4, g5, g6, g7] = parsed as [number, number, number, number, number, number, number, number];
+  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0 && g6 === 0 && (g7 === 0 || g7 === 1)) return true; // :: or ::1
+  if ((g0 & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+  if ((g0 & 0xfe00) === 0xfc00) return true; // fc00::/7 unique-local
+  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && (g5 === 0 || g5 === 0xffff)) {
+    const v4 = `${(g6 >> 8) & 0xff}.${g6 & 0xff}.${(g7 >> 8) & 0xff}.${g7 & 0xff}`;
+    return isBlockedV4(v4);
+  }
   return false;
 }
 
@@ -67,10 +108,22 @@ export class SsrfBlockedError extends Error {
   }
 }
 
-/** Validate that `url` is absolute http(s) AND resolves only to public
- *  addresses. Throws SsrfBlockedError otherwise. Call this again for every
- *  redirect hop — a validated entry URL says nothing about where it redirects. */
-export async function assertPublicHttpUrl(raw: string): Promise<URL> {
+interface ResolvedAddress {
+  address: string;
+  family: 4 | 6;
+}
+
+/** "[::1]" → "::1". URL.hostname brackets IPv6 literals; net.isIPv6 and the
+ *  group parser both need them gone. */
+function stripBrackets(host: string): string {
+  return host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+}
+
+/** Validate + resolve in one pass. Internal — assertPublicHttpUrl (below)
+ *  wraps this for callers that only need the validation; ssrfSafeFetch
+ *  additionally needs the resolved address itself, to pin the connection to
+ *  it (see the DNS-rebinding comment on ssrfSafeFetch). */
+async function resolveAndValidate(raw: string): Promise<{ url: URL; resolved: ResolvedAddress }> {
   let url: URL;
   try {
     url = new URL(raw);
@@ -80,15 +133,23 @@ export async function assertPublicHttpUrl(raw: string): Promise<URL> {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throw new SsrfBlockedError(raw, 'must be http or https');
   }
-  const host = url.hostname;
+  // URL.hostname keeps the BRACKETS on an IPv6 literal ("[::1]"), and
+  // net.isIPv6("[::1]") is false — so before 2026-08-13 the isIPv6 branch below
+  // was unreachable dead code and every IPv6 literal fell through to the DNS
+  // path instead. It still got BLOCKED there (node's resolver happens to parse
+  // a bracketed literal, and a resolver failure fails closed), so this was not
+  // a bypass — but it made a purely local, offline decision depend on resolver
+  // behaviour, which is exactly the kind of load-bearing accident that turns
+  // into a bypass after an unrelated change. Found by writing ssrf-smoke.ts.
+  const host = stripBrackets(url.hostname);
   // An IP literal in the URL — validate directly, no DNS involved.
   if (isIPv4(host)) {
     if (isBlockedV4(host)) throw new SsrfBlockedError(raw, `${host} is a private/internal address`);
-    return url;
+    return { url, resolved: { address: host, family: 4 } };
   }
   if (isIPv6(host)) {
     if (isBlockedV6(host)) throw new SsrfBlockedError(raw, `${host} is a private/internal address`);
-    return url;
+    return { url, resolved: { address: host, family: 6 } };
   }
   // A hostname — resolve it and check EVERY answer (a name can round-robin
   // across public and private addresses; one safe answer proves nothing).
@@ -101,19 +162,89 @@ export async function assertPublicHttpUrl(raw: string): Promise<URL> {
   if (addrs.length === 0) throw new SsrfBlockedError(raw, `${host} resolved to no address`);
   for (const a of addrs) {
     const blocked = a.family === 4 ? isBlockedV4(a.address) : isBlockedV6(a.address);
-    if (blocked) throw new SsrfBlockedError(raw, `${host} resolves to ${a.address}, a private/internal address`);
+    if (blocked) {
+      // The resolved address stays OUT of the thrown message (2026-08-12,
+      // differential-review self-check): http_get/fetch_url return a caught
+      // error straight back as normal tool output, so a hostname the caller
+      // supplied but didn't already know the IP of (e.g. an internal-sounding
+      // name reachable only via a specific VPC) would otherwise let a prompt-
+      // injected agent learn real internal IPs purely from BLOCKED responses,
+      // never completing a connection. console.warn keeps it for an operator
+      // reading server logs; the tool-visible message does not.
+      console.warn(`[ssrf-guard] blocked ${raw}: ${host} resolves to ${a.address}, a private/internal address`);
+      throw new SsrfBlockedError(raw, `${host} resolves to a private/internal address`);
+    }
   }
-  return url;
+  const first = addrs[0]!;
+  return { url, resolved: { address: first.address, family: first.family === 6 ? 6 : 4 } };
+}
+
+/** Validate that `url` is absolute http(s) AND resolves only to public
+ *  addresses. Throws SsrfBlockedError otherwise. Call this again for every
+ *  redirect hop — a validated entry URL says nothing about where it redirects. */
+export async function assertPublicHttpUrl(raw: string): Promise<URL> {
+  return (await resolveAndValidate(raw)).url;
+}
+
+/** A dns.lookup-compatible function that ignores real DNS and always answers
+ *  with the single address already validated for `expectedHost` — used to
+ *  pin ssrfSafeFetch's actual TCP connection (see there for why). */
+function pinnedLookup(expectedHost: string, resolved: ResolvedAddress) {
+  // Compared bracket-insensitively: the caller passes url.hostname (which
+  // brackets IPv6), while undici's connector may hand us either form. A
+  // mismatch here fails the request closed, so a purely cosmetic difference
+  // must not be allowed to look like a redirect to an unexpected host.
+  const want = stripBrackets(expectedHost);
+  return (hostname: string, options: unknown, callback: unknown) => {
+    const cb = (typeof options === 'function' ? options : callback) as (err: Error | null, ...rest: unknown[]) => void;
+    if (stripBrackets(hostname) !== want) {
+      cb(new Error(`ssrf-guard: refusing to resolve unexpected host "${hostname}" (pinned to "${expectedHost}")`));
+      return;
+    }
+    const wantsAll = typeof options === 'object' && options !== null && (options as { all?: boolean }).all;
+    if (wantsAll) cb(null, [{ address: resolved.address, family: resolved.family }]);
+    else cb(null, resolved.address, resolved.family);
+  };
 }
 
 /** fetch() that validates the initial URL AND every redirect hop, instead of
  *  redirect:'follow' (which would let a public URL 302 into a private one
- *  after the entry check already passed). Caps hops at 5 like browsers do. */
+ *  after the entry check already passed). Caps hops at 5 like browsers do.
+ *
+ *  Also pins the actual TCP connection to the exact address just validated
+ *  (2026-08-13, closing a gap flagged and deliberately deferred on
+ *  2026-08-12). Without this, assertPublicHttpUrl's lookup() and fetch()'s
+ *  OWN internal DNS resolution are two independent queries — a DNS-rebinding
+ *  attacker (a name server they control, TTL=0) can answer with a safe public
+ *  address for the check and a private one moments later for the real
+ *  connect, and the check would never see the address actually used. Using
+ *  an undici Agent with a fixed connect.lookup means the low-level address
+ *  lookup is the one we already validated; the Host header, TLS SNI, and
+ *  certificate verification still use the original hostname, so this only
+ *  overrides WHERE the socket connects, not what the server sees or how the
+ *  cert is checked.
+ *
+ *  Uses undici's OWN fetch, not Node's global fetch: Node's global fetch is
+ *  powered by a specific version of undici bundled INSIDE that Node release,
+ *  and handing it an Agent built from the separately-installed `undici`
+ *  package is a version mismatch — confirmed live (2026-08-13): it threw
+ *  `InvalidArgumentError: invalid onRequestStart method` the moment a real
+ *  request went out. Using the package's own fetch alongside its own Agent
+ *  keeps both from the same version, avoiding the interface drift entirely.
+ *  The returned Response is spec-compliant (json/text/status/headers/ok) and
+ *  behaves identically for every caller here — none does an `instanceof`
+ *  check against the global Response class. */
 export async function ssrfSafeFetch(rawUrl: string, init: RequestInit = {}, maxRedirects = 5): Promise<Response> {
   let current = rawUrl;
   for (let hop = 0; hop <= maxRedirects; hop++) {
-    await assertPublicHttpUrl(current);
-    const res = await fetch(current, { ...init, redirect: 'manual' });
+    const { url, resolved } = await resolveAndValidate(current);
+    const dispatcher = new Agent({ connect: { lookup: pinnedLookup(url.hostname, resolved) } });
+    let res: Response;
+    try {
+      res = (await undiciFetch(url, { ...init, redirect: 'manual', dispatcher } as never)) as unknown as Response;
+    } finally {
+      await dispatcher.close().catch(() => {});
+    }
     const isRedirect = res.status >= 300 && res.status < 400;
     const location = res.headers.get('location');
     if (!isRedirect || !location) return res;

@@ -28,7 +28,20 @@ export default defineConfig(() => {
           // AIOS_API_TOKEN to this process via ecosystem.config.cjs.
           configure: (proxy) => {
             const token = process.env.AIOS_API_TOKEN;
-            if (token) proxy.on('proxyReq', (proxyReq) => proxyReq.setHeader('x-aios-token', token));
+            proxy.on('proxyReq', (proxyReq, req, res) => {
+              // Never lend the token to a CROSS-SITE request (2026-08-13 audit,
+              // same fix as apps/web/app/api/[...path]/route.ts — this proxy
+              // mints the identical ambient authority). Sec-Fetch-Site is
+              // browser-set and unforgeable from JS; a MISSING value means a
+              // non-browser client, which stays token-gated as before.
+              if (req.headers['sec-fetch-site'] === 'cross-site') {
+                proxyReq.destroy();
+                res.writeHead(403, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ error: 'cross-site requests are not allowed' }));
+                return;
+              }
+              if (token) proxyReq.setHeader('x-aios-token', token);
+            });
           },
         },
       },
