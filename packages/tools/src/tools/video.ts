@@ -155,7 +155,15 @@ export const videoAnalyze: ToolDef = {
             content: `Video "${title}"${span} — part ${i + 1}/${chunks.length}:\n${account}`.slice(0, 16_000),
             subject: `video:${slug}#${i + 1}`,
             tags: ['video', `video:${slug}`],
-            source: { task_id: ctx.taskId },
+            // untrusted: this row is a near-verbatim transcription of a video the
+            // caller supplied by URL — the instruction above deliberately asks for
+            // maximum fidelity to on-screen text, so anything written in the video
+            // lands here almost word for word. This tool already declares
+            // untrustedOutput:true for its LIVE result; without the same stamp on
+            // the PERSISTED row, a later task recalled it as "trusted context you
+            // learned earlier" with §8.3 disarmed (2026-08-13 audit). Recall now
+            // quarantines it and arms the latch instead.
+            source: { task_id: ctx.taskId, untrusted: true },
             confidence: 0.9,
           })
           .catch((e) => notes.push(`could not store part ${i + 1} to memory: ${e instanceof Error ? e.message : String(e)}`));

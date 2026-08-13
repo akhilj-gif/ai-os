@@ -76,7 +76,10 @@ export async function makePlan(
   let memoryBlock = '';
   if (!opts.registry) {
     try {
-      memoryBlock = await assembleMemoryContext(pool, { goal: opts.goal });
+      // Planning only READS memory to shape a plan; every step it emits is still
+      // classified and gated at execution time, so the planner needs the text
+      // but not the taint flag (the executor arms the latch itself).
+      memoryBlock = (await assembleMemoryContext(pool, { goal: opts.goal })).block;
     } catch {
       /* best-effort */
     }

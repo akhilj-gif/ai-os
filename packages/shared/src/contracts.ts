@@ -109,6 +109,16 @@ export const MemorySource = z
     task_id: z.uuid().optional(),
     tool_call_id: z.uuid().optional(),
     user_stated: z.boolean().optional(),
+    /** This memory's CONTENT came from outside the user — a web page, a video,
+     *  an email/ticket body, any tool output flagged untrustedOutput. Set at
+     *  write time by whoever persists external content (2026-08-13
+     *  memory-poisoning audit). Read back by assembleMemoryContext, which
+     *  quarantines such rows and arms the §8.3 latch for the recalling task, so
+     *  attacker text cannot launder itself into authority by taking a trip
+     *  through durable memory. Absent/false = first-party, as before.
+     *  Lives in the existing JSONB `source` column — no migration needed, and
+     *  every pre-existing row correctly reads as first-party. */
+    untrusted: z.boolean().optional(),
   })
   .refine(
     (s) => s.task_id !== undefined || s.tool_call_id !== undefined || s.user_stated === true,

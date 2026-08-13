@@ -6,10 +6,21 @@ import { embedOne } from '@ai-os/model-router';
 
 export type MemoryType = 'episodic' | 'semantic' | 'preference' | 'procedural' | 'project' | 'document' | 'failure';
 
+/** NB this duplicates the zod MemorySource in @ai-os/shared/contracts.ts — the
+ *  two must be kept in step (both carry `untrusted` as of 2026-08-13). */
 export interface MemorySource {
   task_id?: string;
   tool_call_id?: string;
   user_stated?: boolean;
+  /** The CONTENT of this memory came from outside the user — a web page, a
+   *  video, a message body, any tool output flagged untrustedOutput. Stamped at
+   *  write time; read back by assembleMemoryContext, which quarantines the row
+   *  and arms the §8.3 latch for the recalling task so attacker text cannot gain
+   *  authority by taking a trip through durable memory (2026-08-13
+   *  memory-poisoning audit). Absent = first-party, so every existing row and
+   *  every existing caller keeps its current meaning. Rides in the existing
+   *  JSONB `source` column, so no migration is required. */
+  untrusted?: boolean;
 }
 
 export interface MemoryRecord {

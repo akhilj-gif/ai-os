@@ -142,6 +142,10 @@ export interface RunTaskOptions {
    *  set when a dependency subtask's output was untrusted-derived, so the
    *  taint propagates ACROSS agents instead of resetting per child task. */
   initialUntrusted?: boolean;
+  /** Provenance of `precomputedMemory`. Must be supplied whenever that block was
+   *  assembled by the caller, or a tainted recall would arrive with the §8.3
+   *  latch off — the exact laundering path this pair of flags exists to close. */
+  precomputedMemoryUntrusted?: boolean;
   /** Perf (2026-07-11): a caller that already computed the memory-context
    *  block (e.g. in parallel with classifyGoal) passes it here so runTask
    *  doesn't redo the embedding + recall round-trip. undefined = compute it
@@ -173,6 +177,10 @@ export async function runTask(
   const traceId = task.trace_id;
 
   let messages: ChatMessage[];
+  // Did the injected MEMORY block contain any untrusted-derived row? Declared
+  // out here because it has to reach the §8.3 latch below (2026-08-13
+  // memory-poisoning audit).
+  let memoryUntrusted = false;
   const lastCp = task.checkpoints?.[0]; // stored newest-first by saveCheckpoint
   if (lastCp?.state?.messages?.length) {
     messages = lastCp.state.messages;
@@ -186,10 +194,14 @@ export async function runTask(
     let memoryBlock = '';
     if (opts.precomputedMemory !== undefined) {
       memoryBlock = opts.precomputedMemory;
+      // The caller assembled the block, so only the caller knows its provenance.
+      memoryUntrusted = opts.precomputedMemoryUntrusted ?? false;
     } else if (!opts.registry || opts.enableMemory) {
       const t0 = Date.now();
       try {
-        memoryBlock = await assembleMemoryContext(pool, { goal: task.goal });
+        const mem = await assembleMemoryContext(pool, { goal: task.goal });
+        memoryBlock = mem.block;
+        memoryUntrusted = mem.untrusted;
       } catch (err) {
         console.warn('[kernel] memory context failed (non-fatal):', err instanceof Error ? err.message : err);
       } finally {
@@ -213,7 +225,13 @@ export async function runTask(
   // Structural injection defense (§8.3): once untrusted content is in context,
   // the trust gate blocks mutating actions. Persists across iterations.
   // M11: a child agent consuming an untrusted-derived dependency starts tainted.
-  let untrustedInContext = opts.initialUntrusted ?? false;
+  // 2026-08-13: RECALLED MEMORY counts too. Untrusted content used to be
+  // contained only while it was live in the task that fetched it; persisting it
+  // and recalling it later stripped the taint, so attacker text came back as
+  // "trusted context you learned earlier" with the latch off and mutating
+  // auto-tools unblocked. This OR is what closes that laundering path — one
+  // clause, and the existing gate does the rest.
+  let untrustedInContext = (opts.initialUntrusted ?? false) || memoryUntrusted;
   let queuedApproval = false; // an irreversible tool got queued for the user's approval this run
   let totalTokens = 0;
 

@@ -421,6 +421,7 @@ async function completeChatTask(taskId: string, agentMode: 'auto' | 'force' | 'o
   // runAgentTask, which doesn't consume a memory block — starting the fetch in
   // either case would just be wasted work with nothing to hand it to.
   let precomputedMemory: string | undefined;
+  let precomputedMemoryUntrusted = false;
   if (process.env.AIOS_AGENTS !== 'off' && agentMode !== 'off') {
     if (agentMode === 'force') useAgents = true;
     else {
@@ -432,12 +433,16 @@ async function completeChatTask(taskId: string, agentMode: 'auto' | 'force' | 'o
           classifyGoal(goal.goal, goal.trace_id),
           assembleMemoryContext(pool, { goal: goal.goal }).catch((err) => {
             console.warn('[api] memory context failed (non-fatal):', err instanceof Error ? err.message : err);
-            return '';
+            return { block: '', untrusted: false };
           }),
         ]);
         console.log(`[latency] classifyGoal+memoryContext taskId=${taskId} ms=${Date.now() - memT0}`);
         useAgents = classification === 'complex';
-        precomputedMemory = memory;
+        precomputedMemory = memory.block;
+        // Forward the provenance with the block. Assembling here (in parallel with
+        // classifyGoal, for latency) is exactly the path that would otherwise drop
+        // the taint and hand the executor a tainted recall with the latch off.
+        precomputedMemoryUntrusted = memory.untrusted;
       }
     }
   }
@@ -448,7 +453,7 @@ async function completeChatTask(taskId: string, agentMode: 'auto' | 'force' | 'o
         extraSystem: packPrompt(),
         say: async (content) => { await addMessage(pool, { sessionId, role: 'assistant', content, taskId }); },
       })
-    : await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true, history: prior, precomputedMemory });
+    : await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true, history: prior, precomputedMemory, precomputedMemoryUntrusted });
   await addMessage(pool, { sessionId, role: 'assistant', content: result.text, taskId });
 
   // Learn from doing (Memory OS Phase 1): distill this task's execution into an
