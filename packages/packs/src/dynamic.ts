@@ -86,13 +86,81 @@ const FORBIDDEN: Array<{ re: RegExp; why: string }> = [
  *  before validation, so nothing from the source is ever callable. */
 const FN = Symbol('pack-fn');
 
-function nodeToValue(node: ts.Node, key: string, errors: string[], path: string): unknown {
+/** Bound on the recursive literal walk. Guards against a hostile source whose
+ *  only payload is nesting depth (see the RangeError note in scanPackSource). */
+const MAX_LITERAL_DEPTH = 40;
+
+/** Names a generated pack may never reference, checked as RESOLVED IDENTIFIERS
+ *  rather than as source text.
+ *
+ *  This exists because the FORBIDDEN regexes below cannot see through a unicode
+ *  identifier escape. `process` IS the identifier `process` to every JS
+ *  engine, but matches no /\bprocess\b/ — verified 2026-08-13: 6 of 8 payloads
+ *  (escaped process, eval, require, globalThis, Function, and
+ *  `(()=>{}).constructor("…")()`) passed the keyword scan with ZERO
+ *  violations. That is the worst possible failure mode for this gate, because
+ *  the gate's stated fallback is a HUMAN reading the source before approving —
+ *  and no reviewer spots `process` in a diff.
+ *
+ *  TypeScript's scanner decodes escapes, so Identifier.text is the canonical
+ *  name regardless of how it was written; matching on that closes the whole
+ *  class rather than one spelling of it. Unlike the regexes this also ignores
+ *  identical words inside strings and comments, so it adds no false positives.
+ *
+ *  Honest scope: this is defense in depth, NOT a sandbox. Generated code still
+ *  runs in-process once a human approves it, and a determined escape through
+ *  computed member access cannot be caught statically. The real containment is
+ *  human install approval + autoApprove=false per call + no DB pool. What this
+ *  removes is the class of bypass that is INVISIBLE to the human doing the
+ *  approving. */
+const FORBIDDEN_NAMES = new Set([
+  'process',
+  'eval',
+  'require',
+  'Function',
+  'globalThis',
+  'constructor', // (()=>{}).constructor === Function — the classic escape
+  '__proto__',
+  'prototype',
+  'module',
+  'exports',
+  '__dirname',
+  '__filename',
+  'child_process',
+  'worker_threads',
+  'Reflect',
+  'Proxy',
+  'WebAssembly',
+]);
+
+/** Every forbidden identifier actually referenced anywhere in the module,
+ *  INCLUDING inside execute() bodies (which the value allowlist deliberately
+ *  does not constrain, since they are real code by design). */
+function forbiddenNamesUsed(sf: ts.SourceFile): string[] {
+  const hits = new Set<string>();
+  const visit = (n: ts.Node): void => {
+    if (ts.isIdentifier(n)) {
+      if (FORBIDDEN_NAMES.has(n.text)) hits.add(n.text);
+    } else if (n.kind === ts.SyntaxKind.ImportKeyword) {
+      hits.add('import'); // dynamic import(), incl. import.meta
+    }
+    ts.forEachChild(n, visit);
+  };
+  ts.forEachChild(sf, visit);
+  return [...hits];
+}
+
+function nodeToValue(node: ts.Node, key: string, errors: string[], path: string, depth: number): unknown {
+  if (depth > MAX_LITERAL_DEPTH) {
+    errors.push(`${path}: nesting deeper than ${MAX_LITERAL_DEPTH} levels is not allowed`);
+    return undefined;
+  }
   // `x as const` / `x satisfies T` are TYPE-level only — fully erased before
   // anything runs, so unwrapping them adds no execution surface, and a model
   // writing TypeScript reaches for them often enough that rejecting would cost
   // pointless repair rounds. The wrapped expression is still checked below.
   if (ts.isAsExpression(node) || ts.isSatisfiesExpression(node)) {
-    return nodeToValue(node.expression, key, errors, path);
+    return nodeToValue(node.expression, key, errors, path, depth);
   }
   if (ts.isFunctionExpression(node) || ts.isArrowFunction(node)) {
     if (key !== 'execute') {
@@ -115,17 +183,21 @@ function nodeToValue(node: ts.Node, key: string, errors: string[], path: string)
         errors.push(`${path}[${i}]: spread (...) is not allowed — it evaluates an expression while the array is built`);
         return undefined;
       }
-      return nodeToValue(el, '', errors, `${path}[${i}]`);
+      return nodeToValue(el, '', errors, `${path}[${i}]`, depth + 1);
     });
   }
-  if (ts.isObjectLiteralExpression(node)) return objectToValue(node, errors, path);
+  if (ts.isObjectLiteralExpression(node)) return objectToValue(node, errors, path, depth + 1);
   errors.push(
     `${path}: only literal data is allowed here, found ${ts.SyntaxKind[node.kind]} — any expression in a value position executes the moment the module is imported`,
   );
   return undefined;
 }
 
-function objectToValue(obj: ts.ObjectLiteralExpression, errors: string[], path: string): Record<string, unknown> {
+function objectToValue(obj: ts.ObjectLiteralExpression, errors: string[], path: string, depth: number): Record<string, unknown> {
+  if (depth > MAX_LITERAL_DEPTH) {
+    errors.push(`${path}: nesting deeper than ${MAX_LITERAL_DEPTH} levels is not allowed`);
+    return {};
+  }
   const out: Record<string, unknown> = {};
   for (const prop of obj.properties) {
     if (ts.isGetAccessorDeclaration(prop) || ts.isSetAccessorDeclaration(prop)) {
@@ -163,7 +235,7 @@ function objectToValue(obj: ts.ObjectLiteralExpression, errors: string[], path: 
       errors.push(`${childPath}: unsupported property form`);
       continue;
     }
-    out[key] = nodeToValue(prop.initializer, key, errors, childPath);
+    out[key] = nodeToValue(prop.initializer, key, errors, childPath, depth + 1);
   }
   return out;
 }
@@ -185,8 +257,30 @@ function hydrate(v: unknown): unknown {
  *  functions are inert placeholders — it is metadata for review/validation
  *  only, never a runnable pack. */
 export function extractManifestFromSource(src: string): { manifest?: DynamicManifest; errors: string[] } {
+  // Pathological input must REJECT, never propagate. ~2000 nested brackets in
+  // ~4KB of source overflows the stack inside ts.createSourceFile itself —
+  // TypeScript's own recursive-descent parser, which MAX_LITERAL_DEPTH cannot
+  // help with because the throw happens before our walk starts. A RangeError
+  // escaping here would surface as an opaque 500 from the forge/staging routes
+  // (and, before listStagedPacks stopped importing, from merely listing).
+  // Catching it converts a crash into an ordinary scan violation, which is what
+  // every caller already knows how to handle.
+  try {
+    return extractManifestUnsafe(src);
+  } catch (err) {
+    const name = err instanceof Error ? err.name : 'Error';
+    return { errors: [`source could not be parsed safely (${name}) — pathologically nested or malformed`] };
+  }
+}
+
+function extractManifestUnsafe(src: string): { manifest?: DynamicManifest; errors: string[] } {
   const errors: string[] = [];
   const sf = ts.createSourceFile('pack.mts', src, ts.ScriptTarget.ESNext, true, ts.ScriptKind.TS);
+  // Resolved-identifier check first: it sees through unicode escapes, which the
+  // FORBIDDEN regexes cannot, and it covers execute() bodies too.
+  for (const name of forbiddenNamesUsed(sf)) {
+    errors.push(`\`${name}\` is not allowed anywhere in a generated pack (referenced as an identifier — unicode escapes do not hide it)`);
+  }
   const exportDefaults = sf.statements.filter((s): s is ts.ExportAssignment => ts.isExportAssignment(s) && !s.isExportEquals);
   if (exportDefaults.length !== 1) {
     errors.push('module must be exactly one `export default { … }` object literal');
@@ -208,7 +302,7 @@ export function extractManifestFromSource(src: string): { manifest?: DynamicMani
     errors.push('`export default` must be a plain object literal');
     return { errors };
   }
-  const raw = hydrate(objectToValue(expr, errors, ''));
+  const raw = hydrate(objectToValue(expr, errors, '', 0));
   if (errors.length) return { errors };
   return { manifest: raw as DynamicManifest, errors: [] };
 }

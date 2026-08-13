@@ -126,6 +126,48 @@ check('Function ctor rejected', scanPackSource(GOOD.replace("String(args.text ??
 check('globalThis rejected', scanPackSource(GOOD.replace('args.text', 'globalThis.x')).some((v) => /globalThis/.test(v)));
 check('node: builtin rejected', scanPackSource(GOOD.replace('deterministic', 'node:fs')).some((v) => /node built-ins/.test(v)));
 
+// --- 4b. UNICODE-ESCAPED identifiers must not slip past ---------------------
+// `process` IS the identifier `process` to every JS engine, but matches no
+// /\bprocess\b/. Verified 2026-08-13: 6 of 8 such payloads passed the keyword
+// regexes with ZERO violations. That is the worst failure mode available to
+// this gate, since its stated fallback is a HUMAN reading the source — and no
+// reviewer spots `process` in a diff. The fix matches on the RESOLVED
+// Identifier.text from the AST (TypeScript decodes escapes), so the whole class
+// is closed rather than one spelling. Built with String.fromCharCode so this
+// file's own compilation cannot collapse the escape before the gate sees it.
+console.log('— unicode-escaped identifiers —');
+const BS = String.fromCharCode(92);
+const escFirst = (w: string) => BS + 'u' + w.charCodeAt(0).toString(16).padStart(4, '0') + w.slice(1);
+const inExec = (body: string) => `export default {
+  name: 'uni-pack', version: '0.1.0', description: 'd',
+  tools: [{ name: 'uni-pack_go', description: 'd', inputSchema: { type: 'object' }, async execute() { ${body} } }],
+};`;
+for (const word of ['process', 'eval', 'require', 'globalThis', 'Function', 'constructor']) {
+  const src = inExec(`return ${escFirst(word)};`);
+  // Guard the test itself: if the escape got collapsed at compile time this
+  // would silently become the plain-word case and prove nothing.
+  const carriesEscape = src.includes(BS + 'u00');
+  check(`test fixture really carries an escape for ${word}`, carriesEscape);
+  check(`unicode-escaped ${word} rejected`, scanPackSource(src).length > 0);
+}
+check('plain .constructor( chain rejected', scanPackSource(inExec('return (()=>{}).constructor("return 1")();')).length > 0);
+check('dynamic import() rejected', scanPackSource(inExec('return import("node:fs");')).length > 0);
+// The AST name check must NOT fire on the same words inside plain prose, which
+// is where the raw-text regexes produce their false positives.
+check('the word "process" inside a description is still fine', scanPackSource(GOOD.replace('deterministic echo pack', 'helps you handle a workflow step')).length === 0);
+
+// --- 4c. the gate must not blow up on a hostile shape ----------------------
+console.log('— gate robustness —');
+const deep = 'export default { name: "d-pack", version: "0.1.0", description: "d", requires: ' + '['.repeat(2000) + ']'.repeat(2000) + ', tools: [] };';
+let threw = '';
+try {
+  const v = scanPackSource(deep);
+  check('deeply nested literal is rejected, not crashed on', v.length > 0, v[0]?.slice(0, 60));
+} catch (err) {
+  threw = err instanceof Error ? err.name : String(err);
+  check('deeply nested literal is rejected, not crashed on', false, `threw ${threw}`);
+}
+
 // --- 5. the legitimate path must still work --------------------------------
 console.log('— legitimate pack still passes end to end —');
 check('clean source passes the scan', scanPackSource(GOOD).length === 0, scanPackSource(GOOD).join('; '));
