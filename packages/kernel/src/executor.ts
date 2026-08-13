@@ -401,14 +401,27 @@ export async function runTask(
           result = { error: `unknown tool: ${tc.name}` };
         } else {
           try {
-            result = await tool.execute(tc.args, { pool, taskId });
+            // untrustedInContext travels WITH the call: a tool that persists
+            // content stamps the row's provenance from it (see ToolContext).
+            result = await tool.execute(tc.args, { pool, taskId, untrusted: untrustedInContext });
           } catch (err) {
             result = { error: err instanceof Error ? err.message : String(err) };
           }
           // Once untrusted output enters context, latch the flag (in array order,
           // so a mutate BEFORE the read isn't blocked, one AFTER it is).
+          //
+          // Two ways to latch. untrustedTools is STATIC — the tool is always a
+          // source of external content (fetch_url, gmail_read). __untrusted is
+          // PER RESULT, for a tool whose output is untrusted only sometimes: it
+          // is how wm_get reports that the value it just returned was STORED
+          // while untrusted content was in context (2026-08-13 audit). Without
+          // it such a tool has only bad options — declare untrustedOutput and
+          // arm §8.3 on every ordinary read, blocking routine work, or declare
+          // nothing and hand back poisoned values as clean. Set by tool code
+          // from ctx.untrusted, never from model-supplied args.
           const failed = !!(result && typeof result === 'object' && 'error' in (result as object));
-          if (untrustedTools.has(tc.name) && !failed) untrustedInContext = true;
+          const perResultUntrusted = !!(result && typeof result === 'object' && (result as { __untrusted?: unknown }).__untrusted === true);
+          if ((untrustedTools.has(tc.name) || perResultUntrusted) && !failed) untrustedInContext = true;
         }
       }
 

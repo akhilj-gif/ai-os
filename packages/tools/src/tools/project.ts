@@ -96,7 +96,16 @@ export const projectRecord: ToolDef = {
       content,
       tags: [`project:${proj.slug}`, `kind:${kind}`],
       confidence: 0.9,
-      source: { task_id: ctx.taskId, user_stated: true },
+      // Provenance is taken from the executor's live §8.3 latch, not asserted
+      // (2026-08-13 memory-poisoning audit). This used to hardcode
+      // user_stated:true, which was a claim the tool could not actually make: the
+      // model calls project_record with whatever is in context, so after a
+      // fetch_url the "fact" may be attacker-authored text — recorded as though
+      // the user had said it, which ALSO skipped the §16 contradiction guard and
+      // let it silently supersede a real user-stated fact. Now: user_stated only
+      // when nothing untrusted is in context, and untrusted stamped when there
+      // is, so recall quarantines it instead of trusting it.
+      source: { task_id: ctx.taskId, user_stated: !ctx.untrusted, untrusted: ctx.untrusted === true },
     });
     return { ok: true, id: rec.id, project: proj.slug, kind };
   },

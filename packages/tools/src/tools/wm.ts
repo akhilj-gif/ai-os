@@ -31,10 +31,15 @@ export const wmSet: ToolDef = {
     if (!key || !value) return { error: 'key and value are required' };
     const session = await sessionFor(ctx.pool, ctx.taskId);
     if (!session) return { error: 'no active session to attach working memory to' };
+    // Stamp provenance from the executor's live §8.3 latch (2026-08-13 audit).
+    // This tool is 'read'-class so the gate does not stop it writing while
+    // untrusted content is in context — marking the row means wm_get can re-arm
+    // the latch on the way back out instead of laundering the value as clean.
+    const untrusted = ctx.untrusted === true;
     await ctx.pool.query(
-      `INSERT INTO working_memory (session_id, key, value) VALUES ($1, $2, $3)
-       ON CONFLICT (session_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
-      [session, key, value],
+      `INSERT INTO working_memory (session_id, key, value, untrusted) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (session_id, key) DO UPDATE SET value = EXCLUDED.value, untrusted = EXCLUDED.untrusted, updated_at = now()`,
+      [session, key, value, untrusted],
     );
     return { ok: true, key, value };
   },
@@ -51,13 +56,28 @@ export const wmGet: ToolDef = {
   async execute(args, ctx) {
     const session = await sessionFor(ctx.pool, ctx.taskId);
     if (!session) return { variables: {} };
+    // untrustedOutput is a STATIC property of a tool, but this tool's output is
+    // untrusted only when the specific value it returns was stored untrusted —
+    // so it reports taint PER RESULT via __untrusted, which the executor honours
+    // (see the latch in executor.ts). Marking the whole tool untrustedOutput
+    // would arm §8.3 on every ordinary working-memory read and block routine
+    // work; not marking it at all is how poisoned values came back clean.
     const key = args.key ? String(args.key).trim() : null;
     if (key) {
-      const { rows } = await ctx.pool.query<{ value: string }>(`SELECT value FROM working_memory WHERE session_id = $1 AND key = $2`, [session, key]);
-      return rows[0] ? { key, value: rows[0].value } : { key, value: null, note: 'not set' };
+      const { rows } = await ctx.pool.query<{ value: string; untrusted: boolean }>(
+        `SELECT value, untrusted FROM working_memory WHERE session_id = $1 AND key = $2`,
+        [session, key],
+      );
+      const row = rows[0];
+      if (!row) return { key, value: null, note: 'not set' };
+      return row.untrusted ? { key, value: row.value, __untrusted: true } : { key, value: row.value };
     }
-    const { rows } = await ctx.pool.query<{ key: string; value: string }>(`SELECT key, value FROM working_memory WHERE session_id = $1 ORDER BY updated_at DESC`, [session]);
-    return { variables: Object.fromEntries(rows.map((r) => [r.key, r.value])) };
+    const { rows } = await ctx.pool.query<{ key: string; value: string; untrusted: boolean }>(
+      `SELECT key, value, untrusted FROM working_memory WHERE session_id = $1 ORDER BY updated_at DESC`,
+      [session],
+    );
+    const variables = Object.fromEntries(rows.map((r) => [r.key, r.value]));
+    return rows.some((r) => r.untrusted) ? { variables, __untrusted: true } : { variables };
   },
 };
 

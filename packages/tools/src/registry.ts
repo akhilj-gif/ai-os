@@ -8,6 +8,21 @@ import type pg from 'pg';
 export interface ToolContext {
   pool: pg.Pool;
   taskId: string;
+  /** The §8.3 latch AS OF THIS CALL: untrusted external content is already in
+   *  this task's context. Supplied by the executor from its live state, never by
+   *  the model — so a compromised model cannot claim first-party provenance.
+   *
+   *  Only tools that PERSIST content need this (2026-08-13 memory-poisoning
+   *  audit). A durable writer classified 'read' — project_record, wm_set — is
+   *  not stopped by the trust gate, because the gate only blocks mutating
+   *  classes. Reclassifying them to 'write' would stop them, but
+   *  blockedByUntrustedContext is a HARD REFUSAL with no approval path (unlike
+   *  irreversible/spend, which queue for the user), so "read this page and save
+   *  the decision to my project" would become impossible rather than merely
+   *  gated. Stamping source.untrusted instead keeps the feature AND closes the
+   *  hole, since a marked row is quarantined on recall and arms this same latch
+   *  for the recalling task — it can never gain authority. */
+  untrusted?: boolean;
 }
 
 export interface ToolDef {
