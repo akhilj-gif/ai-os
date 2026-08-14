@@ -236,19 +236,76 @@ function pinnedLookup(expectedHost: string, resolved: ResolvedAddress) {
  *  check against the global Response class. */
 export async function ssrfSafeFetch(rawUrl: string, init: RequestInit = {}, maxRedirects = 5): Promise<Response> {
   let current = rawUrl;
+  let hopInit: RequestInit = { ...init };
   for (let hop = 0; hop <= maxRedirects; hop++) {
     const { url, resolved } = await resolveAndValidate(current);
     const dispatcher = new Agent({ connect: { lookup: pinnedLookup(url.hostname, resolved) } });
-    let res: Response;
     try {
-      res = (await undiciFetch(url, { ...init, redirect: 'manual', dispatcher } as never)) as unknown as Response;
+      const res = (await undiciFetch(url, { ...hopInit, redirect: 'manual', dispatcher } as never)) as unknown as Response;
+      const isRedirect = res.status >= 300 && res.status < 400;
+      const location = res.headers.get('location');
+      if (!isRedirect || !location) {
+        // DRAIN THE BODY BEFORE THE finally CLOSES THE POOL. undiciFetch resolves
+        // as soon as the HEADERS arrive, so the first version of this function
+        // closed the Agent while the body was still streaming — and that is a
+        // DEADLOCK, not just an early close: close() waits for the in-flight
+        // request to finish, the request cannot finish until its body is
+        // consumed, and the body cannot be consumed because control is stuck in
+        // the finally. Reproduced 2026-08-13: any response larger than undici's
+        // initial buffered chunk (~16 KiB) hung forever, which is most real web
+        // pages — so http_get, fetch_url and web_search were all affected. Small
+        // responses survived only because they arrived complete with the
+        // headers, which is exactly why it passed the first round of testing.
+        //
+        // Buffering here also detaches the Response from the pooled socket, so
+        // returning it after close() is safe. Every caller reads the whole body
+        // (res.text()/res.json()) and caps it afterwards, so nothing loses
+        // streaming it was actually using. content-encoding/length are dropped
+        // because undici already decompressed the bytes we are re-wrapping.
+        const noBody = res.status === 204 || res.status === 205 || res.status === 304;
+        const buffered = noBody ? null : await res.arrayBuffer();
+        const headers = new Headers();
+        for (const [k, v] of res.headers as unknown as Iterable<[string, string]>) {
+          if (k !== 'content-encoding' && k !== 'content-length') headers.append(k, v);
+        }
+        return new Response(buffered, { status: res.status, statusText: res.statusText, headers });
+      }
+      // A redirect: discard the body so the socket is releasable, then re-derive
+      // the next hop's init before looping (the guard re-validates the new URL).
+      await res.arrayBuffer().catch(() => {});
+      const next = new URL(location, current);
+      hopInit = initForRedirect(hopInit, url, next, res.status);
+      current = next.toString();
     } finally {
       await dispatcher.close().catch(() => {});
     }
-    const isRedirect = res.status >= 300 && res.status < 400;
-    const location = res.headers.get('location');
-    if (!isRedirect || !location) return res;
-    current = new URL(location, current).toString();
   }
   throw new SsrfBlockedError(rawUrl, `too many redirects (>${maxRedirects})`);
+}
+
+/** Carry `init` across a redirect the way undici's own redirect handler does.
+ *
+ *  Following redirects manually (which the SSRF check requires, so every hop can
+ *  be re-validated) means losing what undici would otherwise do for free — and
+ *  what it does is SECURITY-relevant: it strips credential headers when the hop
+ *  changes origin. Without this, a public URL that 302s to an attacker host
+ *  replayed Authorization/Cookie verbatim to that host, turning the SSRF guard
+ *  into a credential-exfiltration path (2026-08-13 adversarial review of this
+ *  file's own first version). It also downgrades the method per spec, so a POST
+ *  body is not silently re-sent somewhere new. */
+export function initForRedirect(prev: RequestInit, from: URL, to: URL, status: number): RequestInit {
+  const out: RequestInit = { ...prev };
+  if (from.origin !== to.origin) {
+    const headers = new Headers((prev.headers ?? {}) as never);
+    for (const name of ['authorization', 'cookie', 'proxy-authorization']) headers.delete(name);
+    out.headers = headers;
+  }
+  const method = (prev.method ?? 'GET').toUpperCase();
+  // 303 always becomes GET; 301/302 downgrade a POST. 307/308 deliberately
+  // preserve both method and body.
+  if (status === 303 || ((status === 301 || status === 302) && method === 'POST')) {
+    out.method = 'GET';
+    out.body = undefined;
+  }
+  return out;
 }

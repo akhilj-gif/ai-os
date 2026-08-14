@@ -17,7 +17,7 @@
 // one bypass, the IPv4-compatible IPv6 form, that a regex-based implementation
 // silently failed for weeks. Each such bypass is pinned below as a named
 // regression so it can never come back unnoticed.
-import { assertPublicHttpUrl, SsrfBlockedError } from './ssrf-guard.js';
+import { assertPublicHttpUrl, SsrfBlockedError, initForRedirect } from './ssrf-guard.js';
 
 let fail = 0;
 const check = (name: string, ok: boolean) => {
@@ -109,6 +109,44 @@ try {
   const msg = err instanceof Error ? err.message : String(err);
   check('block message mentions no resolved-address detail beyond the input', !/resolves to \d/.test(msg));
 }
+
+// --- redirect carry-over rules -------------------------------------------
+// Following redirects manually is REQUIRED here (every hop must be re-validated),
+// but it means losing what undici's own redirect handler does for free — and part
+// of that is security-relevant. The first version of ssrfSafeFetch replayed
+// Authorization and Cookie verbatim to a redirect target on a DIFFERENT host,
+// which turns the SSRF guard into a credential-exfiltration path: a public URL
+// 302s to an attacker host and hands over the bearer token. Pinned here.
+const withCreds = (): RequestInit => ({
+  method: 'POST',
+  body: 'x=1',
+  headers: { authorization: 'Bearer supersecret', cookie: 'session=abc', 'content-type': 'text/plain' },
+});
+const hdr = (i: RequestInit, n: string): string | null => new Headers((i.headers ?? {}) as never).get(n);
+const A = new URL('https://good.example/a');
+const B = new URL('https://evil.example/b');
+const sameHost = new URL('https://good.example/other');
+
+const cross = initForRedirect(withCreds(), A, B, 302);
+check('cross-host redirect strips Authorization', hdr(cross, 'authorization') === null);
+check('cross-host redirect strips Cookie', hdr(cross, 'cookie') === null);
+check('cross-host redirect keeps benign headers', hdr(cross, 'content-type') === 'text/plain');
+
+const same = initForRedirect(withCreds(), A, sameHost, 307);
+check('SAME-host redirect keeps Authorization (not over-broad)', hdr(same, 'authorization') === 'Bearer supersecret');
+
+// Method/body downgrade per spec, so a POST body is not silently re-sent.
+check('303 downgrades to GET', initForRedirect(withCreds(), A, sameHost, 303).method === 'GET');
+check('303 drops the body', initForRedirect(withCreds(), A, sameHost, 303).body === undefined);
+check('302 downgrades a POST to GET', initForRedirect(withCreds(), A, sameHost, 302).method === 'GET');
+check('307 PRESERVES method and body', (() => {
+  const r = initForRedirect(withCreds(), A, sameHost, 307);
+  return r.method === 'POST' && r.body === 'x=1';
+})());
+check('308 PRESERVES method and body', (() => {
+  const r = initForRedirect(withCreds(), A, sameHost, 308);
+  return r.method === 'POST' && r.body === 'x=1';
+})());
 
 console.log(`\n${fail === 0 ? 'ALL PASS' : fail + ' FAILED'}`);
 process.exit(fail ? 1 : 0);
