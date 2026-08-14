@@ -50,10 +50,11 @@ const vite = await createVite({
 await vite.listen();
 const port = vite.config.server.port ?? 3001;
 
-const hit = (site: string | null): Promise<number> =>
+const hit = (site: string | null, host?: string): Promise<number> =>
   new Promise((ok) => {
     const headers: Record<string, string> = { 'content-type': 'text/plain' };
     if (site !== null) headers['sec-fetch-site'] = site;
+    if (host !== undefined) headers['host'] = host;
     const rq = request({ host: '127.0.0.1', port, path: '/api/trust/promote', method: 'POST', headers }, (rs) => {
       rs.resume();
       rs.on('end', () => ok(rs.statusCode ?? 0));
@@ -83,6 +84,16 @@ try {
       check(`${label} -> 403 AND token never forwarded`, status === 403 && !reached, `status=${status} token=${reached}`);
     }
   }
+
+  // DNS rebinding: a rebound attacker-owned NAME yields a genuinely same-origin
+  // request, so only the Host check stops it.
+  for (const host of ['evil.example:3001', 'rebind.attacker.test']) {
+    tokenSeen = null;
+    const status = await hit('same-origin', host);
+    check(`rebound Host "${host}" -> 403 AND token never forwarded`, status === 403 && tokenSeen === null, `status=${status} token=${tokenSeen !== null}`);
+  }
+  tokenSeen = null;
+  check('loopback Host still allowed', (await hit('same-origin', '127.0.0.1:3001')) === 200 && tokenSeen === 'ZZ-ADMIN-TOKEN');
 
   let bad = 0;
   for (let i = 0; i < 25; i++) if ((await hit('cross-site')) !== 403) bad++;

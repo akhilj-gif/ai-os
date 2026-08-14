@@ -8,6 +8,17 @@ import { type NextRequest } from 'next/server';
 const API = process.env.AIOS_API_BASE ?? 'http://localhost:4000';
 const TOKEN = process.env.AIOS_API_TOKEN ?? '';
 
+/** Is the Host header a loopback name? Port-agnostic on purpose — the point is to
+ *  reject a rebound attacker-owned NAME, and hard-coding a port would break the
+ *  UI the first time someone runs it somewhere else. */
+export function hostIsLoopback(host: string | null | undefined): boolean {
+  if (!host) return false;
+  const h = host.trim().toLowerCase();
+  // Strip the port, taking care with a bracketed IPv6 literal ("[::1]:3000").
+  const name = h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : (h.split(':')[0] ?? '');
+  return name === 'localhost' || name === '127.0.0.1' || name === '[::1]';
+}
+
 async function proxy(req: NextRequest, paramsP: Promise<{ path?: string[] }>): Promise<Response> {
   // This proxy is the one place ambient authority is minted: it attaches the
   // admin token to whatever arrives, so any request that reaches it executes
@@ -38,8 +49,24 @@ async function proxy(req: NextRequest, paramsP: Promise<{ path?: string[] }>): P
   // An allowlist also disposes of header-shape tricks for free: a capitalised
   // value, or a duplicated header that Headers.get joins into
   // "cross-site, same-origin", simply is not 'same-origin' and is refused.
-  if (req.headers.get('sec-fetch-site') !== 'same-origin') {
-    return new Response(JSON.stringify({ error: 'only same-origin requests may use the API proxy' }), {
+  //
+  // WHAT THIS DOES AND DOES NOT CLOSE — stated precisely, because an earlier
+  // version of this comment overclaimed. Sec-Fetch-Site is unforgeable from
+  // BROWSER JS, so the allowlist stops a hostile page driving this API. It does
+  // NOT stop a non-browser local process, which can simply set the header itself;
+  // that boundary is inherently soft anyway, since any process able to read .env
+  // or the pm2 environment already has AIOS_API_TOKEN. The threat handled here is
+  // browser-driven CSRF, not local privilege separation.
+  const site = req.headers.get('sec-fetch-site');
+  // Host must be loopback (2026-08-13). Without this, DNS rebinding defeats the
+  // allowlist entirely: an attacker points evil.example at 127.0.0.1, the victim
+  // loads http://evil.example:3000/, and that page's fetch to /api/* IS
+  // same-origin from the browser's point of view — so 'same-origin' arrives, the
+  // token is attached, and the origin check was worth nothing. Checking the
+  // hostname (port-agnostic, so a port change does not silently break the UI)
+  // pins the request to a name the attacker cannot own.
+  if (site !== 'same-origin' || !hostIsLoopback(req.headers.get('host'))) {
+    return new Response(JSON.stringify({ error: 'only same-origin loopback requests may use the API proxy' }), {
       status: 403,
       headers: { 'content-type': 'application/json' },
     });

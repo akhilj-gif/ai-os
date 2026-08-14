@@ -17,7 +17,7 @@
 // one bypass, the IPv4-compatible IPv6 form, that a regex-based implementation
 // silently failed for weeks. Each such bypass is pinned below as a named
 // regression so it can never come back unnoticed.
-import { assertPublicHttpUrl, SsrfBlockedError, initForRedirect } from './ssrf-guard.js';
+import { assertPublicHttpUrl, SsrfBlockedError, initForRedirect, drainCapped } from './ssrf-guard.js';
 
 let fail = 0;
 const check = (name: string, ok: boolean, extra = '') => {
@@ -188,6 +188,67 @@ check('308 PRESERVES method and body', (() => {
   const r = initForRedirect(withCreds(), A, sameHost, 308);
   return r.method === 'POST' && r.body === 'x=1';
 })());
+
+// --- response body cap ------------------------------------------------------
+// Both tool callers cap only AFTER `await res.text()`, so the whole body was
+// resident before any cap applied. Content-Length cannot bound that: a real gzip
+// bomb was measured at 407 KiB on the wire decompressing to 400 MB and +880 MB
+// RSS (2026-08-13). undici decompresses before handing over the stream, so the
+// cap has to be metered here, on decompressed bytes. Driven with a synthetic
+// stream rather than a live server because the guard (correctly) refuses to fetch
+// 127.0.0.1, so a local bomb server is unreachable through it by design.
+console.log('— response body cap —');
+const streamOf = (chunkSize: number, chunks: number): Response => {
+  let sent = 0;
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    pull(c) {
+      if (sent >= chunks) return c.close();
+      sent++;
+      c.enqueue(new Uint8Array(chunkSize).fill(65));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const r = new Response(body);
+  Object.defineProperty(r, 'wasCancelled', { get: () => cancelled });
+  return r;
+};
+
+const under = await drainCapped(streamOf(1000, 5), 8000);
+check('a body under the cap passes through whole', under.byteLength === 5000, `${under.byteLength} bytes`);
+
+const over = await drainCapped(streamOf(1000, 5000), 8000); // 5 MB offered, 8 KB allowed
+check('a body over the cap truncates at EXACTLY the cap', over.byteLength === 8000, `${over.byteLength} bytes`);
+
+// A 1 GB "bomb" must cost ~the cap, not the whole thing — the property that
+// makes this a DoS fix rather than a cosmetic limit.
+const bombRes = streamOf(1_000_000, 1000); // 1 GB offered
+const rssBefore = process.memoryUsage().rss;
+const bombOut = await drainCapped(bombRes, 8000);
+const rssDelta = process.memoryUsage().rss - rssBefore;
+check('a 1GB stream yields only the cap', bombOut.byteLength === 8000, `${bombOut.byteLength} bytes`);
+check('and costs almost no memory', rssDelta < 100_000_000, `RSS +${Math.round(rssDelta / 1e6)} MB`);
+check('the oversized stream was CANCELLED, not left draining', (bombRes as unknown as { wasCancelled: boolean }).wasCancelled === true);
+
+// --- cross-origin redirect header allowlist ---------------------------------
+// The first version denylisted three names, so every OTHER header was replayed
+// to the new host — and these tools routinely set exactly that kind of header
+// (http_get forwards model-supplied headers; the bridges use x-*-token).
+console.log('— cross-origin header allowlist —');
+const carried = new Headers(
+  initForRedirect(
+    { headers: { authorization: 'Bearer s', 'x-api-key': 'k', 'x-aios-token': 't', 'proxy-authorization': 'p', accept: 'text/html', 'user-agent': 'UA' } },
+    new URL('https://a.example/1'),
+    new URL('https://b.example/2'),
+    302,
+  ).headers as never,
+);
+for (const secret of ['authorization', 'x-api-key', 'x-aios-token', 'proxy-authorization']) {
+  check(`${secret} stripped on a cross-origin hop`, carried.get(secret) === null);
+}
+check('accept and user-agent survive', carried.get('accept') === 'text/html' && carried.get('user-agent') === 'UA');
 
 console.log(`\n${fail === 0 ? 'ALL PASS' : fail + ' FAILED'}`);
 process.exit(fail ? 1 : 0);

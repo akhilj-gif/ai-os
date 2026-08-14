@@ -25,15 +25,34 @@ import { defineConfig, type Plugin } from 'vite';
  *  remote-triggerable log/disk-growth nuisance. A middleware added in
  *  configureServer's body runs BEFORE Vite's internal proxy middleware, so a
  *  refused request never opens an upstream socket at all. */
+/** Is the Host header a loopback name? Mirrors hostIsLoopback in
+ *  apps/web/app/api/[...path]/route.ts — duplicated rather than shared because a
+ *  vite.config.ts cannot import from a Next app, and adding a workspace package
+ *  for six lines is not worth it. Keep the two in step. */
+function hostIsLoopback(host: string | undefined): boolean {
+  if (!host) return false;
+  const h = host.trim().toLowerCase();
+  const name = h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : (h.split(':')[0] ?? '');
+  return name === 'localhost' || name === '127.0.0.1' || name === '[::1]';
+}
+
 function apiOriginGuard(): Plugin {
   return {
     name: 'aios-api-origin-guard',
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
         if (!req.url?.startsWith('/api')) return next();
+        // Host must be a loopback NAME (2026-08-13). Without it, DNS rebinding
+        // defeats the origin check outright: point evil.example at 127.0.0.1, have
+        // the victim load http://evil.example:3001/, and that page's fetch to
+        // /api/* is same-origin as far as the browser is concerned — so
+        // 'same-origin' arrives and the token is attached. Vite's own allowedHosts
+        // blocks this by default, but it is disabled in several common configs, so
+        // the proxy does not rely on it. Port-agnostic so changing the port cannot
+        // silently break the UI.
         // A duplicated header arrives joined ("cross-site, same-origin") or as an
         // array; neither is === 'same-origin', so both are refused for free.
-        if (req.headers['sec-fetch-site'] !== 'same-origin') {
+        if (req.headers['sec-fetch-site'] !== 'same-origin' || !hostIsLoopback(req.headers.host)) {
           res.statusCode = 403;
           res.setHeader('content-type', 'application/json');
           res.end(JSON.stringify({ error: 'only same-origin requests may use the API proxy' }));

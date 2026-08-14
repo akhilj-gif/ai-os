@@ -94,7 +94,10 @@ function isBlockedV6(ip: string): boolean {
   const [g0, g1, g2, g3, g4, g5, g6, g7] = parsed as [number, number, number, number, number, number, number, number];
   if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0 && g6 === 0 && (g7 === 0 || g7 === 1)) return true; // :: or ::1
   if ((g0 & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+  if ((g0 & 0xffc0) === 0xfec0) return true; // fec0::/10 site-local (deprecated, still routed by some stacks)
   if ((g0 & 0xfe00) === 0xfc00) return true; // fc00::/7 unique-local
+  if ((g0 & 0xff00) === 0xff00) return true; // ff00::/8 multicast — the v6 analog of 224.0.0.0/4, already blocked for v4
+  if ((g0 & 0xff80) === 0xfe00) return true; // fe00::/9 unassigned — reserved space has no business being fetched
 
   // TRANSITION FAMILIES (2026-08-13). Every one of these EMBEDS an IPv4 address
   // somewhere other than the low 32 bits, so the mapped/compatible check below
@@ -119,6 +122,58 @@ function isBlockedV6(ip: string): boolean {
   if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && (g5 === 0 || g5 === 0xffff)) return isBlockedV4(lowV4);
   if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0xffff && g5 === 0) return isBlockedV4(lowV4); // ::ffff:0:a.b.c.d
   return false;
+}
+
+/** Hard ceiling on a single response body, applied to DECOMPRESSED bytes.
+ *
+ *  Both tool callers cap only AFTER `await res.text()` — http.ts slices to
+ *  MAX_BODY, fetch-url.ts to MAX_BYTES — so the whole body was already resident
+ *  before any cap applied. That is a memory DoS, and Content-Length cannot bound
+ *  it: a gzip decompression bomb was measured turning a 510 KiB transfer into
+ *  ~2.8 GB of RSS and killing the process (2026-08-13). undici decompresses
+ *  before handing us the stream, so metering it HERE is the only place the real
+ *  size is known. Set well above fetch-url's own 2 MB cap so no existing caller
+ *  changes behaviour. */
+const MAX_RESPONSE_BYTES = 8_000_000;
+
+/** Fallback request timeout for a caller that passes no AbortSignal. */
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+/** Read at most `maxBytes` of the body, then cancel the stream. TRUNCATES rather
+ *  than throwing, because both callers already truncate — a hostile server must
+ *  not be able to turn "page too big" into a failed task, only a shorter page. */
+export async function drainCapped(res: Response, maxBytes: number): Promise<Uint8Array> {
+  const reader = res.body?.getReader();
+  if (!reader) return new Uint8Array(0);
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      const room = maxBytes - total;
+      if (value.byteLength >= room) {
+        chunks.push(value.subarray(0, room));
+        total += room;
+        await reader.cancel().catch(() => {});
+        break;
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } catch {
+    // A mid-body network error still yields whatever arrived; the caller sees a
+    // short body rather than an exception from deep inside the guard.
+    await reader.cancel().catch(() => {});
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.byteLength;
+  }
+  return out;
 }
 
 export class SsrfBlockedError extends Error {
@@ -263,9 +318,18 @@ function pinnedLookup(expectedHost: string, resolved: ResolvedAddress) {
  *  The returned Response is spec-compliant (json/text/status/headers/ok) and
  *  behaves identically for every caller here — none does an `instanceof`
  *  check against the global Response class. */
-export async function ssrfSafeFetch(rawUrl: string, init: RequestInit = {}, maxRedirects = 5): Promise<Response> {
+export async function ssrfSafeFetch(
+  rawUrl: string,
+  init: RequestInit = {},
+  maxRedirects = 5,
+  maxBytes = MAX_RESPONSE_BYTES,
+): Promise<Response> {
   let current = rawUrl;
-  let hopInit: RequestInit = { ...init };
+  // A caller that forgets a signal must not be able to hang forever on a server
+  // that stalls mid-body (2026-08-13). http_get always passes one; fetch_url
+  // does too, but the default belongs here so the NEXT caller cannot omit it.
+  const init2: RequestInit = init.signal ? init : { ...init, signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS) };
+  let hopInit: RequestInit = { ...init2 };
   for (let hop = 0; hop <= maxRedirects; hop++) {
     const { url, resolved } = await resolveAndValidate(current);
     const dispatcher = new Agent({ connect: { lookup: pinnedLookup(url.hostname, resolved) } });
@@ -292,12 +356,19 @@ export async function ssrfSafeFetch(rawUrl: string, init: RequestInit = {}, maxR
         // streaming it was actually using. content-encoding/length are dropped
         // because undici already decompressed the bytes we are re-wrapping.
         const noBody = res.status === 204 || res.status === 205 || res.status === 304;
-        const buffered = noBody ? null : await res.arrayBuffer();
+        const buffered = noBody ? null : await drainCapped(res, maxBytes);
         const headers = new Headers();
         for (const [k, v] of res.headers as unknown as Iterable<[string, string]>) {
           if (k !== 'content-encoding' && k !== 'content-length') headers.append(k, v);
         }
-        return new Response(buffered, { status: res.status, statusText: res.statusText, headers });
+        const out = new Response(buffered, { status: res.status, statusText: res.statusText, headers });
+        // Response.url is an empty string on a constructed Response and is
+        // read-only, so re-wrapping silently lost the POST-REDIRECT url —
+        // fetch-url.ts does `res.url || url` and was therefore reporting
+        // redirected content under the originally requested address (2026-08-13).
+        // An own property shadows the prototype getter.
+        Object.defineProperty(out, 'url', { value: current, enumerable: true });
+        return out;
       }
       // A redirect: discard the body so the socket is releasable, then re-derive
       // the next hop's init before looping (the guard re-validates the new URL).
@@ -325,8 +396,22 @@ export async function ssrfSafeFetch(rawUrl: string, init: RequestInit = {}, maxR
 export function initForRedirect(prev: RequestInit, from: URL, to: URL, status: number): RequestInit {
   const out: RequestInit = { ...prev };
   if (from.origin !== to.origin) {
-    const headers = new Headers((prev.headers ?? {}) as never);
-    for (const name of ['authorization', 'cookie', 'proxy-authorization']) headers.delete(name);
+    // ALLOWLIST the headers that survive a cross-origin hop, rather than
+    // denylisting three known credential names. The denylist version replayed
+    // every OTHER header verbatim to the new host (2026-08-13) — and the tools
+    // here routinely set exactly that kind of header: http_get forwards whatever
+    // `headers` the model supplies (commonly an api-key, x-api-key or a bearer
+    // under a vendor-specific name), and the bridges use x-aios-token /
+    // x-bridge-token. Any of those leaking to a redirect target is the same
+    // credential-exfiltration bug the original strip was added to prevent, just
+    // spelled differently. Keeping only content negotiation and the UA means a
+    // NEW credential header cannot be forgotten here later.
+    const KEEP = new Set(['accept', 'accept-language', 'accept-encoding', 'content-type', 'user-agent']);
+    const src = new Headers((prev.headers ?? {}) as never);
+    const headers = new Headers();
+    for (const [k, v] of src as unknown as Iterable<[string, string]>) {
+      if (KEEP.has(k.toLowerCase())) headers.append(k, v);
+    }
     out.headers = headers;
   }
   const method = (prev.method ?? 'GET').toUpperCase();
