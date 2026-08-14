@@ -16,9 +16,10 @@
 import { fileURLToPath } from 'node:url';
 import Fastify from 'fastify';
 import { chromium, type BrowserContext, type Page } from 'playwright';
-import { assertPublicHttpUrl, timingSafeEqualStr } from '@ai-os/shared';
+import { timingSafeEqualStr } from '@ai-os/shared';
 import { DEFAULT_BROWSER_BRIDGE_PORT, type ElementRef } from './contract.js';
 import { findInPage } from './find-in-page.js';
+import { installSsrfGuard } from './ssrf-route.js';
 
 // Playwright's own error messages (e.g. locator timeouts) embed ANSI dim/reset
 // codes from its terminal call-log pretty-printer — strip them before they hit
@@ -35,48 +36,9 @@ const USER_DATA_DIR = process.env.BROWSER_USER_DATA_DIR ?? fileURLToPath(new URL
 let context: BrowserContext | null = null;
 let page: Page | null = null;
 
-// SSRF guard (2026-08-12, variant-analysis hunt): /navigate previously checked
-// only the URL scheme, so a model-issued goto could reach 127.0.0.1, another
-// loopback bridge, or (once this ever runs on a cloud VM) the metadata
-// endpoint. A route handler is the right layer for a REAL browser rather than
-// a one-time check before p.goto: Playwright fires a new request through this
-// handler for the entry URL AND for every redirect hop the server sends, so a
-// public URL that later 302s into a private one is caught too — a check made
-// only before the initial goto would miss that. Scoped to top-level document
-// navigations only; page subresources (scripts/images/xhr from an already-
-// approved page) are a different, broader threat model and out of scope here.
-//
-// Registered on the CONTEXT, not the one tracked Page (2026-08-12,
-// differential-review self-check — a live Playwright repro proved
-// page.route() gives a popup opened via window.open()/target="_blank" ZERO
-// coverage: the popup's own top-level navigation never reaches the handler at
-// all, no encoding tricks needed). context.route() applies to every page the
-// context ever creates, existing or future.
-//
-// Validates EVERY 'document'-type request, main-frame or iframe, rather than
-// trying to identify "is this a top-level navigation" — an earlier version
-// called req.frame() to check that, but a live repro of the SAME popup
-// scenario proved req.frame() THROWS for a popup's very first navigation
-// request (the frame object isn't wired up yet when the request is issued —
-// a genuine Playwright race, not a coding mistake). An uncaught throw inside
-// a route handler is worse than the bypass being fixed. Treating every
-// document request the same sidesteps the race entirely and, as a bonus,
-// also covers iframe navigations to an internal target, which the frame-
-// identity check would have excluded.
-function installSsrfGuard(ctx: BrowserContext): void {
-  ctx.route('**/*', async (route) => {
-    const req = route.request();
-    if (req.resourceType() !== 'document') return route.continue();
-    try {
-      await assertPublicHttpUrl(req.url());
-      return route.continue();
-    } catch {
-      // Playwright throws if the route already resolved by the time abort()
-      // runs (a race with continue() elsewhere) — the request is gone either way.
-      return route.abort('blockedbyclient').catch(() => {});
-    }
-  });
-}
+// The SSRF route guard lives in ./ssrf-route.ts so its smoke can import the
+// real installer without booting this server. See that file for the full
+// rationale, including the documented DNS-rebinding residual.
 
 async function ensurePage(): Promise<Page> {
   if (context && page && !page.isClosed()) return page;

@@ -20,8 +20,8 @@
 import { assertPublicHttpUrl, SsrfBlockedError, initForRedirect } from './ssrf-guard.js';
 
 let fail = 0;
-const check = (name: string, ok: boolean) => {
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}`);
+const check = (name: string, ok: boolean, extra = '') => {
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${extra ? ' — ' + extra : ''}`);
   if (!ok) fail++;
 };
 
@@ -95,6 +95,47 @@ const BLOCKED_V6 = [
 for (const [u, why] of BLOCKED_V6) check(`v6 blocked (${why}): ${u}`, await blocked(u!));
 
 check('v6 public allowed: [2606:4700::1111]', await allowed('http://[2606:4700::1111]/'));
+check('v6 public allowed: [2001:4860:4860::8888] (2001::/16 is NOT Teredo)', await allowed('http://[2001:4860:4860::8888]/'));
+
+// TRANSITION FAMILIES — each embeds an IPv4 address somewhere OTHER than the low
+// 32 bits, so the mapped/compatible check could not see it. All seven reached a
+// private address when tested live on 2026-08-13.
+const TRANSITION = [
+  ['http://[64:ff9b::7f00:1]/', 'NAT64 well-known -> 127.0.0.1'],
+  ['http://[64:ff9b::a9fe:a9fe]/', 'NAT64 -> 169.254.169.254 metadata'],
+  ['http://[64:ff9b::a00:1]/', 'NAT64 -> 10.0.0.1'],
+  ['http://[64:ff9b:1::7f00:1]/', 'NAT64 local-use /48'],
+  ['http://[2002:7f00:1::]/', '6to4 -> 127.0.0.1'],
+  ['http://[2002:a9fe:a9fe::]/', '6to4 -> 169.254.169.254'],
+  ['http://[2001:0:0:0:0:0:7f00:1]/', 'Teredo (2001:0::/32)'],
+  ['http://[::ffff:0:7f00:1]/', 'IPv4-translated ::ffff:0:a.b.c.d'],
+];
+for (const [u, why] of TRANSITION) check(`v6 transition blocked (${why})`, await blocked(u!));
+
+// One refusal message for every name-resolution outcome. http_get/fetch_url
+// return a caught error verbatim as tool output, so "no such name" reading
+// differently from "resolves internally" was a 1-bit oracle for enumerating
+// internal hostnames without ever connecting. Both must be byte-identical.
+async function reason(u: string): Promise<string> {
+  try {
+    await assertPublicHttpUrl(u);
+    return '(allowed)';
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+// A name that cannot resolve (.invalid is reserved for exactly this, RFC 2606)
+// versus one that resolves to loopback. localhost resolves internally on any box.
+const rNoSuchName = await reason('http://nonexistent-zz-probe.invalid/');
+const rInternal = await reason('http://localhost/');
+// replaceAll, not replace: the hostname appears TWICE (once in the echoed URL,
+// once in the reason) and a string-pattern replace only swaps the first.
+check(
+  'unresolvable and internal-resolving names give the SAME reason',
+  rNoSuchName.replaceAll('nonexistent-zz-probe.invalid', 'H') === rInternal.replaceAll('localhost', 'H'),
+  `"${rNoSuchName}" vs "${rInternal}"`,
+);
+check('neither reason reveals which case it was', !/private|internal address|no address|not exist/i.test(rInternal));
 
 // --- no DNS oracle ---------------------------------------------------------
 // The thrown message must not hand back an internal address: http_get/fetch_url

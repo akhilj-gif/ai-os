@@ -95,10 +95,29 @@ function isBlockedV6(ip: string): boolean {
   if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0 && g6 === 0 && (g7 === 0 || g7 === 1)) return true; // :: or ::1
   if ((g0 & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
   if ((g0 & 0xfe00) === 0xfc00) return true; // fc00::/7 unique-local
-  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && (g5 === 0 || g5 === 0xffff)) {
-    const v4 = `${(g6 >> 8) & 0xff}.${g6 & 0xff}.${(g7 >> 8) & 0xff}.${g7 & 0xff}`;
-    return isBlockedV4(v4);
-  }
+
+  // TRANSITION FAMILIES (2026-08-13). Every one of these EMBEDS an IPv4 address
+  // somewhere other than the low 32 bits, so the mapped/compatible check below
+  // could not see it — verified live: [64:ff9b::7f00:1], [2002:7f00:1::],
+  // [2001:0:0:0:0:0:7f00:1] and [::ffff:0:7f00:1] all reached 127.0.0.1, and the
+  // NAT64/6to4 forms of 169.254.169.254 reached cloud metadata. Refusing the
+  // whole prefix rather than decoding each one and testing the inner v4: these
+  // are deprecated or gateway-only (6to4 and Teredo are formally deprecated,
+  // NAT64 addresses belong to a translator, not to a host the OS should fetch),
+  // so there is no legitimate reason for one to appear in a model-supplied URL,
+  // and "block the range" cannot be defeated by a novel way of encoding the
+  // inner address. Prefixes are matched EXACTLY, not loosely — Teredo is
+  // 2001:0000::/32, and 2001::/16 as a whole is a huge legitimate global range
+  // that must keep working.
+  if (g0 === 0x2002) return true; // 6to4, 2002::/16 — v4 sits in g1:g2
+  if (g0 === 0x2001 && g1 === 0x0000) return true; // Teredo, 2001:0::/32 — server v4 in g2:g3, client v4 XOR-obfuscated in g6:g7
+  if (g0 === 0x0064 && g1 === 0xff9b) return true; // NAT64 well-known 64:ff9b::/96 and local-use 64:ff9b:1::/48
+
+  // IPv4-mapped (::ffff:a.b.c.d), IPv4-compatible (::a.b.c.d), and
+  // IPv4-translated (::ffff:0:a.b.c.d) all carry the v4 in the low 32 bits.
+  const lowV4 = `${(g6 >> 8) & 0xff}.${g6 & 0xff}.${(g7 >> 8) & 0xff}.${g7 & 0xff}`;
+  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && (g5 === 0 || g5 === 0xffff)) return isBlockedV4(lowV4);
+  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0xffff && g5 === 0) return isBlockedV4(lowV4); // ::ffff:0:a.b.c.d
   return false;
 }
 
@@ -153,13 +172,23 @@ async function resolveAndValidate(raw: string): Promise<{ url: URL; resolved: Re
   }
   // A hostname — resolve it and check EVERY answer (a name can round-robin
   // across public and private addresses; one safe answer proves nothing).
+  // ONE message for every name-resolution outcome (2026-08-13). These used to
+  // read differently — "could not resolve X" versus "X resolves to a
+  // private/internal address" — and http_get/fetch_url hand a caught error
+  // straight back as ordinary tool output, so the pair was a 1-bit oracle: a
+  // prompt-injected agent could enumerate INTERNAL HOSTNAMES (does
+  // `vault.internal` exist on this network?) purely from which refusal it got,
+  // without ever completing a connection. Removing the specific resolved IP from
+  // the message, done earlier, was not enough while the two failure MODES stayed
+  // distinguishable. The operator still gets the detail via console.warn below.
+  const REFUSED = `${host} could not be resolved to a public address`;
   let addrs: Array<{ address: string; family: number }>;
   try {
     addrs = await lookup(host, { all: true, verbatim: true });
   } catch {
-    throw new SsrfBlockedError(raw, `could not resolve ${host}`);
+    throw new SsrfBlockedError(raw, REFUSED);
   }
-  if (addrs.length === 0) throw new SsrfBlockedError(raw, `${host} resolved to no address`);
+  if (addrs.length === 0) throw new SsrfBlockedError(raw, REFUSED);
   for (const a of addrs) {
     const blocked = a.family === 4 ? isBlockedV4(a.address) : isBlockedV6(a.address);
     if (blocked) {
@@ -172,7 +201,7 @@ async function resolveAndValidate(raw: string): Promise<{ url: URL; resolved: Re
       // never completing a connection. console.warn keeps it for an operator
       // reading server logs; the tool-visible message does not.
       console.warn(`[ssrf-guard] blocked ${raw}: ${host} resolves to ${a.address}, a private/internal address`);
-      throw new SsrfBlockedError(raw, `${host} resolves to a private/internal address`);
+      throw new SsrfBlockedError(raw, REFUSED); // identical to the "no such name" case — see REFUSED above
     }
   }
   const first = addrs[0]!;

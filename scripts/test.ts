@@ -31,6 +31,7 @@ const SMOKES = [
   'packages/packs/src/mobility-decide-smoke.ts',
   'packages/packs/src/uber-smoke.ts',
   'apps/browser-bridge/src/find-in-page-smoke.ts',
+  'apps/browser-bridge/src/ssrf-route-smoke.ts', // bridge SSRF guard covers EVERY http(s) request, not just documents (security-critical)
   'apps/voice/src/lib/vad-smoke.ts',
 ];
 
