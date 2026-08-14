@@ -1,7 +1,17 @@
 // Deterministic smoke suite runner (pnpm test). Runs only the suites that need
 // NO Docker / Postgres / model quota, so it is safe in CI and as a fast local
 // gate. DB/model-backed suites (memory, scheduler, graph, learning, whatsapp,
-// forge) run separately against a live stack; the eval gym is `pnpm eval`.
+// forge, kernel/memory-taint) run separately against a live stack; the eval gym
+// is `pnpm eval`.
+//
+// Two further suites are excluded because they BIND PORTS (4000, and 3001 for
+// the Vite one) to stand up a fake kernel API, so they need the stack DOWN
+// rather than up, and cannot share a runner with either group:
+//   cd apps/web   && npx tsx proxy-guard-smoke.mts
+//   cd apps/voice && npx tsx proxy-guard-smoke.mts
+// Both pin the ambient-authority guard on the /api proxies — the place the admin
+// token is minted — including the same-site-spans-every-localhost-port and
+// missing-header cases that were proven exploitable on 2026-08-13.
 import { spawnSync } from 'node:child_process';
 
 const SMOKES = [

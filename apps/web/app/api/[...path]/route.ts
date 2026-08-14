@@ -9,21 +9,37 @@ const API = process.env.AIOS_API_BASE ?? 'http://localhost:4000';
 const TOKEN = process.env.AIOS_API_TOKEN ?? '';
 
 async function proxy(req: NextRequest, paramsP: Promise<{ path?: string[] }>): Promise<Response> {
-  // Refuse to lend the API token to a CROSS-SITE request (2026-08-13 audit).
   // This proxy is the one place ambient authority is minted: it attaches the
-  // admin token to whatever arrives, so any request a browser can be induced to
-  // make to localhost:3000/api/* would otherwise execute fully authenticated —
-  // classic CSRF, except the credential is injected rather than a cookie. A
-  // malicious page cannot read the response, but the side effect (approve a
-  // pending action, promote a trust policy, send a message) already happened.
+  // admin token to whatever arrives, so any request that reaches it executes
+  // fully authenticated. That is CSRF with an injected credential instead of a
+  // cookie — a malicious page cannot read the response, but the side effect
+  // (approve a pending action, promote a trust policy, send a message) has
+  // already happened.
   //
-  // Sec-Fetch-Site is set by the browser and cannot be forged from JS, which is
-  // exactly why the check belongs here rather than on an Origin allowlist. We
-  // reject ONLY the explicit 'cross-site' value: same-origin/same-site are the
-  // real UI, and a MISSING header means a non-browser client (tools, CLI, the
-  // supervisor) which never had this exposure and stays token-gated as before.
-  if (req.headers.get('sec-fetch-site') === 'cross-site') {
-    return new Response(JSON.stringify({ error: 'cross-site requests are not allowed' }), {
+  // ALLOWLIST, not a denylist. The first version of this check rejected only the
+  // literal 'cross-site', which was wrong in two proven ways (2026-08-13, real
+  // browser rig):
+  //   - Sec-Fetch-Site has FOUR values and three of them were being trusted. A
+  //     page served from ANY OTHER PORT on localhost is a different ORIGIN but
+  //     the SAME SITE, so it sends 'same-site' — and drove this API with the
+  //     admin token on 4 of 4 vectors (no-cors fetch POST, img GET, sendBeacon,
+  //     cross-origin form POST). On loopback, "same-site" spans every port, so
+  //     it is worth nothing as a trust signal.
+  //   - A request with NO Sec-Fetch-Site header was allowed on the reasoning
+  //     that non-browser clients "stay token-gated as before". That reasoning was
+  //     backwards: this proxy GIVES them the token. It re-opened precisely the
+  //     "any local process can act as the user" hole that the API token exists to
+  //     close (see the comment above the auth hook in apps/api/src/server.ts).
+  // Legitimate non-browser callers (tools, CLI, supervisor, scripts/ops.ts) talk
+  // to the API directly on :4000 with their own AIOS_API_TOKEN and never come
+  // through here, so requiring same-origin costs nothing. Every real UI call is a
+  // relative fetch/EventSource from the page itself, i.e. same-origin.
+  //
+  // An allowlist also disposes of header-shape tricks for free: a capitalised
+  // value, or a duplicated header that Headers.get joins into
+  // "cross-site, same-origin", simply is not 'same-origin' and is refused.
+  if (req.headers.get('sec-fetch-site') !== 'same-origin') {
+    return new Response(JSON.stringify({ error: 'only same-origin requests may use the API proxy' }), {
       status: 403,
       headers: { 'content-type': 'application/json' },
     });
