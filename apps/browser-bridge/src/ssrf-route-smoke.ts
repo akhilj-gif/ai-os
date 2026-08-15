@@ -37,6 +37,12 @@ const internal = createServer((_q, r) => {
   r.writeHead(200, { 'content-type': 'text/plain' });
   r.end('INTERNAL-SECRET');
 });
+// Count ws upgrades too — otherwise the WebSocket probe below would read zero
+// arrivals and look "covered" when nothing was ever listening for it.
+internal.on('upgrade', (_q, sock) => {
+  hits++;
+  sock.destroy();
+});
 await new Promise<void>((ok) => internal.listen(0, '127.0.0.1', () => ok()));
 const port = (internal.address() as { port: number }).port;
 
@@ -83,6 +89,73 @@ try {
   for (const kind of ['image', 'script', 'stylesheet', 'fetch']) {
     check(`${kind} subresource blocked`, blocked.includes(kind), 'saw: ' + JSON.stringify(blocked));
   }
+
+  // Request kinds beyond plain subresources. These were measured individually on
+  // 2026-08-13; the two NOT covered are asserted as KNOWN so this suite records
+  // reality. If one of them ever starts being blocked, that is good news and this
+  // check should flip — a suite that quietly tolerates either outcome tells you
+  // nothing.
+  const arrivals = async (label: string, fn: () => Promise<unknown>): Promise<number> => {
+    const before = hits;
+    await fn().catch(() => undefined);
+    await page.waitForTimeout(900);
+    const n = hits - before;
+    console.log(`      ${label}: ${n} arrival(s)`);
+    return n;
+  };
+
+  check(
+    'web worker fetch is blocked',
+    (await arrivals('web worker', () =>
+      page.evaluate(async (p: number) => {
+        const src = `self.onmessage=async()=>{try{await fetch('http://127.0.0.1:${p}/w');}catch(e){}; self.postMessage('d');};`;
+        const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        await new Promise((r) => {
+          w.onmessage = r;
+          w.postMessage('go');
+        });
+      }, port),
+    )) === 0,
+  );
+
+  check(
+    'sendBeacon is blocked',
+    (await arrivals('sendBeacon', () => page.evaluate((p: number) => void navigator.sendBeacon(`http://127.0.0.1:${p}/b`, 'x'), port))) === 0,
+  );
+
+  check(
+    'popup window.open is blocked (why context.route, not page.route)',
+    (await arrivals('popup', () => page.evaluate((p: number) => void window.open(`http://127.0.0.1:${p}/p`, '_blank'), port))) === 0,
+  );
+
+  // KNOWN HOLE 1: ctx.route never sees a ws:// upgrade. routeWebSocket is the
+  // right API but does not fire under launchPersistentContext in playwright
+  // 1.61.1 (measured), which is the context type the bridge uses.
+  const wsArrivals = await arrivals('websocket', () =>
+    page.evaluate(
+      (p: number) =>
+        new Promise<string>((r) => {
+          const s = new WebSocket(`ws://127.0.0.1:${p}/ws`);
+          s.onopen = () => r('open');
+          s.onerror = () => r('err');
+          setTimeout(() => r('t'), 1500);
+        }),
+      port,
+    ),
+  );
+  check('KNOWN HOLE: ws:// still reaches loopback (documented residual)', wsArrivals > 0, wsArrivals === 0 ? 'now blocked — update ssrf-route.ts and flip this check' : 'as documented');
+
+  // KNOWN HOLE 2: Chrome's speculative loader bypasses route interception. Blind
+  // GET only (the page cannot read the response).
+  const preArrivals = await arrivals('link rel=prefetch', () =>
+    page.evaluate((p: number) => {
+      const l = document.createElement('link');
+      l.rel = 'prefetch';
+      l.href = `http://127.0.0.1:${p}/pf`;
+      document.head.appendChild(l);
+    }, port),
+  );
+  check('KNOWN HOLE: prefetch still reaches loopback (documented residual)', preArrivals > 0, preArrivals === 0 ? 'now blocked — update ssrf-route.ts and flip this check' : 'as documented');
 
   // A guard that blocks everything is not a guard — a public navigation must
   // still work. (Network-dependent; treated as informational if offline.)
