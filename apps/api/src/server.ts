@@ -192,7 +192,16 @@ app.addHook('onRequest', async (req, reply) => {
   }
 });
 
-app.get('/health', async () => {
+// Readiness, and it must be HONEST (2026-08-15 harness pass). This used to
+// return HTTP 200 unconditionally with {ok:false} in the BODY when Postgres was
+// down — but every consumer only looks at the status code: ops.ts's httpUp(),
+// scripts/up.ts's health gate, the supervisor's recovery check, and any external
+// watchdog. So a completely broken OS reported itself healthy to the very things
+// whose job is to notice, which is the worst possible failure mode for a
+// component called /health. Now: 200 only when the hard dependencies are up,
+// 503 otherwise. Langfuse stays advisory — it is optional telemetry and must not
+// gate readiness.
+app.get('/health', async (_req, reply) => {
   const services: Record<string, string> = {};
   try {
     await pool.query('SELECT 1');
@@ -216,7 +225,15 @@ app.get('/health', async () => {
     services.langfuse = 'unreachable';
   }
   const ok = services.postgres === 'ok' && services.redis === 'ok';
-  return { ok, milestone: 'M10', services };
+  // uptime + pid make "did it restart?" answerable from a single curl, which is
+  // the first question during an incident.
+  return reply.code(ok ? 200 : 503).send({
+    ok,
+    services,
+    pid: process.pid,
+    uptimeSec: Math.round(process.uptime()),
+    startedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+  });
 });
 
 // M8 settings: which providers/models the router will use, in failover order

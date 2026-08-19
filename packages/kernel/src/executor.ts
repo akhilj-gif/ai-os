@@ -5,13 +5,19 @@
 // last checkpoint (M1 exit criterion). Planner/task-graph arrive in M4; at M1
 // every task is a single sequential loop.
 import type pg from 'pg';
-import { TraceStore } from '@ai-os/shared';
+import { TraceStore, logger } from '@ai-os/shared';
 import { chat, type ChatMessage } from '@ai-os/model-router';
 import { buildRegistry, type ToolRegistry } from '@ai-os/tools';
 import { TrustGate, blockedByUntrustedContext, redactForAudit } from '@ai-os/trust';
 import { extractAndStore } from '@ai-os/memory';
 import { systemPrompt } from './prompts.js';
 import { assembleMemoryContext, compactHistory, shrinkToolResults } from './context.js';
+
+// Structured logging: these used to be bare console.log lines carrying a taskId
+// in a prose string, which meant a log line could never be JOINED to the task or
+// trace that produced it. Same information, now greppable and correlatable —
+// see packages/shared/src/log.ts.
+const log = logger('kernel');
 
 const MAX_ITERATIONS = 12;
 const KEEP_CHECKPOINTS = 3;
@@ -203,9 +209,9 @@ export async function runTask(
         memoryBlock = mem.block;
         memoryUntrusted = mem.untrusted;
       } catch (err) {
-        console.warn('[kernel] memory context failed (non-fatal):', err instanceof Error ? err.message : err);
+        log.warn('memory.context.failed', { taskId, traceId, err });
       } finally {
-        console.log(`[latency] assembleMemoryContext taskId=${taskId} ms=${Date.now() - t0}`);
+        log.info('memory.context.assembled', { taskId, traceId, ms: Date.now() - t0, untrusted: memoryUntrusted, chars: memoryBlock.length });
       }
     }
     messages = [
@@ -267,7 +273,7 @@ export async function runTask(
       await trace.record({ traceId, taskId, component: 'kernel', event: 'task.failed', payload: { error: msg } });
       return { taskId, status: 'failed', text: humanizeFailure(msg) };
     } finally {
-      console.log(`[latency] chat taskId=${taskId} iter=${iter} ms=${Date.now() - modelT0}`);
+      log.info('model.call', { taskId, traceId, iter, ms: Date.now() - modelT0 });
     }
 
     totalTokens += resp.usage.inputTokens + resp.usage.outputTokens;
@@ -337,7 +343,7 @@ export async function runTask(
           .then((stored) => {
             if (stored) return trace.record({ traceId, taskId, component: 'memory', event: 'memory.extracted', payload: { count: stored } });
           })
-          .catch((err) => console.warn('[kernel] memory extraction failed (non-fatal):', err instanceof Error ? err.message : err));
+          .catch((err) => log.warn('memory.extract.failed', { taskId, traceId, err }));
       }
       return { taskId, status: finalStatus, text };
     }

@@ -10,6 +10,8 @@
     "os:down": "tsx scripts/down.ts",
     "os:status": "tsx scripts/status.ts",
     "os:logs": "pm2 logs",
+    "os:doctor": "tsx scripts/doctor.ts",
+    "os:trace": "tsx scripts/trace.ts",
     "os:watch": "tsx scripts/supervisor.ts",
     "os:backup": "tsx scripts/backup.ts",
     "os:install-autostart": "tsx scripts/install-autostart.ts",

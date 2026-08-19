@@ -86,6 +86,24 @@ export async function httpJson(url: string, timeoutMs = 4_000): Promise<{ ok: bo
   }
 }
 
+/** READINESS: the endpoint answered AND reported itself ready (2xx).
+ *
+ *  httpUp() below deliberately accepts ANY response, so it answers "is something
+ *  listening on that port" — which is the right question for the web dev server.
+ *  It is the WRONG question for /health: a 503 from an API whose database is down
+ *  is still `status > 0`, so a liveness probe reports a dead OS as healthy. That
+ *  is exactly how the autonomous jobs sat broken for ~13 days while every monitor
+ *  said fine. Use this for anything that has an opinion about its own readiness. */
+export async function httpReady(url: string, timeoutMs = 4_000): Promise<boolean> {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: authHeaders() });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** LIVENESS: something answered on that port at all, whatever it said. */
 export async function httpUp(url: string, timeoutMs = 4_000): Promise<boolean> {
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: authHeaders() });

@@ -10,7 +10,7 @@
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { appendFileSync, mkdirSync, existsSync, readFileSync, statSync, writeFileSync, rmSync } from 'node:fs';
-import { API, BRIDGE, C, bridgeHeaders, dockerDaemonUp, httpUp, pm2List, run, sleep } from './ops.js';
+import { API, BRIDGE, C, bridgeHeaders, dockerDaemonUp, httpReady, httpUp, pm2List, run, sleep } from './ops.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const APPS = ['ai-os-api', 'ai-os-bridge', 'ai-os-web', 'ai-os-browser', 'ai-os-voice'];
@@ -37,7 +37,9 @@ function recoveryLocked(): boolean {
 }
 
 async function healthy(): Promise<boolean> {
-  if (!(await httpUp(`${API}/health`))) return false;
+  // httpReady, not httpUp: /health returns 503 when Postgres or Redis is down,
+  // and a liveness probe would score that as healthy and never recover it.
+  if (!(await httpReady(`${API}/health`))) return false;
   const states = await pm2List();
   return APPS.every((a) => states[a] === 'online');
 }

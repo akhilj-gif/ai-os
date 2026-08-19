@@ -12,6 +12,7 @@ Two kinds of document live here, and mixing them up is how the codebase drifted.
 | [architecture/TOOLS-AND-PACKS.md](architecture/TOOLS-AND-PACKS.md) | The complete tool catalog with trust classes, the `ToolDef`/`ToolContext` contract, the capability-pack system, Pack Forge, and the sandbox |
 | [architecture/OPERATIONS.md](architecture/OPERATIONS.md) | The process model and ports, the complete HTTP API reference, the interfaces, the ops runbook, every environment variable, and the model router |
 | [SECURITY.md](SECURITY.md) | The security model as built — threat model, trust gate, §8.3, SSRF, auth surfaces, **and an honest residuals list** |
+| [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Symptom → first move. Start with `pnpm os:doctor`, reconstruct an incident with `pnpm os:trace`, and how to read the structured logs |
 | [ROADMAP.md](ROADMAP.md) | Where the project actually is (measured) and the phased plan, with exit criteria |
 
 **Design — records intent and decisions at a point in time.** Historically

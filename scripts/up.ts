@@ -3,7 +3,7 @@
 // services to pm2 (auto-restart on crash). Idempotent: safe to run repeatedly.
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { C, run, runLive, dockerDaemonUp, dockerDesktopStart, pgReady, httpUp, waitFor, API, BRIDGE, WEB } from './ops.js';
+import { C, run, runLive, dockerDaemonUp, dockerDesktopStart, pgReady, httpReady, httpUp, waitFor, API, BRIDGE, WEB } from './ops.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -61,10 +61,10 @@ console.log(C.green('✓ pm2-logrotate: 10M/file, 10 rotations, compressed'));
 
 // 6. Health-gate: wait for API + bridge to answer (web dev server is slower — soft check).
 console.log('\n▶ health');
-const apiOk = await waitFor('api', () => httpUp(`${API}/health`), 45_000);
-const bridgeOk = await waitFor('whatsapp bridge', () => httpUp(`${BRIDGE}/health`), 30_000);
+const apiOk = await waitFor('api', () => httpReady(`${API}/health`), 45_000);
+const bridgeOk = await waitFor('whatsapp bridge', () => httpReady(`${BRIDGE}/health`), 30_000);
 const webOk = await waitFor('web (first compile is slow)', () => httpUp(WEB), 60_000, 5_000);
 
 console.log(C.bold('\n▶ up complete') + `  api:${apiOk ? C.green('●') : C.red('●')}  bridge:${bridgeOk ? C.green('●') : C.red('●')}  web:${webOk ? C.green('●') : C.yellow('●')}`);
-console.log(C.dim('  logs: npx pm2 logs   ·   status: pnpm status   ·   stop: pnpm down\n'));
+console.log(C.dim('  logs: pnpm os:logs   ·   status: pnpm os:status   ·   diagnose: pnpm os:doctor   ·   stop: pnpm os:down\n'));
 process.exit(0);
