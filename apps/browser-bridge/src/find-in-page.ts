@@ -35,7 +35,30 @@ export function findInPage(query: string): ElementRef[] {
     if (!name) continue;
     if (q && !(name.toLowerCase().includes(q) || role.includes(q))) continue;
     seen.add(el);
-    const ref = 'e' + i++;
+    // The ref carries IDENTITY, not just position (2026-08-19). It used to be a
+    // bare counter, 'e0','e1','e2'… assigned in document order, and /act only
+    // checked that SOMETHING carried the ref. So when a page re-rendered and a
+    // later find() re-numbered the elements, the model's saved "e1" resolved to a
+    // DIFFERENT control: the existence check passed, the click landed on the
+    // wrong thing, and the bridge reported ok:true. Wrong action, success
+    // reported — the worst failure mode available to a browser agent.
+    //
+    // Appending a digest of role+name makes a re-bound ref simply NOT EXIST, so
+    // the stale-ref 404 that /act already returns starts firing for this case
+    // too. No new parameter and no cooperation from the model required: it hands
+    // back the same opaque string it was given.
+    //
+    // KNOWN LIMIT: two controls with the SAME role and name (two "Delete"
+    // buttons in a list) produce the same digest, so they remain distinguishable
+    // only by position — the thing that is unreliable. Verified, not assumed.
+    // This scheme fixes the dangerous case, where the ref silently comes to mean
+    // a DIFFERENTLY-named control ("Sign in" -> "Accept cookies"); it does not
+    // claim to resolve genuine duplicates, which need row context the accessible
+    // name does not carry.
+    let h = 5381;
+    const idSrc = role + '|' + name;
+    for (let k = 0; k < idSrc.length; k++) h = ((h << 5) + h + idSrc.charCodeAt(k)) >>> 0;
+    const ref = 'e' + i++ + '~' + h.toString(36).slice(0, 4);
     el.setAttribute('data-aios-ref', ref);
     out.push({ ref, role, name });
     if (out.length >= 50) break;

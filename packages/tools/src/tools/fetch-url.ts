@@ -37,11 +37,54 @@ function looksBlocked(text: string): boolean {
   return text.length < 400 || GATE_PHRASES.some((p) => lower.includes(p));
 }
 
+// Boilerplate-aware extraction (2026-08-19).
+//
+// The previous version stripped only script/style/noscript/svg/head, so the text
+// began with the site's navigation. That was not cosmetic: research.ts feeds the
+// model the FIRST 3,000 characters of this output, so for
+// https://en.wikipedia.org/wiki/PostgreSQL the model received "Jump to content |
+// Main menu | Navigation | Main page | Contents | Random article | About
+// Wikipedia | Contact us …" and not one sentence about PostgreSQL — while the run
+// still reported success. Measured on that exact URL.
+//
+// Three passes, cheapest first, no dependency:
+//   1. Drop layout containers outright.
+//   2. If the page marks its content with <main>/<article>, keep only that — the
+//      highest-signal hint a page can give, and most real sites give it.
+//   3. Score what remains and drop link-menu blocks, for the sites that mark up
+//      nothing. Navigation is many short fragments with almost no sentence
+//      punctuation; prose is the opposite.
+const LAYOUT_TAGS = 'script|style|noscript|svg|head|nav|header|footer|aside|form|button|select|dialog|iframe|template';
+const LAYOUT_RE = new RegExp(`<(${LAYOUT_TAGS})\\b[^>]*>[\\s\\S]*?<\\/\\1>`, 'gi');
+
+/** Keep the innermost <main>/<article> when present — on Wikipedia this alone
+ *  removes the sidebar, the interwiki language list and the edit chrome. */
+function mainContent(html: string): string {
+  for (const tag of ['article', 'main']) {
+    const m = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i').exec(html);
+    // Guard against a tiny decorative <article> (a teaser card) beating the real
+    // body: only take it when it holds a meaningful share of the page.
+    if (m?.[1] && m[1].length > html.length * 0.15) return m[1];
+  }
+  return html;
+}
+
+/** Navigation rather than content? Link menus are many short lines with no
+ *  sentence enders; prose has long lines that end in punctuation. */
+function isBoilerplate(block: string): boolean {
+  const lines = block.split('\n').map((l) => l.trim()).filter(Boolean);
+  if (!lines.length) return true;
+  const shortRatio = lines.filter((l) => l.length < 40).length / lines.length;
+  const sentences = (block.match(/[.!?]["')\]]?(\s|$)/g) ?? []).length;
+  const words = block.split(/\s+/).length;
+  return shortRatio > 0.75 && sentences < Math.max(2, words / 120);
+}
+
 function extract(html: string): { title: string; text: string } {
   const title = decodeEntities(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.trim() ?? '');
-  const text = decodeEntities(
-    html
-      .replace(/<(script|style|noscript|svg|head)[\s\S]*?<\/\1>/gi, ' ')
+  const body = mainContent(html.replace(LAYOUT_RE, ' '));
+  const flat = decodeEntities(
+    body
       .replace(/<!--[\s\S]*?-->/g, ' ')
       .replace(/<\/(p|div|li|h[1-6]|br|tr|section|article)>/gi, '\n')
       .replace(/<[^>]+>/g, ' ')
@@ -49,7 +92,15 @@ function extract(html: string): { title: string; text: string } {
       .replace(/\n{3,}/g, '\n\n')
       .trim(),
   );
-  return { title, text };
+  // Never return nothing: a page that is genuinely all short lines (a link
+  // directory, a table) is still worth more than an empty string, so fall back
+  // to the unfiltered text rather than reporting a blank page.
+  const kept = flat
+    .split(/\n{2,}/)
+    .filter((b) => !isBoilerplate(b))
+    .join('\n\n')
+    .trim();
+  return { title, text: kept.length > 200 ? kept : flat };
 }
 
 export const fetchUrl: ToolDef = {

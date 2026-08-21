@@ -159,12 +159,26 @@ async function main(): Promise<void> {
     const { action, ref, text } = (req.body ?? {}) as { action?: string; ref?: string; text?: string };
     if (!action) return reply.code(400).send({ error: 'action is required' });
     const p = await ensurePage();
-    const loc = ref ? p.locator(`[data-aios-ref="${ref}"]`) : null;
+    let loc = ref ? p.locator(`[data-aios-ref="${ref}"]`) : null;
     // A stale/typo'd ref has to fail this check to even reach click/fill/
     // selectOption below — otherwise a ref that plainly never existed pays
     // the full 15s action-timeout instead of failing in ~milliseconds.
     if (loc && (await loc.count()) === 0) {
-      return reply.code(404).send({ error: `no element matches ref "${ref}" — it may be stale (page navigated/re-rendered); call read/find again for current refs` });
+      // RECOVERY (2026-08-19): a ref is now `e<position>~<digest of role+name>`,
+      // and the digest follows the element when the page re-renders — "Sign in"
+      // stays ~1kxw even after it shifts from e0 to e1. So an exact-ref miss with
+      // exactly ONE element carrying the same digest is unambiguously the same
+      // control, just moved, and clicking it is what the caller meant. Requiring
+      // exactly one match is what keeps this safe: if the name is duplicated on
+      // the page there is a real choice to make, and guessing is how you click
+      // the wrong "Delete". Zero or many -> the stale-ref 404 below, unchanged.
+      const digest = ref?.includes('~') ? ref.slice(ref.indexOf('~')) : null;
+      const moved = digest ? p.locator(`[data-aios-ref$="${digest}"]`) : null;
+      if (moved && (await moved.count()) === 1) {
+        loc = moved;
+      } else {
+        return reply.code(404).send({ error: `no element matches ref "${ref}" — it may be stale (page navigated/re-rendered); call read/find again for current refs` });
+      }
     }
     try {
       switch (action) {
