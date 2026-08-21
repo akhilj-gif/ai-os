@@ -151,6 +151,24 @@ resolving to `127.0.0.1` produces a genuinely same-origin request.
 which can simply set the header itself. It closes browser-driven CSRF. The
 local-process boundary is soft by construction.
 
+### Camera (2026-08-19)
+
+The camera is a **user-initiated UI surface, not a model-callable tool**, and that
+is a deliberate departure from the `screen_capture` precedent (which is
+`read`/auto-approved, so the model can call it freely).
+
+A camera is materially different from a screen grab: it watches the user and the
+room they are in. A model-callable, auto-approved camera would mean a prompt
+injection on any page the OS reads could switch on the webcam. So there is no
+`camera_capture` tool. The stream is opened only by an explicit click in
+`apps/voice/src/pages/Camera.tsx`, released on page unmount (a leaked track
+leaves the hardware light on, which reads as the OS spying), and a frame reaches
+the model only when the user presses Ask — travelling the same attachment path as
+any pasted image, so it inherits the existing vision handling unchanged.
+
+If a model-callable version is ever wanted it must be `irreversible` (one-click
+approval per shot), never `read`.
+
 Secrets: `SecretsBroker` (`packages/trust/src/secrets.ts`) holds the known
 credential names and `redactForAudit` scrubs them from `steps.tool_args` and
 `steps.result` before they reach the append-only audit log.

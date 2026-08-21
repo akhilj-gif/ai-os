@@ -15,6 +15,7 @@ import Chats from './pages/Chats';
 import Tasks from './pages/Tasks';
 import Memory from './pages/Memory';
 import Jobs from './pages/Jobs';
+import CameraPage from './pages/Camera';
 import Settings from './pages/Settings';
 
 function Layout() {
@@ -39,6 +40,7 @@ function Layout() {
             <Route path="/chats" element={<Chats />} />
             <Route path="/tasks" element={<Tasks />} />
             <Route path="/memory" element={<Memory />} />
+            <Route path="/camera" element={<CameraPage />} />
             <Route path="/jobs" element={<Jobs />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>

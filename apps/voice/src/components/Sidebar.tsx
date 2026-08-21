@@ -11,7 +11,8 @@ import {
   AudioLines,
   Brain,
   BrainCircuit,
-  Hammer
+  Hammer,
+  Camera
 } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { useState } from 'react';
@@ -50,7 +51,8 @@ export default function Sidebar() {
          <NavItem icon={<MessageSquare size={20} />} label="Chats" to="/chats" />
          <NavItem icon={<CheckSquare size={20} />} label="Tasks" to="/tasks" />
          <NavItem icon={<Database size={20} />} label="Memory" to="/memory" />
-         <NavItem icon={<Briefcase size={20} />} label="Jobs" to="/jobs" />
+         <NavItem icon={<Camera size={20} />} label="Camera" to="/camera" />
+        <NavItem icon={<Briefcase size={20} />} label="Jobs" to="/jobs" />
          <NavItem icon={<Settings size={20} />} label="Settings" to="/settings" />
       </nav>
 
