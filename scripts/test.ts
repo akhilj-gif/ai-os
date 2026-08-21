@@ -22,6 +22,7 @@ const SMOKES = [
   'packages/packs/src/forge-scan-smoke.ts', // Pack Forge AST gate — 16 pinned code-exec vectors (security-critical)
   'packages/packs/src/files-smoke.ts',
   'packages/packs/src/browser-smoke.ts',
+  'packages/tools/src/search-smoke.ts', // search relevance gate — pins the Bing first-word-only garbage case
   'packages/model-router/src/failover-smoke.ts',
   'packages/kernel/src/agents-smoke.ts',
   'packages/kernel/src/context-smoke.ts',
