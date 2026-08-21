@@ -17,11 +17,35 @@ export function findInPage(query: string): ElementRef[] {
   // resolves the ref to TWO elements (hit live: "Enter Location" field and an
   // unrelated nav link both carried data-aios-ref="e1" → Playwright's strict
   // mode correctly refused to guess which one). Refs are a per-call snapshot.
-  for (const el of Array.from(document.querySelectorAll('[data-aios-ref]'))) el.removeAttribute('data-aios-ref');
+  // querySelectorAll does NOT pierce shadow roots, so every control inside a web
+  // component was invisible — measured 2026-08-19: a page whose only button was
+  // in an open shadow root returned an empty list. Design-system buttons, media
+  // players and many payment widgets live there, so "this page has no controls"
+  // was a lie on a growing share of real sites. Closed roots stay unreachable by
+  // construction; nothing can see into those.
+  //
+  // Written as an explicit STACK, not recursion with inner helper functions.
+  // This whole function is shipped to the browser via page.evaluate, and esbuild
+  // wraps nested function expressions in a `__name` helper that does not exist
+  // in the page — a first attempt using two inner arrows made every call throw
+  // `ReferenceError: __name is not defined`, i.e. it broke find entirely rather
+  // than just failing to see shadow content. A flat loop has no such hazard.
+  const roots: Array<Document | ShadowRoot> = [document];
+  const candidates: Element[] = [];
+  for (let ri = 0; ri < roots.length; ri++) {
+    const root = roots[ri]!;
+    for (const el of Array.from(root.querySelectorAll('[data-aios-ref]'))) el.removeAttribute('data-aios-ref');
+    for (const el of Array.from(root.querySelectorAll(sel))) candidates.push(el);
+    for (const el of Array.from(root.querySelectorAll('*'))) {
+      const sr = (el as Element & { shadowRoot?: ShadowRoot | null }).shadowRoot;
+      if (sr) roots.push(sr);
+    }
+  }
+
   const out: ElementRef[] = [];
   const seen = new Set<Element>();
   let i = 0;
-  for (const el of Array.from(document.querySelectorAll(sel))) {
+  for (const el of candidates) {
     if (seen.has(el)) continue;
     const r = el.getBoundingClientRect();
     const cs = getComputedStyle(el);

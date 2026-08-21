@@ -81,6 +81,34 @@ try {
   await snap();
   const r3 = await resolve(dRef);
   check('KNOWN LIMIT: duplicate names share a digest, so one is picked', r3.text === 'Delete', `${r3.how} -> ${r3.text}`);
+  // --- shadow DOM and iframes (2026-08-19) ---------------------------------
+  // querySelectorAll does not pierce either, so both were entirely invisible:
+  // a page whose only control sat in an open shadow root returned an empty
+  // list, and a cookie banner in an iframe could never be clicked. Both
+  // measured before the fix.
+  await page.setContent('<div id="h"></div><script>const s=document.getElementById("h").attachShadow({mode:"open"});s.innerHTML="<button>Shadow submit</button>";</script>');
+  const shadow = await snap();
+  check('a control inside an open shadow root is found', shadow.some((r) => r.name === 'Shadow submit'), shadow.map((r) => r.name).join(' | ') || '(none)');
+
+  // The find function is shipped into the page by evaluate(), where esbuild's
+  // `__name` helper does not exist — a first version of the shadow walk used
+  // inner arrow functions and made EVERY call throw ReferenceError, breaking
+  // find entirely rather than merely missing shadow content. This asserts the
+  // ordinary path still returns results, which is what that regression killed.
+  await page.setContent('<button>Plain button</button>');
+  check('the ordinary main-document path still works', (await snap()).some((r) => r.name === 'Plain button'));
+
+  await page.setContent('<button>Outer</button><iframe srcdoc="<button>Accept all cookies</button>"></iframe>');
+  await page.waitForTimeout(300);
+  // Mirrors findEverywhere() in index.ts: evaluate per frame, namespace child refs.
+  const everywhere: Array<{ ref: string; name: string }> = [];
+  for (const [i, f] of page.frames().entries()) {
+    const found = (await f.evaluate(findInPage, '').catch(() => [])) as Array<{ ref: string; name: string }>;
+    for (const r of found) everywhere.push(f === page.mainFrame() ? r : { ...r, ref: `f${i}:${r.ref}` });
+  }
+  check('an iframe control is reachable per-frame', everywhere.some((r) => r.name === 'Accept all cookies'), everywhere.map((r) => r.name).join(' | '));
+  const framed = everywhere.find((r) => r.name === 'Accept all cookies');
+  check('and its ref is namespaced to the frame that minted it', !!framed && /^f\d+:e\d+~/.test(framed.ref), framed?.ref);
 } finally {
   await browser.close();
 }

@@ -44,10 +44,46 @@ async function ensurePage(): Promise<Page> {
   if (context && page && !page.isClosed()) return page;
   context = await chromium.launchPersistentContext(USER_DATA_DIR, { headless: HEADLESS, viewport: { width: 1280, height: 800 } });
   installSsrfGuard(context);
+  // FOLLOW NEW TABS (2026-08-19). Measured: clicking a target="_blank" link on
+  // example.com opened a second page and the bridge kept driving the FIRST one,
+  // so every subsequent read/find/act targeted the tab the user had just left
+  // and the new one was orphaned. On a real site that is most checkout flows,
+  // most OAuth popups, and most "open in new tab" results — the task silently
+  // continues against the wrong document.
+  //
+  // Adopting the newest page is the right default for an agent: a click that
+  // opens a tab is the site moving you there. It is also reversible, since
+  // /tabs lists every page and /tabs/:i switches back.
+  context.on('page', (fresh) => {
+    void fresh
+      .waitForLoadState('domcontentloaded')
+      .catch(() => undefined)
+      .then(() => {
+        if (!fresh.isClosed()) page = fresh;
+      });
+  });
+  // If the tracked tab is closed (by the site or by us), fall back to whatever
+  // is left rather than throwing on the next call.
+  context.on('close', () => {
+    page = null;
+  });
   page = context.pages()[0] ?? (await context.newPage());
   const start = process.env.AIOS_BROWSER_START_URL;
   if (start) await page.goto(start, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
   return page;
+}
+
+/** Refs from a child frame carry an `f<index>:` prefix; resolve back to the
+ *  frame that minted them. Main-frame refs stay bare, which keeps the common
+ *  case short and every existing ref valid. */
+function locatorFor(p: Page, ref: string) {
+  const m = /^f(\d+):(.+)$/.exec(ref);
+  if (!m) return p.locator(`[data-aios-ref="${ref}"]`);
+  const frame = p.frames()[Number(m[1])];
+  // A vanished frame is a stale ref, and the caller's 404 path handles that —
+  // a locator over the main frame would silently find nothing, which reads the
+  // same to the caller but is a lie about where we looked.
+  return (frame ?? p.mainFrame()).locator(`[data-aios-ref="${m[2]}"]`);
 }
 
 const SNAPSHOT_MAX = 30;
@@ -56,12 +92,35 @@ const SNAPSHOT_MAX = 30;
  *  without a separate /find — refs are re-tagged each call, so these are valid
  *  right now (the stale-ref trap). */
 async function snapshot(p: Page): Promise<ElementRef[]> {
-  try {
-    const all = (await p.evaluate(findInPage, '')) as ElementRef[];
-    return all.slice(0, SNAPSHOT_MAX);
-  } catch {
-    return [];
+  return (await findEverywhere(p, '')).slice(0, SNAPSHOT_MAX);
+}
+
+/** Run findInPage in EVERY frame, not just the main one.
+ *
+ *  page.evaluate only ever reaches the main frame, and a cross-origin iframe
+ *  cannot be read from it at all — so cookie banners, embedded payment fields,
+ *  and third-party login widgets were entirely invisible. Measured 2026-08-19:
+ *  a page with one iframe reported one control from the main document while
+ *  "Accept all cookies" and a card-number field sat unreachable in the child.
+ *  Those are exactly the controls a real task has to click first.
+ *
+ *  Child-frame refs are namespaced `f<index>:<ref>` so /act can resolve them
+ *  back to the right frame. Frame index is a per-call snapshot, same contract
+ *  the refs themselves already have — and if the indexes shift, the identity
+ *  digest in the ref means the lookup misses and returns the stale-ref 404
+ *  rather than acting on the wrong element. */
+async function findEverywhere(p: Page, query: string): Promise<ElementRef[]> {
+  const frames = p.frames();
+  const out: ElementRef[] = [];
+  for (const [i, frame] of frames.entries()) {
+    // A detached or still-loading frame throws; it simply contributes nothing.
+    const found = (await frame.evaluate(findInPage, query).catch(() => [])) as ElementRef[];
+    const isMain = frame === p.mainFrame();
+    for (const r of found) {
+      out.push(isMain ? r : { ...r, ref: `f${i}:${r.ref}`, name: r.name });
+    }
   }
+  return out;
 }
 
 /** Let a page settle after a navigation/interaction: DOM ready always, then a
@@ -144,7 +203,7 @@ async function main(): Promise<void> {
   app.post('/find', async (req) => {
     const { query } = (req.body ?? {}) as { query?: string };
     const p = await ensurePage();
-    const matches = await p.evaluate(findInPage, query ?? '');
+    const matches = await findEverywhere(p, query ?? '');
     return { matches };
   });
 
@@ -159,7 +218,7 @@ async function main(): Promise<void> {
     const { action, ref, text } = (req.body ?? {}) as { action?: string; ref?: string; text?: string };
     if (!action) return reply.code(400).send({ error: 'action is required' });
     const p = await ensurePage();
-    let loc = ref ? p.locator(`[data-aios-ref="${ref}"]`) : null;
+    let loc = ref ? locatorFor(p, ref) : null;
     // A stale/typo'd ref has to fail this check to even reach click/fill/
     // selectOption below — otherwise a ref that plainly never existed pays
     // the full 15s action-timeout instead of failing in ~milliseconds.
@@ -173,7 +232,9 @@ async function main(): Promise<void> {
       // the page there is a real choice to make, and guessing is how you click
       // the wrong "Delete". Zero or many -> the stale-ref 404 below, unchanged.
       const digest = ref?.includes('~') ? ref.slice(ref.indexOf('~')) : null;
-      const moved = digest ? p.locator(`[data-aios-ref$="${digest}"]`) : null;
+      const fm = /^f(\d+):/.exec(ref ?? '');
+      const scope = fm ? (p.frames()[Number(fm[1])] ?? p.mainFrame()) : p;
+      const moved = digest ? scope.locator(`[data-aios-ref$="${digest}"]`) : null;
       if (moved && (await moved.count()) === 1) {
         loc = moved;
       } else {
