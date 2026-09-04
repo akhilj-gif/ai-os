@@ -206,7 +206,15 @@ async function tick(): Promise<boolean> {
 }
 
 if (process.argv.includes('--loop')) {
-  const everyMs = Number(process.env.AIOS_SUPERVISOR_POLL_MS) || 180_000;
+  // Once a day by default (was every 10 min, which was just noise now that the
+  // stack is stable). Safe only because of RETRY_MS below: a daily poll on its
+  // own would mean a crash at 09:00 goes unlooked-at until tomorrow.
+  const everyMs = Number(process.env.AIOS_SUPERVISOR_POLL_MS) || 24 * 3600_000;
+  // When a tick finds the stack unhealthy (or Docker still down), come back in
+  // a minute instead of a day. pm2 already auto-restarts crashed apps, so this
+  // is the second line of defence -- but a watchdog that sleeps through the
+  // whole outage it exists to catch is not a watchdog.
+  const RETRY_MS = 60_000;
   log(C.bold(`▶ supervisor loop (every ${Math.round(everyMs / 1000)}s)`));
   // Startup grace. os:up starts this supervisor as one of the pm2 apps, so at
   // t=0 the api it is about to probe is by definition still booting. The first
@@ -217,8 +225,8 @@ if (process.argv.includes('--loop')) {
   const until = Date.now() + GRACE_MS;
   while (Date.now() < until && !(await httpReady(`${API}/health`))) await sleep(3_000);
   for (;;) {
-    await tick();
-    await sleep(everyMs);
+    const ok = await tick();
+    await sleep(ok ? everyMs : RETRY_MS);
   }
 } else {
   const ok = await tick();

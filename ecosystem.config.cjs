@@ -105,7 +105,7 @@ module.exports = {
       interpreter: 'node',
       interpreter_args: '--import tsx',
       cwd: root,
-      env: { AIOS_API_TOKEN, BROWSER_BRIDGE_TOKEN, AIOS_SUPERVISOR_POLL_MS: '600000' },
+      env: { AIOS_API_TOKEN, BROWSER_BRIDGE_TOKEN, AIOS_SUPERVISOR_POLL_MS: '86400000' },
       out_file: join(root, 'logs/supervisor.log'),
       error_file: join(root, 'logs/supervisor.err.log'),
     },
