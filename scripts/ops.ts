@@ -113,6 +113,27 @@ export async function httpUp(url: string, timeoutMs = 4_000): Promise<boolean> {
   }
 }
 
+/** pm2 apps with the fields a health check actually needs. pm2List() below
+ *  returns a name→status MAP, and doctor.ts consumed it as an ARRAY — so
+ *  `apps.length` was undefined, `!apps.length` was always true, and the doctor
+ *  reported "pm2 apps: NOTHING running" on every run while six apps were online.
+ *  The per-app status and crash-loop branch underneath it had never executed.
+ *  Record<string,string> has an index signature, so `apps.length` type-checks as
+ *  `string` and nothing complained — and scripts/ was outside tsconfig's include
+ *  anyway. Returning a real array makes the shape match the use. */
+export async function pm2Apps(): Promise<Array<{ name: string; status: string; restarts: number }>> {
+  const r = await run('npx', ['pm2', 'jlist'], { timeoutMs: 20_000 });
+  try {
+    const arr = JSON.parse(r.out.slice(r.out.indexOf('['))) as Array<{
+      name: string;
+      pm2_env?: { status?: string; restart_time?: number };
+    }>;
+    return arr.map((a) => ({ name: a.name, status: a.pm2_env?.status ?? 'unknown', restarts: a.pm2_env?.restart_time ?? 0 }));
+  } catch {
+    return [];
+  }
+}
+
 /** pm2 process list (name → status), via npx so no global install is required. */
 export async function pm2List(): Promise<Record<string, string>> {
   const r = await run('npx', ['pm2', 'jlist'], { timeoutMs: 20_000 });

@@ -20,7 +20,7 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
-import { C, dockerDaemonUp, pgReady, httpReady, httpUp, pm2List, API, BRIDGE, WEB, bridgeHeaders } from './ops.js';
+import { C, dockerDaemonUp, pgReady, httpReady, httpUp, pm2Apps, API, BRIDGE, WEB, bridgeHeaders } from './ops.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 dotenv.config({ path: join(root, '.env') });
@@ -62,7 +62,7 @@ if (pool) {
 }
 
 // --- 4. processes -----------------------------------------------------------
-const apps = await pm2List();
+const apps = await pm2Apps();
 const EXPECTED = ['ai-os-api', 'ai-os-bridge', 'ai-os-web', 'ai-os-browser', 'ai-os-supervisor', 'ai-os-voice'];
 if (!apps.length) {
   record('fail', 'pm2 apps', 'NOTHING running', 'pnpm os:up   — nothing is running, which is why the OS appears dead');
@@ -261,5 +261,13 @@ for (const r of rows) {
 const verdict = fails ? C.red(`${fails} FAILED`) + (warns ? `, ${warns} warning(s)` : '') : warns ? C.yellow(`${warns} warning(s)`) : C.green('all clear');
 console.log(`\n  ${verdict}\n`);
 if (fails) console.log(C.dim('  Fix the FIRST failure — checks run outside-in, so later ones are usually symptoms.\n'));
+// Exit code is this script's entire machine-readable contract: a watchdog or CI
+// step reads it to decide whether the OS is healthy. Calling process.exit()
+// straight after pool.end() raced libuv's socket teardown and aborted the
+// process with `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)` and
+// status 3221226505 (0xC0000409) -- so a perfectly healthy run reported a
+// catastrophic failure, and a genuine 1 was indistinguishable from the crash.
+// Let the closing handles finish before exiting.
 await pool?.end();
+await new Promise((r) => setTimeout(r, 250));
 process.exit(fails ? 1 : 0);

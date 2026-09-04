@@ -208,6 +208,14 @@ async function tick(): Promise<boolean> {
 if (process.argv.includes('--loop')) {
   const everyMs = Number(process.env.AIOS_SUPERVISOR_POLL_MS) || 180_000;
   log(C.bold(`▶ supervisor loop (every ${Math.round(everyMs / 1000)}s)`));
+  // Startup grace. os:up starts this supervisor as one of the pm2 apps, so at
+  // t=0 the api it is about to probe is by definition still booting. The first
+  // tick used to fire immediately, score the stack unhealthy 370ms in, and
+  // trigger a full recovery of a stack that was merely young. Wait for the api
+  // to answer, and only give up (and let tick() do its job) after GRACE_MS.
+  const GRACE_MS = 90_000;
+  const until = Date.now() + GRACE_MS;
+  while (Date.now() < until && !(await httpReady(`${API}/health`))) await sleep(3_000);
   for (;;) {
     await tick();
     await sleep(everyMs);
