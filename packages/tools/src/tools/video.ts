@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
 import { describeVideo, callModel } from '@ai-os/model-router';
 import { MemoryService } from '@ai-os/memory';
-import { newTraceId } from '@ai-os/shared';
+import { newTraceId, assertPublicHttpUrl, SsrfBlockedError } from '@ai-os/shared';
 import type { ToolDef } from '../registry.js';
 
 const FFMPEG = process.env.AIOS_FFMPEG ?? 'ffmpeg';
@@ -79,6 +79,29 @@ export const videoAnalyze: ToolDef = {
       let input: string;
       let title: string;
       if (isUrl) {
+        // SSRF gate for a SUBPROCESS sink. Everything in ssrf-guard.ts — the
+        // private/link-local ranges, the IPv6 transition families, the resolve-
+        // every-answer rule, the uniform refusal message that denies an injected
+        // agent a hostname oracle — protects fetch()-based tools. yt-dlp does its
+        // OWN networking in another process, so NONE of it applied here: until
+        // 2026-09-04 `source` went from tool args straight to the command line,
+        // and video_analyze is read-class (so the §8.3 latch does not stop a
+        // prompt-injected agent from calling it). That made cloud metadata at
+        // 169.254.169.254 and any internal host reachable through a "summarize
+        // this video" request.
+        //
+        // HONEST RESIDUAL RISK, because this is a pre-check and not a sandbox:
+        // yt-dlp resolves the name again itself and follows redirects itself, so
+        // a hostile server can still 302 to an internal address, and a hostile
+        // resolver can still rebind between our check and its lookup. Closing
+        // those needs the subprocess confined at the OS/proxy level, which this
+        // is not. It closes the direct attack, which is the one that was open.
+        try {
+          await assertPublicHttpUrl(source);
+        } catch (err) {
+          if (err instanceof SsrfBlockedError) return { error: `refused to fetch that URL: ${err.message}` };
+          throw err;
+        }
         const dl = await run(
           YTDLP,
           ['-f', 'best[height<=720][ext=mp4]/best[height<=720]/best', '--no-playlist', '--merge-output-format', 'mp4', '--no-warnings', '-o', join(work, 'source.%(ext)s'), source],

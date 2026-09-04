@@ -2,7 +2,11 @@
 // NO Docker / Postgres / model quota, so it is safe in CI and as a fast local
 // gate. DB/model-backed suites (memory, scheduler, graph, learning, whatsapp,
 // forge, kernel/memory-taint) run separately against a live stack; the eval gym
-// is `pnpm eval`.
+// is `pnpm eval`. One of those is security-critical and worth naming:
+//   tsx packages/kernel/src/graph-untrusted-smoke.ts
+// It pins §8.3 on the GRAPH driver, which — unlike executor.ts — enforced none
+// of it until 2026-09-04: a write-class tool ran there under untrusted context.
+// Needs Postgres, because the taint latch is persisted on the task row.
 //
 // Two further suites are excluded because they BIND PORTS (4000, and 3001 for
 // the Vite one) to stand up a fake kernel API, so they need the stack DOWN
@@ -23,6 +27,7 @@ const SMOKES = [
   'packages/packs/src/files-smoke.ts',
   'packages/packs/src/browser-smoke.ts',
   'packages/tools/src/search-smoke.ts', // search relevance gate — pins the Bing first-word-only garbage case
+  'packages/tools/src/tools/video-ssrf-smoke.ts', // yt-dlp SUBPROCESS sink — ssrf-guard only covers fetch(); pins the metadata-service hole (security-critical)
   'packages/model-router/src/failover-smoke.ts',
   'packages/kernel/src/agents-smoke.ts',
   'packages/kernel/src/context-smoke.ts',
