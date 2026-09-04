@@ -34,6 +34,7 @@ const SMOKES = [
   'packages/kernel/src/context-smoke.ts',
   'packages/kernel/src/remote-smoke.ts',
   'packages/packs/src/x-smoke.ts',
+  'packages/tools/src/tools/instagram-smoke.ts', // instagram pack — pins the mock client + the caption/hashtag/public-image limits
   'packages/packs/src/mobility-smoke.ts',
   'packages/packs/src/mobility-decide-smoke.ts',
   'packages/packs/src/uber-smoke.ts',

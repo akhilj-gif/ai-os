@@ -374,7 +374,7 @@ async function executeStep(
       ]
         .filter(Boolean)
         .join('\n\n'),
-      maxTokens: 1200,
+      maxTokens: 900, // under Groq's 1,000 OTPM ceiling — see executor.ts
       traceId,
       taskId,
       name: `step:${step.title ?? 'reason'}`,

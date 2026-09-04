@@ -51,7 +51,7 @@ export async function updateKnowledgeGraph(
       // conversations (live: "Expected ',' or ']' … at position 1147"), which
       // lost the whole graph update. parseModelJson also salvages a truncated
       // response, so this is belt AND braces.
-      maxTokens: 1200,
+      maxTokens: 900, // under Groq's 1,000 OTPM ceiling — see executor.ts
       traceId: opts.traceId,
       taskId: opts.taskId,
       name: 'kg-extract',

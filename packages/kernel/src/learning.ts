@@ -113,7 +113,7 @@ export function llmProposer(pool: pg.Pool, ids: { taskId: string; traceId: strin
       role: 'planning',
       system: PROPOSE_SYSTEM,
       prompt: `Learnable signals (${signals.totalFailed} behavioral failures total):\n${evidence}`,
-      maxTokens: 1200,
+      maxTokens: 900, // under Groq's 1,000 OTPM ceiling — see executor.ts
       traceId: ids.traceId,
       taskId: ids.taskId,
       name: 'learning-propose',

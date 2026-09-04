@@ -316,7 +316,7 @@ async function synthesize(goal: string, results: ChildResult[], traceId: string)
     role: 'execution',
     traceId,
     name: 'agents.synthesize',
-    maxTokens: 1024,
+    maxTokens: 900, // under Groq's 1,000 OTPM ceiling — see executor.ts
     system:
       'You are the synthesizer of a multi-agent run. Combine the subtask results into ONE final user-facing answer.\n' +
       '- Keep citations exactly as given.\n' +

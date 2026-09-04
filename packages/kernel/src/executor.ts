@@ -299,7 +299,17 @@ ${omittedToolsNote(selection.omitted)}` } : m));
       // 429'd → synchronized 70s retries → minutes-long "hangs" (dogfooded
       // 2026-07-09, voice testing). Replies don't need >1024 tokens (~750 words);
       // halving the reservation lets two tasks fit the window side by side.
-      resp = await chat({ role: 'execution', messages, tools: toolDefs, traceId, taskId, maxTokens: 1024 });
+      // 900, not 1024. Providers BOOK max_tokens against their per-minute window
+      // UP FRONT, and Groq's free tier caps OUTPUT tokens per minute at 1,000 — so
+      // 1024 was rejected before the call even ran:
+      //   413 Request too large ... on output tokens per minute (OTPM):
+      //   Limit 1000, Requested 1024
+      // Every single chat turn missed by 24 tokens, failed over to a
+      // quota-exhausted Gemini, and took ~60s instead of ~1s. Replies do not need
+      // >900 tokens (~675 words); callers that genuinely do (research, planning,
+      // forge) keep their larger budgets and correctly fail over to Gemini rather
+      // than being silently truncated here.
+      resp = await chat({ role: 'execution', messages, tools: toolDefs, traceId, taskId, maxTokens: 900 });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       await pool.query(`UPDATE steps SET status='failed', error=$2, updated_at=now() WHERE id=$1`, [stepId, msg]);
