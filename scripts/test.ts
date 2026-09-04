@@ -30,6 +30,7 @@ const SMOKES = [
   'packages/tools/src/tools/video-ssrf-smoke.ts', // yt-dlp SUBPROCESS sink — ssrf-guard only covers fetch(); pins the metadata-service hole (security-critical)
   'packages/model-router/src/failover-smoke.ts',
   'packages/kernel/src/agents-smoke.ts',
+  'packages/kernel/src/tool-select-smoke.ts', // per-turn tool selection — pins that filtering never silently drops a needed tool
   'packages/kernel/src/context-smoke.ts',
   'packages/kernel/src/remote-smoke.ts',
   'packages/packs/src/x-smoke.ts',

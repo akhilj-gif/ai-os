@@ -138,8 +138,36 @@ const PREMIUM_PRIORITY = ['anthropic', 'xai'] as const;
  *  - fast: ultra-low-latency/simple (the kernel's own routing-tier calls) →
  *    Groq, whose whole value proposition is inference speed. */
 const CAPABILITY_CHAINS: Record<Capability, readonly string[]> = {
-  workspace: ['gemini', 'groq', 'nvidia'],
-  coding: ['groq', 'gemini', 'nvidia'],
+  // NVIDIA is OUT of every automatic chain as of 2026-09-04. It stays configured
+  // (MODEL_PROVIDER=nvidia still works, and the provider block is intact) but it
+  // must not sit in a failover path, because landing on it is catastrophic
+  // rather than merely slow: measured on a live UI request, minimax-m3 took
+  // 143 SECONDS to answer "what is 2+2?", which is most of that request's 167s.
+  //
+  // I put that model here earlier the same day on the strength of a single 200
+  // response to a 5-token probe, and never measured it under a realistic prompt.
+  // A provider earns a place in the chain by being fast AND reachable under real
+  // load, not by returning 200 once.
+  // Groq leads EVERY chain as of 2026-09-04, on measurement rather than theory.
+  // Latency, same prompt, same question ("what is 2+2?"):
+  //     groq qwen3.8-27b     35 tok in -> 0.60s
+  //     groq qwen3.8-27b   4839 tok in -> 0.74s     (138x the input, same time)
+  //     gemini-flash-lite    20 tok in -> 10.03s
+  //     gemini-flash-latest             -> 429, quota exhausted under real use
+  // Gemini-first is what made a trivial chat turn take 20s, and the free tier
+  // then 429'd and pushed the request down the chain. Note the middle row: input
+  // size is NOT the cost driver, so the 6,373-token tool catalog is not worth
+  // filtering for speed — the provider choice was the whole problem.
+  //
+  // Gemini stays as immediate fallback and keeps 'workspace' as its own strength
+  // area is real (native multimodal), but vision/video do NOT route through these
+  // chains — they call Gemini directly — so nothing multimodal is lost here.
+  // HONEST TRADEOFF: Groq's tool-calling is the flakier of the two (this file
+  // already retries its inline `<function=` pseudo-syntax), so leading with it
+  // trades a little tool-call reliability for a ~15x latency win, with Gemini one
+  // step behind when it misbehaves.
+  workspace: ['groq', 'gemini'],
+  coding: ['groq', 'gemini'],
   // 'fast' led with Groq on the reasonable theory that Groq is the fast one.
   // Measured 2026-09-04, that broke the one caller it exists for: EVERY open
   // model Groq now offers emits inline chain-of-thought, so a one-word
@@ -147,7 +175,7 @@ const CAPABILITY_CHAINS: Record<Capability, readonly string[]> = {
   // classifyGoal's /complex/i then always read 'simple' — the multi-agent Brain
   // could never trigger. gemini-flash-lite-latest answers the same prompt with a
   // clean "complex" in ~1.1s, which is fast enough and actually correct.
-  fast: ['gemini', 'groq', 'nvidia'],
+  fast: ['groq', 'gemini'],
 };
 
 const WORKSPACE_TOOL_RE = /^(gmail_|calendar_|workspace_|web_search|fetch_url|screen_capture)/;
@@ -500,6 +528,11 @@ export async function describeVideo(
         }),
       }),
       `gemini/${VIDEO_MODEL}:video`,
+      4,
+      // Video is the one call that is LEGITIMATELY slow: this analyzes a 30-min
+      // chunk of audio+frames, so the 60s chat seatbelt would abort real work.
+      // Its own generous budget, still bounded — never unbounded again.
+      Number(process.env.AIOS_VIDEO_TIMEOUT_MS) || 10 * 60_000,
     );
     if (!gen.ok) throwHttp({ name: 'gemini' } as Provider, gen.status, await gen.text());
     const data = (await gen.json()) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
@@ -559,24 +592,52 @@ async function callAnthropicShape(
  *  the next API key (free-tier quotas are per key), and only when every key in
  *  the round is exhausted honor Retry-After / the "retry in Xs" body hint with a
  *  capped wait. Up to 4 rounds across all keys. */
+/** Whole-attempt budget for ONE provider, in ms.
+ *
+ *  There was NO timeout anywhere in this file. A provider could hang forever and
+ *  the caller just waited — measured 2026-09-04 on a live UI request:
+ *  "what is 2+2?" took 166,945ms end to end, of which 143,000ms was a single
+ *  minimax-m3 call that nothing was ever going to abandon.
+ *
+ *  Note this bounds the ENTIRE attempt (all rounds, all key rotations), not each
+ *  fetch. A naive per-fetch timeout would have made things WORSE: 4 rounds x N
+ *  keys x 60s is a longer hang than the one being fixed. Once the budget is
+ *  spent we stop retrying and throw INFRA_NETWORK, which isInfraFailure()
+ *  already classifies as failover-able — so the chain moves to the next provider
+ *  instead of the task dying.
+ *
+ *  This is a SEATBELT, not a tuning knob: with a sane chain it should never
+ *  fire. Raise it via AIOS_MODEL_TIMEOUT_MS for genuinely long generations. */
+const MODEL_TIMEOUT_MS = Number(process.env.AIOS_MODEL_TIMEOUT_MS) || 60_000;
+
 async function fetchWithRateLimitRetry(
   url: string,
   keys: string[],
   buildInit: (apiKey: string) => RequestInit,
   label: string,
   maxRounds = 4,
+  budgetMs = MODEL_TIMEOUT_MS,
 ): Promise<Response> {
   const MAX_ROUNDS = maxRounds;
   const MAX_WAIT_MS = 70_000;
+  const deadline = Date.now() + budgetMs;
+  /** Remaining budget, floored so an almost-spent budget still makes one honest
+   *  attempt rather than aborting instantly with a confusing error. */
+  const remaining = (): number => Math.max(1_000, deadline - Date.now());
   let lastNetErr: unknown = null;
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     // Reset per round so the FINAL round's outcome decides what we return — a
     // 429 from an earlier round must not shadow a network error in the last one.
     let lastRes: Response | null = null;
     for (let k = 0; k < keys.length; k++) {
+      if (Date.now() >= deadline) {
+        throw new Error(`INFRA_NETWORK: ${label} exceeded its ${budgetMs}ms budget — abandoning this provider so the chain can fail over`);
+      }
       let res: Response;
       try {
-        res = await fetch(url, buildInit(keys[k]!));
+        // The signal is rebuilt per attempt against the SHARED deadline, so key
+        // rotation and retry rounds all draw down one budget.
+        res = await fetch(url, { ...buildInit(keys[k]!), signal: AbortSignal.timeout(remaining()) });
       } catch (err) {
         // Transient network throw (fetch failed / ECONNRESET / ETIMEDOUT) — not
         // a status we can inspect. Treat like a retryable failure (FC-017).
@@ -605,7 +666,19 @@ async function fetchWithRateLimitRetry(
     // SAME hint and re-collide every round in lockstep (observed as a minutes-
     // long mutual livelock between a chat task and a background task).
     const jitter = Math.random() * 4_000;
-    const waitMs = Math.min(Math.max(headerWait, bodyWait, round * 5_000) + 1_000 + jitter, MAX_WAIT_MS);
+    // Clamped to the REMAINING budget, not just MAX_WAIT_MS. Gemini answers a
+    // quota 429 with a retry-after of ~58s, so two rounds slept ~116s while the
+    // caller waited — measured 2026-09-04, and it is why a per-fetch deadline
+    // alone did not bound the turn: the sleep happened BEFORE the next deadline
+    // check. If there is no budget left to wait out, stop retrying and let the
+    // chain move on.
+    const budgetLeft = deadline - Date.now();
+    const waitMs = Math.min(Math.max(headerWait, bodyWait, round * 5_000) + 1_000 + jitter, MAX_WAIT_MS, Math.max(0, budgetLeft));
+    if (waitMs <= 0 || budgetLeft <= 0) {
+      console.warn(`[model-router] ${label}: ${budgetMs}ms budget spent — not waiting out the rate limit, failing over`);
+      if (lastRes) return lastRes;
+      throw new Error(`INFRA_NETWORK: ${label} budget spent while rate-limited`);
+    }
     const reason = lastRes ? `all ${keys.length} key(s) rate-limited` : 'network errors';
     // Surface the provider's own explanation (e.g. Groq's "on tokens per minute
     // (TPM): Limit 12000, Requested 15406") — a Requested>Limit request can NEVER
@@ -740,6 +813,14 @@ export async function callModel(input: ModelCallInput): Promise<ModelCallResult>
   // already knows (input.capability).
   const chain = failoverChain(input.capability ?? classifyCapability({ role: input.role, prompt: input.prompt }));
   let lastErr: unknown;
+  // WHOLE-CHAIN deadline. MODEL_TIMEOUT_MS bounds ONE provider attempt, which is
+  // not the number a user feels: with a 2-provider chain the observed worst case
+  // was 116-119s (60s + 60s), measured 2026-09-04 on consecutive trivial turns
+  // where Groq hit its 8,000 tokens-per-minute ceiling and Gemini was
+  // quota-exhausted behind it. Bound the total so a chat turn cannot run away no
+  // matter how long the chain gets; the honest fast failure beats a two-minute
+  // wait that ends in an error anyway.
+  const chainDeadline = Date.now() + (Number(process.env.AIOS_MODEL_CHAIN_TIMEOUT_MS) || 45_000);
   for (let i = 0; i < chain.length; i++) {
     const provider = chain[i]!;
     const model = i === 0 ? routingTable(provider)[input.role] : provider.defaults[input.role];
@@ -748,8 +829,14 @@ export async function callModel(input: ModelCallInput): Promise<ModelCallResult>
       return await callModelOn(provider, model, input, retryRounds);
     } catch (err) {
       lastErr = err;
+      if (Date.now() >= chainDeadline && i < chain.length - 1) {
+        console.warn(`[model-router] chain budget spent after ${provider.name} — not trying ${chain[i + 1]!.name}`);
+        throw err;
+      }
       if (i < chain.length - 1 && isInfraFailure(err)) {
-        console.warn(`[model-router] ${provider.name} INFRA on ${input.name ?? input.role} — failing over to ${chain[i + 1]!.name}`);
+        // The REASON was missing here, which made a silent-failover loop
+        // undiagnosable: the log said Groq failed on every call and never why.
+        console.warn(`[model-router] ${provider.name} INFRA on ${input.name ?? input.role} — failing over to ${chain[i + 1]!.name}: ${err instanceof Error ? err.message.slice(0, 300) : String(err).slice(0, 300)}`);
         continue;
       }
       throw err;
@@ -837,7 +924,9 @@ export async function chat(input: ChatInput): Promise<ChatResult> {
     } catch (err) {
       lastErr = err;
       if (i < attempts.length - 1 && isInfraFailure(err)) {
-        console.warn(`[model-router] ${provider.name} INFRA on ${input.name ?? input.role} — failing over to ${attempts[i + 1]!.name}`);
+        // The REASON was missing here, which made a silent-failover loop
+        // undiagnosable: the log said Groq failed on every call and never why.
+        console.warn(`[model-router] ${provider.name} INFRA on ${input.name ?? input.role} — failing over to ${attempts[i + 1]!.name}: ${err instanceof Error ? err.message.slice(0, 300) : String(err).slice(0, 300)}`);
         continue;
       }
       throw err;

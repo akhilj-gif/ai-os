@@ -9,6 +9,7 @@ import { TraceStore, logger } from '@ai-os/shared';
 import { chat, type ChatMessage } from '@ai-os/model-router';
 import { buildRegistry, type ToolRegistry } from '@ai-os/tools';
 import { TrustGate, blockedByUntrustedContext, redactForAudit } from '@ai-os/trust';
+import { selectTools, omittedToolsNote } from './tool-select.js';
 import { extractAndStore } from '@ai-os/memory';
 import { systemPrompt } from './prompts.js';
 import { assembleMemoryContext, compactHistory, shrinkToolResults } from './context.js';
@@ -226,7 +227,40 @@ export async function runTask(
   const registry = opts.registry ?? buildRegistry();
   const gate = new TrustGate(pool);
   const allowed = opts.allowedTools?.length ? new Set(opts.allowedTools) : null;
-  const toolDefs = allowed ? registry.list().filter((t) => allowed.has(t.name)) : registry.list();
+  const fullCatalog = allowed ? registry.list().filter((t) => allowed.has(t.name)) : registry.list();
+  // Per-turn selection. An explicit allowedTools (an M11 specialist's toolkit) is
+  // already a deliberate subset, so it is left exactly as the caller set it.
+  //
+  // Why this is here rather than in the API layer: EVERY caller of runTask was
+  // paying 5,830 tokens of catalog, which pushed the prompt to ~10,965 and over
+  // Groq's 7,000 ITPM ceiling — so the fast provider 413'd on every call and the
+  // request fell through to a quota-exhausted Gemini. See tool-select.ts.
+  const selection = allowed ? { selected: fullCatalog, omitted: [] as string[] } : selectTools(fullCatalog, [task.goal, ...(opts.history ?? []).slice(-4).map((m) => (typeof m.content === 'string' ? m.content : ''))].join(' '));
+  let toolDefs = selection.selected;
+  if (selection.omitted.length) {
+    // Keep omitted tools DISCOVERABLE, or filtering becomes silent capability
+    // loss — the exact failure mode this repo keeps paying for. Two halves:
+    // the system-prompt index of names, and the tool that loads them.
+    messages = messages.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}
+
+${omittedToolsNote(selection.omitted)}` } : m));
+    // Synthetic: tools_expand is loop machinery, not a registry entry, so its
+    // schema is injected here rather than installed for every other driver.
+    toolDefs = [
+      {
+        name: 'tools_expand',
+        description:
+          'Load the full schema of an installed tool that is not in your current tool list, so you can call it on the next step. Use the OTHER TOOLS AVAILABLE ON REQUEST names in the system prompt.',
+        inputSchema: {
+          type: 'object',
+          properties: { query: { type: 'string', description: 'Tool name or keyword, e.g. "whatsapp" or "calendar_create_event".' } },
+          required: ['query'],
+        },
+        untrustedOutput: false, // it returns OUR OWN schemas, never external content
+      },
+      ...toolDefs,
+    ];
+  }
   const untrustedTools = new Set(toolDefs.filter((t) => t.untrustedOutput).map((t) => t.name));
   // Structural injection defense (§8.3): once untrusted content is in context,
   // the trust gate blocks mutating actions. Persists across iterations.
@@ -349,6 +383,27 @@ export async function runTask(
     }
 
     for (const tc of resp.toolCalls) {
+      // tools_expand — the escape hatch that makes per-turn filtering safe.
+      // Handled HERE rather than as a registry tool because it mutates this
+      // run's offered catalog; it touches nothing outside the loop, needs no
+      // trust class (it grants no new capability — every tool it can load was
+      // already installed and still passes the gate when actually called), and
+      // must not appear in the registry for other drivers to trip over.
+      if (tc.name === 'tools_expand') {
+        const q = String((tc.args as { query?: unknown }).query ?? '').toLowerCase();
+        const have = new Set(toolDefs.map((t) => t.name));
+        const add = fullCatalog.filter(
+          (t) => !have.has(t.name) && (t.name.toLowerCase().includes(q) || (t.description ?? '').toLowerCase().includes(q)),
+        );
+        toolDefs = [...toolDefs, ...add];
+        const payload = add.length
+          ? { loaded: add.map((t) => t.name), note: 'Schemas are now available — call the one you need on this next step.' }
+          : { loaded: [], note: `No installed tool matches "${q}". Do not invent one; tell the user it is not available.` };
+        messages.push({ role: 'assistant', content: `tools_expand(${JSON.stringify(tc.args)})` });
+        messages.push({ role: 'user', content: `TOOL RESULT tools_expand: ${JSON.stringify(payload)}` });
+        await trace.record({ traceId, taskId, component: 'kernel', event: 'tools.expanded', payload: { query: q, loaded: add.map((t) => t.name) } });
+        continue;
+      }
       const decision = await gate.classify(tc.name);
       const started = Date.now();
       let result: unknown;

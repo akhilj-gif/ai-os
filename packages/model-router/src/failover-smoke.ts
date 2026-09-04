@@ -42,13 +42,21 @@ setEnv({ GEMINI_API_KEY: 'g1', NVIDIA_API_KEY: 'n1', GROQ_API_KEY: 'q1' });
 // LAST everywhere now, not because of capability fit but because this account can
 // barely call it: /models lists 81 entries, 14 of 15 probed returned 410 Gone or
 // "Not found for account", and the survivors timed out at 45-90s.
-check("capability 'workspace': gemini first, nvidia last (barely reachable)", names('workspace') === 'gemini,groq,nvidia', names('workspace'));
-check("capability 'coding': groq first (nvidia demoted — 1 of 15 models reachable)", names('coding') === 'groq,gemini,nvidia', names('coding'));
+check("capability 'workspace': groq then gemini (nvidia is out of every chain)", names('workspace') === 'groq,gemini', names('workspace'));
+check("capability 'coding': groq then gemini", names('coding') === 'groq,gemini', names('coding'));
 // 'fast' led with Groq until its open models all began emitting inline
 // chain-of-thought: a one-word classifier prompt returned "<think>…" (qwen) or
 // empty (gpt-oss), so classifyGoal always read 'simple' and the multi-agent Brain
 // could never fire. gemini-flash-lite-latest answers cleanly in ~1.1s.
-check("capability 'fast': gemini first (Groq's open models leak <think> into content)", names('fast') === 'gemini,groq,nvidia', names('fast'));
+// NVIDIA left every chain 2026-09-04: minimax-m3 took 143s on a live "what is
+// 2+2?", so landing on it is catastrophic rather than slow. It stays configured
+// for an explicit MODEL_PROVIDER=nvidia, but never as automatic failover.
+// Groq leads every chain on MEASUREMENT: same question, same prompt —
+// groq 0.60s @35 tok in, 0.74s @4839 tok in; gemini-flash-lite 10.03s @20 tok
+// in, and gemini-flash-latest 429s outright under real use. Note the middle
+// figure: input size does not drive Groq's latency, so the tool catalog was
+// never a SPEED problem — it was an admission problem (Groq ITPM 7000).
+check("capability 'fast': groq then gemini, and NVIDIA is in no chain at all", names('fast') === 'groq,gemini', names('fast'));
 
 setEnv({ GEMINI_API_KEY: 'g1', GROQ_API_KEY: 'q1' }); // nvidia NOT configured
 check("capability 'coding' with nvidia unconfigured: skips straight to groq,gemini", names('coding') === 'groq,gemini', names('coding'));
@@ -108,7 +116,7 @@ check('schema/parse error → NO failover', !isInfraFailure(new Error('proposer 
 check('auth error → NO failover', !isInfraFailure(Object.assign(new Error('invalid api key'), { status: 401 })));
 check("body mentioning 'quota' without marker → NO failover (FC-020 lesson: match markers, not vibes)", !isInfraFailure(new Error('user quota table missing column')));
 
-console.log('\n— end-to-end loop with a stubbed network (Gemini 429 → Groq serves) —');
+console.log('\n— end-to-end loop with a stubbed network (primary 429 → secondary serves) —');
 // Real callModel(), real retry/classification/fallback code paths — only the
 // network edge is stubbed. No .env is loaded here, so Langfuse is off and no
 // stray HTTP leaves the process. capability:'workspace' pins gemini as primary
@@ -116,17 +124,19 @@ console.log('\n— end-to-end loop with a stubbed network (Gemini 429 → Groq s
 // block is proving the FAILOVER MECHANISM, not which bucket is default).
 const realFetch = globalThis.fetch;
 const hits: string[] = [];
-const stub = (geminiStatus: number) =>
+const stub = (primaryStatus: number) =>
   (async (url: unknown) => {
     const u = String(url);
-    if (u.includes('generativelanguage.googleapis.com')) {
-      hits.push('gemini');
-      return new Response(JSON.stringify({ error: { code: geminiStatus, message: 'stub' } }), { status: geminiStatus });
-    }
+    // groq is the chain PRIMARY as of 2026-09-04, so it is the one made to fail.
     if (u.includes('api.groq.com')) {
       hits.push('groq');
+      return new Response(JSON.stringify({ error: { code: primaryStatus, message: 'stub' } }), { status: primaryStatus });
+    }
+    // gemini is the SECONDARY and serves the failover.
+    if (u.includes('generativelanguage.googleapis.com')) {
+      hits.push('gemini');
       return new Response(
-        JSON.stringify({ choices: [{ message: { content: 'pong-from-groq' } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+        JSON.stringify({ choices: [{ message: { content: 'pong-from-gemini' } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
         { status: 200 },
       );
     }
@@ -139,23 +149,23 @@ try {
   const t0 = Date.now();
   const res = await callModel({ role: 'execution', prompt: 'ping', capability: 'workspace', traceId: '00000000-0000-0000-0000-000000000001', name: 'failover-smoke' });
   const elapsed = Date.now() - t0;
-  check('gemini 429 → call served by groq', res.text === 'pong-from-groq', res.text);
-  check("fallback used groq's OWN default model", res.model === 'qwen/qwen3.8-27b', res.model);
-  check('gemini was tried first, groq second', hits.join(',') === 'gemini,groq', hits.join(','));
+  check('primary 429 → call served by the secondary', res.text === 'pong-from-gemini', res.text);
+  check("fallback used the secondary's OWN default model", res.model === 'gemini-flash-latest', res.model);
+  check('the chain was walked in order, primary first', hits.join(',') === 'groq,gemini', hits.join(','));
   check('failed over IMMEDIATELY (no backoff sleeps)', elapsed < 3000, `${elapsed}ms`);
 } catch (err) {
-  check('gemini 429 → call served by groq', false, String(err).slice(0, 80));
+  check('primary 429 → call served by the secondary', false, String(err).slice(0, 80));
 }
 
 hits.length = 0;
 globalThis.fetch = stub(400); // non-infra: must NOT fail over
 try {
   await callModel({ role: 'execution', prompt: 'ping', capability: 'workspace', traceId: '00000000-0000-0000-0000-000000000002', name: 'failover-smoke' });
-  check('gemini 400 → surfaces (no failover)', false, 'call unexpectedly succeeded');
+  check('primary 400 → surfaces (no failover)', false, 'call unexpectedly succeeded');
 } catch (err) {
   const msg = String(err);
-  check('gemini 400 → surfaces (no failover)', /gemini 400/.test(msg), msg.slice(0, 60));
-  check('groq was never tried on a non-infra failure', !hits.includes('groq'), hits.join(','));
+  check('primary 400 → surfaces (no failover)', /groq 400/.test(msg), msg.slice(0, 60));
+  check('the secondary was never tried on a non-infra failure', !hits.includes('gemini'), hits.join(','));
 }
 globalThis.fetch = realFetch;
 

@@ -269,7 +269,12 @@ export async function classifyGoal(goal: string, traceId: string): Promise<'simp
       // before it writes the answer, so a 4-token ceiling returned an EMPTY
       // string (measured on gemini-flash-lite-latest) — and the catch below
       // then fail-safed to 'simple' forever, silently disabling the Brain.
-      maxTokens: 64,
+      // 600, not 64. Open models emit a <think> block before the answer and the
+      // router strips it centrally — but a budget too small to CLOSE the block
+      // leaves nothing behind after stripping. Measured on qwen3.6-27b: 64 and
+      // 300 both strip to "", 600 yields "complex" in ~1s. Cheap insurance
+      // against silently disabling the Brain a second time.
+      maxTokens: 600,
       system:
         'Classify a personal-assistant goal. Reply with EXACTLY one word.\n' +
         'complex = it clearly needs MULTIPLE different specialists chained or combined (e.g. research the web AND message someone / AND schedule something / AND produce a file).\n' +
