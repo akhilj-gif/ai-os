@@ -50,7 +50,16 @@ const PROVIDERS: Record<string, () => Provider | null> = {
           kind: 'openai', // Gemini's OpenAI-compatible endpoint
           apiKeys: [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_FALLBACK].filter((k): k is string => !!k),
           baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
-          defaults: { routing: 'gemini-2.5-flash-lite', execution: 'gemini-2.5-flash', planning: 'gemini-2.5-pro' },
+          // The `-latest` ALIASES, not pinned versions. Pinned ids rot silently:
+          // measured 2026-09-04, gemini-2.0-flash was 404 "no longer available",
+          // and every Groq/NVIDIA id in this file had been retired out from under
+          // us -- which read as "our API keys are exhausted" when not one key had
+          // a quota problem. Google maintains these aliases, so the class of
+          // outage cannot recur here.
+          // NB planning is flash, NOT pro: gemini-pro-latest returns a hard 429
+          // on this free tier (measured 3/3 attempts), so defaulting to it would
+          // make every planning call fail over.
+          defaults: { routing: 'gemini-flash-lite-latest', execution: 'gemini-flash-latest', planning: 'gemini-flash-latest' },
         }
       : null,
   // Groq (NOT xAI Grok — gsk_ keys): OpenAI-compatible, generous free tier, fast
@@ -62,10 +71,15 @@ const PROVIDERS: Record<string, () => Provider | null> = {
           kind: 'openai',
           apiKeys: [process.env.GROQ_API_KEY],
           baseURL: 'https://api.groq.com/openai/v1',
+          // Both llama ids above were RETIRED — 404 "does not exist or you do not
+          // have access to it". Verified live 2026-09-04 against this key's own
+          // /models list (14 models). gpt-oss is the largest available but is
+          // capped at 1,000 req/day on the free tier vs 14,400 for the rest, so
+          // it is reserved for planning, which runs least often.
           defaults: {
-            routing: 'llama-3.1-8b-instant',
-            execution: 'llama-3.3-70b-versatile',
-            planning: 'llama-3.3-70b-versatile',
+            routing: 'qwen/qwen3.6-27b',
+            execution: 'qwen/qwen3.8-27b',
+            planning: 'openai/gpt-oss-120b',
           },
         }
       : null,
@@ -87,10 +101,17 @@ const PROVIDERS: Record<string, () => Provider | null> = {
           kind: 'openai',
           apiKeys: [process.env.NVIDIA_API_KEY],
           baseURL: 'https://integrate.api.nvidia.com/v1',
+          // Every meta/llama id here returned 410 Gone (EOL 2026-08-26). Worse,
+          // this account can call almost NOTHING in the catalog: /models lists 81
+          // entries, but 14 of 15 probed returned 410 or "Not found for account",
+          // and the two that resolved timed out at 45-90s. minimax-m3 is the only
+          // id verified to answer 200. NVIDIA is therefore last in every chain
+          // below — it is a fallback that mostly will not fire, and pretending
+          // otherwise is how the old ids sat broken unnoticed.
           defaults: {
-            routing: 'meta/llama-3.1-8b-instruct',
-            execution: 'meta/llama-3.1-8b-instruct',
-            planning: 'meta/llama-3.1-70b-instruct',
+            routing: 'minimaxai/minimax-m3',
+            execution: 'minimaxai/minimax-m3',
+            planning: 'minimaxai/minimax-m3',
           },
         }
       : null,
@@ -117,9 +138,16 @@ const PREMIUM_PRIORITY = ['anthropic', 'xai'] as const;
  *  - fast: ultra-low-latency/simple (the kernel's own routing-tier calls) →
  *    Groq, whose whole value proposition is inference speed. */
 const CAPABILITY_CHAINS: Record<Capability, readonly string[]> = {
-  workspace: ['gemini', 'nvidia', 'groq'],
-  coding: ['nvidia', 'groq', 'gemini'],
-  fast: ['groq', 'gemini', 'nvidia'],
+  workspace: ['gemini', 'groq', 'nvidia'],
+  coding: ['groq', 'gemini', 'nvidia'],
+  // 'fast' led with Groq on the reasonable theory that Groq is the fast one.
+  // Measured 2026-09-04, that broke the one caller it exists for: EVERY open
+  // model Groq now offers emits inline chain-of-thought, so a one-word
+  // classifier prompt came back as "<think>…" (qwen) or empty (gpt-oss), and
+  // classifyGoal's /complex/i then always read 'simple' — the multi-agent Brain
+  // could never trigger. gemini-flash-lite-latest answers the same prompt with a
+  // clean "complex" in ~1.1s, which is fast enough and actually correct.
+  fast: ['gemini', 'groq', 'nvidia'],
 };
 
 const WORKSPACE_TOOL_RE = /^(gmail_|calendar_|workspace_|web_search|fetch_url|screen_capture)/;
@@ -923,6 +951,25 @@ async function chatOn(provider: Provider, model: string, input: ChatInput, retry
       data = retryData;
       message = retryMessage;
       toolCalls = parseToolCalls(message);
+    }
+
+    // Open-weight models (qwen3, deepseek-r1 and friends) put their chain of
+    // thought INLINE in content as <think>…</think>, rather than in the
+    // structured reasoning_content field handled further up. Measured
+    // 2026-09-04: groq qwen/qwen3.6-27b answered a strict one-word classifier
+    // prompt with a literal "<think>" opener and no answer, so any caller that pattern-
+    // matches the reply reads the REASONING instead of the answer. Strip it
+    // here, once, for every caller. The second regex catches an unclosed opener,
+    // which is what a max_tokens-truncated response leaves behind.
+    if (message.content && message.content.includes('<think>')) {
+      const cleaned = message.content
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .replace(/<think>[\s\S]*$/i, '')
+        .trim();
+      if (!cleaned) {
+        console.warn(`[model-router] ${provider.name}/${model}: response was ENTIRELY reasoning — raise maxTokens for this call`);
+      }
+      message = { ...message, content: cleaned };
     }
 
     const usage = {

@@ -265,7 +265,11 @@ export async function classifyGoal(goal: string, traceId: string): Promise<'simp
       role: 'routing',
       traceId,
       name: 'agents.classify',
-      maxTokens: 4,
+      // 64, not 4. Every current model reserves output tokens for reasoning
+      // before it writes the answer, so a 4-token ceiling returned an EMPTY
+      // string (measured on gemini-flash-lite-latest) — and the catch below
+      // then fail-safed to 'simple' forever, silently disabling the Brain.
+      maxTokens: 64,
       system:
         'Classify a personal-assistant goal. Reply with EXACTLY one word.\n' +
         'complex = it clearly needs MULTIPLE different specialists chained or combined (e.g. research the web AND message someone / AND schedule something / AND produce a file).\n' +

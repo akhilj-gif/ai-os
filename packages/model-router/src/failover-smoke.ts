@@ -38,9 +38,17 @@ setEnv({ ANTHROPIC_API_KEY: 'a1', GEMINI_API_KEY: 'g1', GROQ_API_KEY: 'q1' });
 check("anthropic outranks all when configured, regardless of capability", names() === 'anthropic,groq,gemini', names());
 
 setEnv({ GEMINI_API_KEY: 'g1', NVIDIA_API_KEY: 'n1', GROQ_API_KEY: 'q1' });
-check("capability 'workspace': gemini first (Workspace/Search/Vision)", names('workspace') === 'gemini,nvidia,groq', names('workspace'));
-check("capability 'coding': nvidia first (coding/general chat/OSS reasoning)", names('coding') === 'nvidia,groq,gemini', names('coding'));
-check("capability 'fast': groq first (ultra-low-latency/simple)", names('fast') === 'groq,gemini,nvidia', names('fast'));
+// Chain order re-pinned 2026-09-04 after probing every provider live. NVIDIA is
+// LAST everywhere now, not because of capability fit but because this account can
+// barely call it: /models lists 81 entries, 14 of 15 probed returned 410 Gone or
+// "Not found for account", and the survivors timed out at 45-90s.
+check("capability 'workspace': gemini first, nvidia last (barely reachable)", names('workspace') === 'gemini,groq,nvidia', names('workspace'));
+check("capability 'coding': groq first (nvidia demoted — 1 of 15 models reachable)", names('coding') === 'groq,gemini,nvidia', names('coding'));
+// 'fast' led with Groq until its open models all began emitting inline
+// chain-of-thought: a one-word classifier prompt returned "<think>…" (qwen) or
+// empty (gpt-oss), so classifyGoal always read 'simple' and the multi-agent Brain
+// could never fire. gemini-flash-lite-latest answers cleanly in ~1.1s.
+check("capability 'fast': gemini first (Groq's open models leak <think> into content)", names('fast') === 'gemini,groq,nvidia', names('fast'));
 
 setEnv({ GEMINI_API_KEY: 'g1', GROQ_API_KEY: 'q1' }); // nvidia NOT configured
 check("capability 'coding' with nvidia unconfigured: skips straight to groq,gemini", names('coding') === 'groq,gemini', names('coding'));
@@ -67,7 +75,7 @@ check(
   classifyCapability({ role: 'planning', prompt: 'debug why this function returns undefined' }) === 'coding',
 );
 check(
-  "no signal at all → 'coding' (the catch-all: general chat routes to NVIDIA per spec)",
+  "no signal at all → 'coding' (the catch-all bucket; now groq-first, see chain order above)",
   classifyCapability({ role: 'execution', prompt: 'hey, how are you?' }) === 'coding',
 );
 
@@ -132,7 +140,7 @@ try {
   const res = await callModel({ role: 'execution', prompt: 'ping', capability: 'workspace', traceId: '00000000-0000-0000-0000-000000000001', name: 'failover-smoke' });
   const elapsed = Date.now() - t0;
   check('gemini 429 → call served by groq', res.text === 'pong-from-groq', res.text);
-  check("fallback used groq's OWN default model", res.model === 'llama-3.3-70b-versatile', res.model);
+  check("fallback used groq's OWN default model", res.model === 'qwen/qwen3.8-27b', res.model);
   check('gemini was tried first, groq second', hits.join(',') === 'gemini,groq', hits.join(','));
   check('failed over IMMEDIATELY (no backoff sleeps)', elapsed < 3000, `${elapsed}ms`);
 } catch (err) {
