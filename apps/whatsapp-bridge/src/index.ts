@@ -14,7 +14,7 @@ import { fileURLToPath as fp } from 'node:url';
 dotenv.config({ path: fp(new URL('../../../.env', import.meta.url)) });
 
 import Fastify from 'fastify';
-import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import qrcodeTerminal from 'qrcode-terminal';
@@ -151,6 +151,20 @@ let paired = false;
 let me = '';
 let currentQr: string | null = null; // latest QR string; served at /qr, cleared on pair
 let needsRepair = false; // WhatsApp invalidated the session (logout) — a human must re-scan
+// Fresh-pair attempts this process. Clearing dead creds is how a new QR is
+// obtained, but it must not become an infinite wipe-reconnect loop if the
+// account is blocked rather than merely logged out.
+let authResets = 0;
+const MAX_AUTH_RESETS = 3;
+// Reconnect backoff. This used to be a FLAT 2s retry with no cap and no
+// backoff, which turned any sustained WhatsApp-side refusal into a hammer:
+// 17,792 `code 405` reconnects in a single log file, 43MB of noise, and very
+// plausibly the reason WhatsApp started refusing this device at all. Back off
+// exponentially and cap it; reset the moment a connection actually opens.
+const RECONNECT_MIN_MS = 2_000;
+const RECONNECT_MAX_MS = 5 * 60_000;
+let reconnectMs = RECONNECT_MIN_MS;
+let consecutiveFailures = 0;
 const PORT = Number(process.env.WHATSAPP_BRIDGE_PORT) || DEFAULT_BRIDGE_PORT;
 
 function msgText(m: WAMessage): string {
@@ -224,6 +238,9 @@ async function connect(): Promise<void> {
       paired = true;
       needsRepair = false; // a good connection clears any prior logout flag
       currentQr = null;
+      reconnectMs = RECONNECT_MIN_MS; // a real connection clears the backoff
+      consecutiveFailures = 0;
+      authResets = 0;
       me = sock.user?.id?.split(':')[0] ?? 'unknown';
       console.log(`[whatsapp-bridge] paired as +${me}`);
     }
@@ -231,19 +248,62 @@ async function connect(): Promise<void> {
       paired = false;
       const code = (u.lastDisconnect?.error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode;
       if (code === DisconnectReason.loggedOut) {
-        // WhatsApp invalidated the session. Do NOT die and do NOT reconnect-loop:
-        // stay up, keep serving CACHED chats from the store, and flag needsRepair so
-        // `pnpm status` / the dashboard surfaces "re-pair needed" instead of silence.
+        // WhatsApp invalidated the session. Stay up and keep serving CACHED chats,
+        // but the old behaviour -- flag needsRepair, tell the user to open /qr, and
+        // return -- was a DEAD END that left the bridge unpairable for 24 days
+        // (2026-08-11 -> 2026-09-04). Two facts make it unrecoverable:
+        //   1. the ONLY writer of currentQr is `u.qr` on a LIVE socket, and this
+        //      branch never reconnects, so no socket ever exists to emit one;
+        //   2. Baileys only issues a QR when it starts with NO credentials, and
+        //      the dead creds were still sitting in AUTH_DIR -- so even a
+        //      reconnect just retried the invalid session (the code-405 loop).
+        // So /qr said "re-scan" while pointing at a page whose QR could never be
+        // produced. The creds are permanently worthless once WhatsApp logs the
+        // session out, so clear them and reconnect to get a real QR. store.json
+        // (chats/contacts cache) is a separate file and is deliberately kept.
         needsRepair = true;
-        console.error('[whatsapp-bridge] logged out — RE-PAIR NEEDED: open /qr and re-scan (cached reads still served)');
+        if (authResets >= MAX_AUTH_RESETS) {
+          console.error(`[whatsapp-bridge] still logged out after ${MAX_AUTH_RESETS} fresh-pair attempts — not wiping again (restart the bridge to retry)`);
+          return;
+        }
+        authResets++;
+        try {
+          rmSync(AUTH_DIR, { recursive: true, force: true });
+          mkdirSync(AUTH_DIR, { recursive: true });
+        } catch (e) {
+          console.error('[whatsapp-bridge] could not clear the dead session:', e instanceof Error ? e.message : e);
+          return;
+        }
+        currentQr = null;
+        console.error(`[whatsapp-bridge] logged out — cleared the dead session, requesting a NEW QR [${authResets}/${MAX_AUTH_RESETS}]. Open http://127.0.0.1:${PORT}/qr`);
+        setTimeout(() => {
+          connect().catch((e) => console.error('[whatsapp-bridge] fresh-pair connect failed:', e instanceof Error ? e.message : e));
+        }, 500);
         return;
       }
       // Everything else — including 515 restart-required, which Baileys ALWAYS
       // emits right after a successful pairing — means reconnect. Use the saved
       // creds (no new QR); catch the reconnect promise so a transient failure
       // can never become an unhandledRejection that kills the process.
-      const delay = code === DisconnectReason.restartRequired ? 250 : 2000;
+      // restartRequired is emitted by Baileys immediately after a SUCCESSFUL
+      // pairing, so it is a normal step and must stay fast and un-backed-off.
+      let delay: number;
+      if (code === DisconnectReason.restartRequired) {
+        delay = 250;
+      } else {
+        consecutiveFailures++;
+        delay = reconnectMs;
+        reconnectMs = Math.min(reconnectMs * 2, RECONNECT_MAX_MS);
+      }
       console.warn(`[whatsapp-bridge] connection closed (code ${code ?? '?'}) — reconnecting in ${delay}ms`);
+      // 405 means WhatsApp is REFUSING the connection, not that it dropped. No
+      // amount of retrying fixes that, so say what it actually means instead of
+      // emitting the same line forever.
+      if (code === 405 && consecutiveFailures % 10 === 0) {
+        console.error(
+          `[whatsapp-bridge] WhatsApp has refused ${consecutiveFailures} connections in a row (code 405). This is a server-side refusal — usually a rate-limit from too-frequent reconnects, or a client version WhatsApp no longer accepts. Backing off to ${Math.round(delay / 1000)}s between tries.`,
+        );
+      }
       setTimeout(() => {
         connect().catch((e) => console.error('[whatsapp-bridge] reconnect failed (will retry on next close):', e instanceof Error ? e.message : e));
       }, delay);
@@ -295,7 +355,13 @@ const qrPage = async (): Promise<string> => {
     `<meta http-equiv="refresh" content="${refresh}"><title>AI OS · WhatsApp pairing</title></head>` +
     `<body style="font-family:system-ui,sans-serif;text-align:center;padding:32px 16px;background:#0e101a;color:#e6e8f0">${body}</body></html>`;
   if (paired) return shell(`<h2>✅ Paired as +${me}</h2><p style="color:#9aa0b5">The bridge is connected. You can close this tab.</p>`, 30);
-  if (!currentQr) return shell(`<h2>Starting…</h2><p style="color:#9aa0b5">Waiting for WhatsApp to issue a QR. This page refreshes automatically.</p>`, 2);
+  if (!currentQr)
+    return shell(
+      needsRepair
+        ? `<h2>Re-pairing…</h2><p style="color:#9aa0b5">The previous session was logged out by WhatsApp. Clearing it and requesting a new QR — this page refreshes itself.</p>`
+        : `<h2>Starting…</h2><p style="color:#9aa0b5">Waiting for WhatsApp to issue a QR. This page refreshes automatically.</p>`,
+      2,
+    );
   const svg = await QRCode.toString(currentQr, { type: 'svg', margin: 2, width: 320 });
   return shell(
     `<h2>Scan with WhatsApp</h2><p style="color:#9aa0b5">WhatsApp → Settings → Linked devices → Link a device</p>` +

@@ -1,5 +1,9 @@
 {
   "extends": "./tsconfig.base.json",
-  "include": ["packages/**/src/**/*.ts", "apps/api/src/**/*.ts", "scripts/**/*.ts", "infra/*.ts", "evals/**/*.ts"],
+  // apps/browser-bridge is deliberately NOT here yet: its find-in-page code runs
+  // INSIDE a page via page.evaluate, so it needs lib:["DOM"], which must not leak
+  // into the Node sources. It needs its own tsconfig -- 23 errors, all
+  // "Cannot find name 'document'". Tracked, not forgotten.
+  "include": ["packages/**/src/**/*.ts", "apps/api/src/**/*.ts", "apps/whatsapp-bridge/src/**/*.ts", "scripts/**/*.ts", "infra/*.ts", "evals/**/*.ts"],
   "exclude": ["node_modules", "apps/web"]
 }
