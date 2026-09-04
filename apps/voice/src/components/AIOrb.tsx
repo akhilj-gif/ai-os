@@ -71,40 +71,43 @@ export default function AIOrb({ state = 'idle', onClick, size = 400 }: { state?:
           style={{ backgroundColor: cfg.accent }}
         />
 
-        {/* Horizontal Sound Waveform Background Line */}
+        {/* Horizontal Sound Waveform Background Line.
+          * The wave SCROLLS (a transform) instead of morphing its `d` between keyframes.
+          * framer-motion interpolates `d` as a plain string, and any moment it cannot
+          * resolve one — most reliably during the second path's `delay: 1` window at
+          * mount — it writes the literal string "undefined", which the browser rejects:
+          *   <path> attribute d: Expected moveto path command ('M' or 'm'), "undefined"
+          * That fired ~16 times per page load and would mask a real error in the console.
+          * Scrolling a static path is also cheaper (GPU-composited transform vs reparsing
+          * a path string every frame) and shorter, for the same decorative effect behind
+          * a blurred orb at 40% opacity. Paths run to 1200 so the 200/300 shift wraps
+          * seamlessly inside the 1000-wide viewBox. */}
         <div className="absolute top-1/2 left-[-60%] right-[-60%] h-[200px] -translate-y-1/2 pointer-events-none opacity-40 mix-blend-screen flex items-center">
           <svg viewBox="0 0 1000 200" className="w-full h-full" preserveAspectRatio="none" style={{ color: cfg.accent }}>
-            <motion.path
-              d="M0,100 Q100,80 200,100 T400,100 T600,100 T800,100 T1000,100"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              animate={{
-                d: [
-                  'M0,100 Q100,80 200,100 T400,100 T600,100 T800,100 T1000,100',
-                  'M0,100 Q150,140 300,100 T600,100 T800,100 T1000,100',
-                  'M0,100 Q100,60 200,100 T400,100 T600,100 T800,100 T1000,100',
-                  'M0,100 Q100,80 200,100 T400,100 T600,100 T800,100 T1000,100',
-                ],
-              }}
-              transition={{ duration: state === 'listening' || state === 'speaking' ? 2.5 : 8, repeat: Infinity, ease: 'easeInOut' }}
-              className="opacity-40"
-            />
-            <motion.path
-              d="M0,100 Q150,120 300,100 T600,100 T900,100 T1000,100"
-              fill="none"
-              stroke="#00D4FF"
-              strokeWidth="0.8"
-              animate={{
-                d: [
-                  'M0,100 Q150,120 300,100 T600,100 T900,100 T1000,100',
-                  'M0,100 Q120,60 240,100 T600,100 T900,100 T1000,100',
-                  'M0,100 Q150,120 300,100 T600,100 T900,100 T1000,100',
-                ],
-              }}
-              transition={{ duration: state === 'listening' || state === 'speaking' ? 2 : 6, repeat: Infinity, ease: 'easeInOut', delay: 1 }}
-              className="opacity-60"
-            />
+            <motion.g
+              animate={{ x: [0, -200] }}
+              transition={{ duration: state === 'listening' || state === 'speaking' ? 2.5 : 8, repeat: Infinity, ease: 'linear' }}
+            >
+              <path
+                d="M0,100 Q100,70 200,100 T400,100 T600,100 T800,100 T1000,100 T1200,100"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                className="opacity-40"
+              />
+            </motion.g>
+            <motion.g
+              animate={{ x: [0, -300] }}
+              transition={{ duration: state === 'listening' || state === 'speaking' ? 2 : 6, repeat: Infinity, ease: 'linear' }}
+            >
+              <path
+                d="M0,100 Q150,130 300,100 T600,100 T900,100 T1200,100"
+                fill="none"
+                stroke="#00D4FF"
+                strokeWidth="0.8"
+                className="opacity-60"
+              />
+            </motion.g>
             <line x1="0" y1="100" x2="1000" y2="100" stroke={cfg.accent} strokeWidth="0.5" className="opacity-20" />
           </svg>
         </div>
