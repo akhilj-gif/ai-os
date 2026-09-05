@@ -2,8 +2,8 @@
 // CLIENT seam where the real Instagram Graph API activates once both IG_* env
 // keys are set, and a deterministic MOCK serves fixtures otherwise (nothing
 // leaves the machine). Built mock-first on purpose: the official API needs a
-// Business/Creator account linked to a Facebook Page plus Meta app review, so
-// the pack has to be testable and shippable before any of that exists.
+// professional (Business or Creator) account plus a Meta app, so the pack has to
+// be testable and shippable before any of that exists.
 //
 // WHY THE OFFICIAL API AND NOT A SCRAPER. instagrapi and the headless-browser
 // MCP servers reach more surface (personal accounts, DM-first, other people's
@@ -24,7 +24,22 @@
 import { assertPublicHttpUrl, SsrfBlockedError } from '@ai-os/shared';
 import type { ToolDef } from '../registry.js';
 
-const GRAPH = 'https://graph.facebook.com/v21.0';
+// TWO auth paths, because Meta has two and they need different hosts.
+//
+//  1. Instagram Login (July 2024, the EASY one) — graph.instagram.com, the token
+//     is an Instagram user token, and the account is addressed as `me`. It needs
+//     NO Facebook Page and no Facebook account in the loop. Set IG_ACCESS_TOKEN
+//     alone and this is what you get.
+//  2. Facebook Login — graph.facebook.com, addressed by the IG business account
+//     id, and the account must be linked to a Facebook Page. Set
+//     IG_BUSINESS_ACCOUNT_ID as well and the pack switches to this.
+//
+// Both require a Business or CREATOR account; neither works with a personal one.
+// Creator is the low-friction answer: converting is free, instant, needs zero
+// followers and is reversible — the one real cost being that professional
+// accounts cannot be private.
+const GRAPH_FB = 'https://graph.facebook.com/v21.0';
+const GRAPH_IG = 'https://graph.instagram.com/v21.0';
 /** Instagram's own caption ceiling. Hashtags beyond 30 are silently DROPPED by
  *  Instagram, so checking both here turns a silent truncation into an error. */
 export const IG_MAX_CAPTION = 2_200;
@@ -32,17 +47,27 @@ export const IG_MAX_HASHTAGS = 30;
 
 interface IgCreds {
   token: string;
+  /** The path segment identifying the account: a numeric id on the Facebook
+   *  Login path, the literal 'me' on the Instagram Login path. */
   accountId: string;
+  base: string;
 }
 
-function creds(): IgCreds | null {
+/** Exported as pickAuthPath for the smoke suite: choosing the wrong host is a
+ *  silent 400 against the wrong API, so it is worth asserting directly. */
+export function creds(): IgCreds | null {
   const { IG_ACCESS_TOKEN, IG_BUSINESS_ACCOUNT_ID } = process.env;
-  if (!IG_ACCESS_TOKEN || !IG_BUSINESS_ACCOUNT_ID) return null;
-  return { token: IG_ACCESS_TOKEN, accountId: IG_BUSINESS_ACCOUNT_ID };
+  if (!IG_ACCESS_TOKEN) return null;
+  // The account id is what selects the path. Present => the caller went through
+  // Facebook Login and has a Page; absent => Instagram Login, which addresses
+  // the account as `me` and needs no Page at all.
+  return IG_BUSINESS_ACCOUNT_ID
+    ? { token: IG_ACCESS_TOKEN, accountId: IG_BUSINESS_ACCOUNT_ID, base: GRAPH_FB }
+    : { token: IG_ACCESS_TOKEN, accountId: 'me', base: GRAPH_IG };
 }
 
 const NOT_CONFIGURED =
-  'IG_ACCESS_TOKEN + IG_BUSINESS_ACCOUNT_ID are not set — running against the deterministic mock. The real API needs an Instagram Business/Creator account linked to a Facebook Page.';
+  'IG_ACCESS_TOKEN is not set — running against the deterministic mock. The real API needs an Instagram Business or CREATOR account (personal accounts have no API access at all). Set IG_ACCESS_TOKEN alone for the Instagram Login path (no Facebook Page needed), or add IG_BUSINESS_ACCOUNT_ID to use Facebook Login.';
 
 /** Mock outbox — "published" posts when no real keys are configured. Exported
  *  for the smoke suite, exactly like xMockOutbox. */
@@ -63,7 +88,7 @@ const MOCK_MEDIA = [
 
 async function graph<T>(method: 'GET' | 'POST', path: string, c: IgCreds, params: Record<string, string> = {}): Promise<T> {
   const body = new URLSearchParams({ ...params, access_token: c.token });
-  const target = method === 'GET' ? `${GRAPH}${path}?${body.toString()}` : `${GRAPH}${path}`;
+  const target = method === 'GET' ? `${c.base}${path}?${body.toString()}` : `${c.base}${path}`;
   const res = await fetch(target, {
     method,
     headers: method === 'POST' ? { 'content-type': 'application/x-www-form-urlencoded' } : {},
@@ -90,7 +115,7 @@ async function graph<T>(method: 'GET' | 'POST', path: string, c: IgCreds, params
 export const instagramGetProfile: ToolDef = {
   name: 'instagram_get_profile',
   description:
-    "The user's own Instagram Business account: username, name, follower/following/media counts. Mocked until IG_ACCESS_TOKEN + IG_BUSINESS_ACCOUNT_ID are configured.",
+    "The user's own Instagram professional account: username, name, follower/following/media counts. Mocked until IG_ACCESS_TOKEN is configured.",
   inputSchema: { type: 'object', properties: {} },
   async execute() {
     const c = creds();
@@ -236,3 +261,6 @@ export const instagramPublishPost: ToolDef = {
     return { ok: true, id: published.id, containerId: container.id };
   },
 };
+
+/** Alias so the smoke suite reads clearly about what it is pinning. */
+export { creds as pickAuthPath };

@@ -300,7 +300,8 @@ export const PACKS: Record<string, CapabilityPack> = {
     evalSuites: [],
     verifiedBy: 'instagram-smoke (mock client, deterministic)',
     requires: [
-      'Instagram Business/Creator account LINKED TO A FACEBOOK PAGE, a Meta app, and IG_ACCESS_TOKEN + IG_BUSINESS_ACCOUNT_ID in .env. Until then the mock records posts locally.',
+      'A professional (Business or CREATOR) Instagram account + a Meta app, then IG_ACCESS_TOKEN in .env. Personal accounts have NO API access whatsoever — converting to Creator is free, instant, needs zero followers and is reversible; the one real cost is that professional accounts cannot be private.',
+      'NO FACEBOOK PAGE NEEDED on the default path: IG_ACCESS_TOKEN alone uses Instagram Login (graph.instagram.com, account addressed as `me`). Only add IG_BUSINESS_ACCOUNT_ID if you went through Facebook Login and have a Page linked.',
       'Long-lived tokens expire after 60 DAYS — the pack reports Meta error code 190 explicitly when that happens rather than failing as a generic 400.',
       'NO DM SUPPORT BY DESIGN: the sanctioned API cannot message anyone first (24h reply window only, 200/hour). A WhatsApp-style Instagram inbox assistant would need an unofficial client, which risks a permanent account ban — deliberately not built.',
     ],

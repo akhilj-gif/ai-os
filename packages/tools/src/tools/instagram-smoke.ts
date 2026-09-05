@@ -1,9 +1,9 @@
 // Instagram pack smoke — deterministic, no network, no DB, no credentials.
 // Run: tsx packages/tools/src/tools/instagram-smoke.ts
 //
-// The pack ships MOCK-FIRST (the official Graph API needs a Business account
-// linked to a Facebook Page plus Meta app review), so the mock is the only
-// thing anyone can exercise until those exist. That makes pinning it the whole
+// The pack ships MOCK-FIRST (the official API needs a professional account plus
+// a Meta app), so the mock is the only thing anyone can exercise until those
+// exist. That makes pinning it the whole
 // point: these assertions are what stop the mock from drifting away from the
 // real client's contract while nobody can run the real one.
 import {
@@ -15,6 +15,7 @@ import {
   igMockOutbox,
   IG_MAX_CAPTION,
   IG_MAX_HASHTAGS,
+  pickAuthPath,
 } from './instagram.js';
 
 let fail = 0;
@@ -83,6 +84,25 @@ const published = (await run(instagramPublishPost, { caption: 'shipped #aios', i
 check('a valid post "publishes" to the mock outbox', published.ok === true && !!published.id, published.id);
 check('...flagged mock:true', published.mock === true);
 check('...and nothing left the machine — it is in the outbox', igMockOutbox.length === 1 && igMockOutbox[0]!.caption === 'shipped #aios', `outbox=${igMockOutbox.length}`);
+
+console.log('\n- auth path selection: which host actually gets called -');
+// Personal accounts have no API access at all, so the realistic setup is a
+// CREATOR account via Instagram Login, which needs NO Facebook Page. Picking the
+// wrong host there is a silent 400 against the wrong API, so pin the choice.
+process.env.IG_ACCESS_TOKEN = 'tok';
+delete process.env.IG_BUSINESS_ACCOUNT_ID;
+const igLogin = pickAuthPath();
+check('token alone -> Instagram Login (no Facebook Page needed)', igLogin?.base.includes('graph.instagram.com') === true, igLogin?.base);
+check("...and the account is addressed as 'me'", igLogin?.accountId === 'me', igLogin?.accountId);
+
+process.env.IG_BUSINESS_ACCOUNT_ID = '178414';
+const fbLogin = pickAuthPath();
+check('adding the account id -> Facebook Login', fbLogin?.base.includes('graph.facebook.com') === true, fbLogin?.base);
+check('...addressed by that id', fbLogin?.accountId === '178414', fbLogin?.accountId);
+
+delete process.env.IG_ACCESS_TOKEN;
+delete process.env.IG_BUSINESS_ACCOUNT_ID;
+check('no token at all -> mock, never a half-configured live call', pickAuthPath() === null);
 
 console.log(`\n${fail === 0 ? 'ALL PASS' : fail + ' FAILED'}`);
 process.exit(fail ? 1 : 0);
