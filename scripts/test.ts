@@ -35,6 +35,7 @@ const SMOKES = [
   'packages/kernel/src/remote-smoke.ts',
   'packages/packs/src/x-smoke.ts',
   'packages/tools/src/tools/instagram-smoke.ts', // instagram pack — pins the mock client + the caption/hashtag/public-image limits
+  'packages/tools/src/tools/connectors-smoke.ts', // app connectors — pins the slug round trip (save-then-run) and the arg contracts
   'packages/packs/src/mobility-smoke.ts',
   'packages/packs/src/mobility-decide-smoke.ts',
   'packages/packs/src/uber-smoke.ts',

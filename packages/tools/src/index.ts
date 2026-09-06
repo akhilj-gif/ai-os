@@ -10,6 +10,7 @@ import { codeExec } from './tools/code-exec.js';
 import { whatsappListChats, whatsappReadMessages, whatsappSearchContacts, whatsappSendMessage } from './tools/whatsapp.js';
 import { xGetMe, xDraftPost, xPublishPost } from './tools/x.js';
 import { instagramGetProfile, instagramRecentPosts, instagramPostInsights, instagramDraftPost, instagramPublishPost } from './tools/instagram.js';
+import { appScrape, appSave, appList, appRun } from './tools/connectors.js';
 import { terminalRun, terminalExec } from './tools/terminal.js';
 import { fsList, fsRead, fsSearch, fsWrite, fsOpen } from './tools/files.js';
 import { screenCapture } from './tools/screen.js';
@@ -39,6 +40,7 @@ export { calendarList, calendarCreateEvent } from './tools/calendar.js';
 export { codeExec } from './tools/code-exec.js';
 export { whatsappListChats, whatsappReadMessages, whatsappSearchContacts, whatsappSendMessage } from './tools/whatsapp.js';
 export { xGetMe, xDraftPost, xPublishPost, xMockOutbox, X_MAX_CHARS } from './tools/x.js';
+export { appScrape, appSave, appList, appRun, type Recipe } from './tools/connectors.js';
 export {
   instagramGetProfile,
   instagramRecentPosts,
@@ -85,6 +87,10 @@ export function buildRegistry(): ToolRegistry {
     xGetMe,
     xDraftPost,
     xPublishPost,
+    appScrape,
+    appSave,
+    appList,
+    appRun,
     instagramGetProfile,
     instagramRecentPosts,
     instagramPostInsights,

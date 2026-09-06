@@ -91,6 +91,15 @@ try {
   const clean = await build(false);
   await runGraph(pool, clean, { registry: reg() });
   check('CONTROL: a write-class tool runs normally when nothing is tainted', wrote === 2, `writes=${wrote}`);
+  // The §8.3 flag must TRAVEL to the tool, not merely gate it: a tool that
+  // persists anything records provenance from ctx.untrusted. Captured here in
+  // the clean case (in the tainted case below the tool is refused outright and
+  // never runs, so this is the only place the plumbing is observable).
+  // Read through an explicit local: the assignment happens inside the tool's
+  // callback, which TS's flow analysis cannot see, so it narrows the variable to
+  // `never` at this point.
+  const seen = lastSeenArgs as { sawUntrustedFlag?: boolean } | null;
+  check('...and ctx.untrusted is plumbed through to tool.execute', seen?.sawUntrustedFlag === false, JSON.stringify(seen));
 
   // --- THE REGRESSION -------------------------------------------------------
   wrote = 0;

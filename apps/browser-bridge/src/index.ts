@@ -214,6 +214,80 @@ async function main(): Promise<void> {
     return { url: p.url(), instruction: instruction ?? '', text };
   });
 
+  // DETERMINISTIC extraction. /extract above ignores its instruction and returns
+  // the whole document.body.innerText (up to 20,000 chars) for the model to read
+  // — which makes "check my notifications" cost a full page of tokens every
+  // time, on a free tier already capped at 7,000 input tokens/minute. This runs
+  // CSS selectors in the page instead and returns only the matched values, so a
+  // saved recipe costs a few hundred bytes and needs no model round-trip at all.
+  //
+  // A field selector may end in @attr to read an attribute rather than text
+  // (e.g. "a@href", "img@src") — links and image URLs are the two things page
+  // TEXT can never give you, and they are most of what a connector wants.
+  app.post('/scrape', async (req, reply) => {
+    const { container, fields, limit } = (req.body ?? {}) as {
+      container?: string;
+      fields?: Record<string, string>;
+      limit?: number;
+    };
+    if (!fields || typeof fields !== 'object' || Object.keys(fields).length === 0) {
+      return reply.code(400).send({ error: 'fields is required: { name: "cssSelector" | "cssSelector@attr" }' });
+    }
+    const p = await ensurePage();
+    const cap = Math.min(Math.max(Number(limit) || 20, 1), 100);
+    try {
+      // Written FLAT — no inner helper functions. This body is shipped into the
+      // page, and esbuild wraps nested function expressions in a `__name` helper
+      // that does not exist there; a previous in-page walker did that and threw
+      // ReferenceError on every call. Same hazard, same discipline.
+      const rows = await p.evaluate(
+        (arg: { container?: string; fields: Record<string, string>; cap: number }) => {
+          const scopes: Element[] = arg.container
+            ? Array.from(document.querySelectorAll(arg.container)).slice(0, arg.cap)
+            : [document.documentElement];
+          const out: Array<Record<string, string | null>> = [];
+          for (const scope of scopes) {
+            const row: Record<string, string | null> = {};
+            for (const key of Object.keys(arg.fields)) {
+              const spec = arg.fields[key] as string;
+              const at = spec.lastIndexOf('@');
+              const sel = at > 0 ? spec.slice(0, at) : spec;
+              const attr = at > 0 ? spec.slice(at + 1) : '';
+              let el: Element | null = null;
+              try {
+                el = sel === ':scope' ? scope : scope.querySelector(sel);
+              } catch {
+                row[key] = null;
+                continue;
+              }
+              if (!el) {
+                row[key] = null;
+                continue;
+              }
+              const v = attr ? el.getAttribute(attr) : (el as HTMLElement).innerText;
+              row[key] = v === null || v === undefined ? null : String(v).trim().slice(0, 500);
+            }
+            out.push(row);
+          }
+          return out;
+        },
+        { container, fields, cap },
+      );
+      const matched = rows.filter((r) => Object.values(r).some((v) => v !== null && v !== ''));
+      return {
+        url: p.url(),
+        rows: matched,
+        count: matched.length,
+        // An empty result is almost always a stale selector, not an empty page.
+        // Say so, or the caller reports "you have no notifications" when in fact
+        // the site re-skinned and the recipe needs re-learning.
+        ...(matched.length === 0 ? { hint: 'no element matched — the selectors are probably stale for this page; re-derive them with browser_read' } : {}),
+      };
+    } catch (e) {
+      return reply.code(400).send({ error: `scrape failed: ${e instanceof Error ? e.message : String(e)}` });
+    }
+  });
+
   app.post('/act', async (req, reply) => {
     const { action, ref, text } = (req.body ?? {}) as { action?: string; ref?: string; text?: string };
     if (!action) return reply.code(400).send({ error: 'action is required' });
