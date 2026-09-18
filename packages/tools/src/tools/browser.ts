@@ -6,7 +6,8 @@
 //
 // Trust: navigate/read/find/extract are read/auto but untrustedOutput=true (the
 // web is the injection vector — once a page is read, §8.3 blocks auto
-// mutations). browser_act (click/type/select/submit/key) is IRREVERSIBLE +
+// mutations). browser_act (click/type/select/scroll/key -- NOT submit; the
+// enum below is the source of truth) is IRREVERSIBLE +
 // auto_approve=false ALWAYS — every state-changing interaction queues for the
 // user's one-click approval showing the exact action + target + URL.
 import { describeImages } from '@ai-os/model-router';

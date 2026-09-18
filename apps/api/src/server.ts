@@ -124,6 +124,13 @@ declare module 'fastify' {
 // self-approval hole: without it any local process could POST /pending/:id/decide
 // or /chat and act as the user. The UI reaches the API only through the Vite/Next
 // proxies, which inject the header server-side (the browser never sees the token).
+/** How long an approval card stays armed. An approval is the confirmation step
+ *  for an intent expressed in conversation, so it is only meaningful while that
+ *  conversation is still live; a card from last month no longer means what the
+ *  user thought they were agreeing to. 24h is the natural "I will deal with it
+ *  tomorrow" window without keeping irreversible actions loaded indefinitely. */
+const PENDING_TTL_MS = Number(process.env.AIOS_PENDING_TTL_MS) || 24 * 3600_000;
+
 const API_TOKEN = (process.env.AIOS_API_TOKEN ?? '').trim();
 let warnedNoAuth = false;
 // A bare `path.startsWith('/oauth/')` prefix (2026-08-13 endpoint-authz audit)
@@ -667,8 +674,10 @@ app.get('/messages', async (req) => {
   const pending = (
     await pool.query(
       `SELECT id, task_id, tool, args, untrusted_context, created_at
-       FROM pending_actions WHERE session_id=$1 AND status='pending' ORDER BY created_at`,
-      [sessionId],
+       FROM pending_actions
+       WHERE session_id=$1 AND status='pending' AND created_at > now() - ($2::bigint * interval '1 millisecond')
+       ORDER BY created_at`,
+      [sessionId, PENDING_TTL_MS],
     )
   ).rows;
   return { sessionId, messages: await listMessages(pool, sessionId), pendingActions: pending };
@@ -1192,11 +1201,31 @@ async function decidePendingAction(
   decision: 'approved' | 'rejected',
   traceId: string,
 ): Promise<{ ok: boolean; executed: boolean; rejected?: boolean; error?: string; httpCode?: number; line: string; result?: unknown }> {
-  const pa = (await pool.query(`SELECT task_id, session_id, tool, args, status FROM pending_actions WHERE id=$1`, [id])).rows[0] as
-    | { task_id: string; session_id: string | null; tool: string; args: Record<string, unknown>; status: string }
+  const pa = (await pool.query(`SELECT task_id, session_id, tool, args, status, created_at FROM pending_actions WHERE id=$1`, [id])).rows[0] as
+    | { task_id: string; session_id: string | null; tool: string; args: Record<string, unknown>; status: string; created_at: string }
     | undefined;
   if (!pa) return { ok: false, executed: false, error: 'no such pending action', httpCode: 404, line: '⚠ No such pending approval.' };
   if (pa.status !== 'pending') return { ok: false, executed: false, error: `already ${pa.status}`, httpCode: 409, line: `⚠ Already ${pa.status} — nothing to do.` }; // no double-send
+  // FRESHNESS. This function used to check only that the row was still
+  // 'pending', so an approval card stayed armed forever. Measured 2026-09-19:
+  // 14 cards were pending, the oldest 71 days old, and they included
+  // purge_all_data (wipes the whole memory DB), mobility_book (books a real
+  // cab) and an x_publish_post whose text said "Shipped M12 today" — approving
+  // that in September would have publicly posted a false claim about August.
+  //
+  // An approval card is the confirmation step for an intent expressed in
+  // conversation; once that conversation is weeks cold the card no longer means
+  // what the user thought they were agreeing to. Expire it rather than execute
+  // a stale intent, and say WHY so it reads as a safety behaviour and not a bug.
+  const ageMs = Date.now() - new Date(pa.created_at).getTime();
+  if (ageMs > PENDING_TTL_MS) {
+    const days = Math.floor(ageMs / 86_400_000);
+    await pool.query(`UPDATE pending_actions SET status='expired', decided_at=now() WHERE id=$1`, [id]);
+    trace.recordSafe({ traceId, taskId: pa.task_id, component: 'trust', event: 'pending.expired', payload: { tool: pa.tool, ageDays: days } });
+    const line = `⏱ That approval is ${days} day(s) old, so I let it expire instead of running ${pa.tool} — the request it came from is long finished. Ask me again if you still want it.`;
+    await pool.query(`UPDATE tasks SET status='done', updated_at=now() WHERE id=$1`, [pa.task_id]);
+    return { ok: false, executed: false, error: `expired after ${days} day(s)`, httpCode: 409, line };
+  }
   await pool.query(`UPDATE notifications SET read=true WHERE meta->>'pendingActionId' = $1`, [id]);
 
   const say = async (content: string) => {
@@ -1284,7 +1313,9 @@ app.get('/dashboard', async () => {
        FROM tasks`,
     ),
     pool.query(`SELECT status, count(*)::int AS n FROM tasks GROUP BY status`),
-    pool.query(`SELECT id, task_id, tool, args, untrusted_context, created_at FROM pending_actions WHERE status='pending' ORDER BY created_at`),
+    // Expired cards are filtered out here too, or the dashboard keeps offering a
+    // live Approve button on an action decidePendingAction would now refuse.
+    pool.query(`SELECT id, task_id, tool, args, untrusted_context, created_at FROM pending_actions WHERE status='pending' AND created_at > now() - ($1::bigint * interval '1 millisecond') ORDER BY created_at`, [PENDING_TTL_MS]),
   ]);
   return {
     approvals: approvals.rows,

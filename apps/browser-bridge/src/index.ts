@@ -18,7 +18,7 @@ import Fastify from 'fastify';
 import { chromium, type BrowserContext, type Page } from 'playwright';
 import { timingSafeEqualStr } from '@ai-os/shared';
 import { DEFAULT_BROWSER_BRIDGE_PORT, type ElementRef } from './contract.js';
-import { findInPage } from './find-in-page.js';
+import { findInPage, FIND_CAP } from './find-in-page.js';
 import { installSsrfGuard } from './ssrf-route.js';
 
 // Playwright's own error messages (e.g. locator timeouts) embed ANSI dim/reset
@@ -91,8 +91,15 @@ const SNAPSHOT_MAX = 30;
  *  after navigate/act so the model always knows the CURRENT page's controls
  *  without a separate /find — refs are re-tagged each call, so these are valid
  *  right now (the stale-ref trap). */
-async function snapshot(p: Page): Promise<ElementRef[]> {
-  return (await findEverywhere(p, '')).slice(0, SNAPSHOT_MAX);
+/** snapshot() plus an explicit note when the list is INCOMPLETE. Returned as a
+ *  spread so every navigate/read/act response carries the same honest shape:
+ *  `{ elements, truncated?, note? }`. Without it a model that sees 30 controls
+ *  cannot tell a 30-control page from a 200-control one, and concludes a button
+ *  does not exist when it was simply number 31. */
+async function snapshotWithNote(p: Page): Promise<{ elements: ElementRef[] } & Record<string, unknown>> {
+  const all = await findEverywhere(p, '');
+  const elements = all.slice(0, SNAPSHOT_MAX);
+  return { elements, ...truncationNote(elements.length, all.length) };
 }
 
 /** Run findInPage in EVERY frame, not just the main one.
@@ -109,18 +116,40 @@ async function snapshot(p: Page): Promise<ElementRef[]> {
  *  the refs themselves already have — and if the indexes shift, the identity
  *  digest in the ref means the lookup misses and returns the stale-ref 404
  *  rather than acting on the wrong element. */
+/** True when any frame returned a FULL page of results, i.e. the in-page walker
+ *  stopped early and there are controls the caller cannot see. Tracked because
+ *  both caps here were SILENT: a model that asked for the page's controls got 50
+ *  (or 30) and had no way to know whether that was the whole page, so "there is
+ *  no Submit button" could simply mean "it was number 51". */
+let lastFindTruncated = false;
+
 async function findEverywhere(p: Page, query: string): Promise<ElementRef[]> {
   const frames = p.frames();
   const out: ElementRef[] = [];
+  lastFindTruncated = false;
   for (const [i, frame] of frames.entries()) {
     // A detached or still-loading frame throws; it simply contributes nothing.
     const found = (await frame.evaluate(findInPage, query).catch(() => [])) as ElementRef[];
+    if (found.length >= FIND_CAP) lastFindTruncated = true;
     const isMain = frame === p.mainFrame();
     for (const r of found) {
       out.push(isMain ? r : { ...r, ref: `f${i}:${r.ref}`, name: r.name });
     }
   }
   return out;
+}
+
+/** The truncation note to merge into a response, or nothing when all is shown. */
+function truncationNote(shown: number, total: number): Record<string, unknown> {
+  if (!lastFindTruncated && shown >= total) return {};
+  return {
+    truncated: true,
+    note:
+      `Showing ${shown} element(s)` +
+      (total > shown ? ` of ${total} found` : '') +
+      `${lastFindTruncated ? ` (a frame hit the ${FIND_CAP}-element ceiling, so more exist beyond that)` : ''}` +
+      '. If what you need is not listed, narrow it with a find query rather than concluding it is absent.',
+  };
 }
 
 /** Let a page settle after a navigation/interaction: DOM ready always, then a
@@ -166,14 +195,14 @@ async function main(): Promise<void> {
     await settle(p);
     // Return the page's controls immediately — the model can act without a
     // separate /read + /find round-trip.
-    return { url: p.url(), title: await p.title(), elements: await snapshot(p) };
+    return { url: p.url(), title: await p.title(), ...(await snapshotWithNote(p)) };
   });
 
   app.post('/read', async () => {
     const p = await ensurePage();
     const text = (await p.evaluate(() => document.body?.innerText ?? '')).slice(0, MAX_TEXT);
     // Structured read: text AND the current interactive elements in one call.
-    return { url: p.url(), title: await p.title(), text, elements: await snapshot(p) };
+    return { url: p.url(), title: await p.title(), text, ...(await snapshotWithNote(p)) };
   });
 
   // Wait for the page to reach a condition before the next step — the fix for
@@ -186,7 +215,7 @@ async function main(): Promise<void> {
       if (selector) await p.locator(selector).first().waitFor({ state: 'visible', timeout });
       else if (text) await p.getByText(text, { exact: false }).first().waitFor({ state: 'visible', timeout });
       else await p.waitForLoadState((state as 'load' | 'networkidle') || 'networkidle', { timeout });
-      return { ok: true, url: p.url(), title: await p.title(), elements: await snapshot(p) };
+      return { ok: true, url: p.url(), title: await p.title(), ...(await snapshotWithNote(p)) };
     } catch (err) {
       return reply.code(504).send({ error: `wait timed out (${timeout}ms): ${(err instanceof Error ? err.message : '').replace(ANSI_RE, '').slice(0, 160) || 'condition not met'}` });
     }
@@ -204,7 +233,7 @@ async function main(): Promise<void> {
     const { query } = (req.body ?? {}) as { query?: string };
     const p = await ensurePage();
     const matches = await findEverywhere(p, query ?? '');
-    return { matches };
+    return { matches, ...truncationNote(matches.length, matches.length) };
   });
 
   app.post('/extract', async (req) => {
@@ -253,7 +282,7 @@ async function main(): Promise<void> {
               const at = spec.lastIndexOf('@');
               const sel = at > 0 ? spec.slice(0, at) : spec;
               const attr = at > 0 ? spec.slice(at + 1) : '';
-              let el: Element | null = null;
+              let el: Element | null;
               try {
                 el = sel === ':scope' ? scope : scope.querySelector(sel);
               } catch {
@@ -345,7 +374,7 @@ async function main(): Promise<void> {
     await settle(p);
     // Return the post-action page state + fresh controls, so the model sees the
     // result of what it did and can take the next step without a stale ref.
-    return { ok: true, action, url: p.url(), title: await p.title(), elements: await snapshot(p) };
+    return { ok: true, action, url: p.url(), title: await p.title(), ...(await snapshotWithNote(p)) };
   });
 
   process.on('unhandledRejection', (e) => app.log.error({ err: e instanceof Error ? e.message : e }, 'unhandledRejection'));

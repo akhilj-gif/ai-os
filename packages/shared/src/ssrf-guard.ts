@@ -361,7 +361,17 @@ export async function ssrfSafeFetch(
         for (const [k, v] of res.headers as unknown as Iterable<[string, string]>) {
           if (k !== 'content-encoding' && k !== 'content-length') headers.append(k, v);
         }
-        const out = new Response(buffered, { status: res.status, statusText: res.statusText, headers });
+        // A Uint8Array is a valid body to both Node's undici and the DOM, but the
+        // two libs type BodyInit differently and TS 5.7 made Uint8Array generic,
+        // so under lib:["DOM"] (which apps/browser-bridge needs for its in-page
+        // code) this is the monorepo's only type conflict. Derive the parameter
+        // type from Response itself rather than naming BodyInit: the name is not
+        // global under the root config, so only this form compiles under BOTH.
+        const out = new Response(buffered as ConstructorParameters<typeof Response>[0], {
+          status: res.status,
+          statusText: res.statusText,
+          headers,
+        });
         // Response.url is an empty string on a constructed Response and is
         // read-only, so re-wrapping silently lost the POST-REDIRECT url —
         // fetch-url.ts does `res.url || url` and was therefore reporting

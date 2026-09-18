@@ -8,6 +8,20 @@ import type { ElementRef } from './contract.js';
 // found live on olacabs.com's location-suggestion list (2026-07-11): those
 // items matched none of a/button/[role] and were invisible to this tool until
 // the cursor:pointer + option/listitem/menuitem heuristic was added below.
+/** Per-frame ceiling, exported so the bridge can tell "this page has 50
+ *  controls" apart from "this page has 200 and you are seeing 50" — the caller
+ *  previously could not, and silently acted as if it had seen everything.
+ *
+ *  MUST stay equal to the literal 50 inside findInPage below, and the literal
+ *  cannot be replaced by this constant. findInPage is shipped into the browser
+ *  by page.evaluate, where module scope does NOT exist: referencing FIND_CAP
+ *  from inside it throws `ReferenceError: FIND_CAP is not defined`, which
+ *  findEverywhere catches into an empty array — so every page silently reports
+ *  ZERO controls. Done exactly that on 2026-09-19, the same trap the __name
+ *  comment inside the function already warns about. ref-identity-smoke asserts
+ *  the two agree. */
+export const FIND_CAP = 50;
+
 export function findInPage(query: string): ElementRef[] {
   const q = (query || '').toLowerCase();
   const sel = 'a,button,input,textarea,select,[role=button],[role=link],[onclick],li,[role=option],[role=listitem],[role=menuitem],[class*=suggest],[class*=option]';
@@ -85,7 +99,8 @@ export function findInPage(query: string): ElementRef[] {
     const ref = 'e' + i++ + '~' + h.toString(36).slice(0, 4);
     el.setAttribute('data-aios-ref', ref);
     out.push({ ref, role, name });
-    if (out.length >= 50) break;
+    if (out.length >= 50) break; // literal on purpose — see FIND_CAP above
+
   }
   return out;
 }

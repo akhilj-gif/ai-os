@@ -14,7 +14,7 @@
 // and the stale-ref 404 fires. Where the same control merely MOVED, /act can
 // recover by digest, but only when exactly one element carries it.
 import { chromium } from 'playwright';
-import { findInPage } from './find-in-page.js';
+import { findInPage, FIND_CAP } from './find-in-page.js';
 
 let fail = 0;
 const check = (name: string, ok: boolean, extra = ''): void => {
@@ -109,6 +109,16 @@ try {
   check('an iframe control is reachable per-frame', everywhere.some((r) => r.name === 'Accept all cookies'), everywhere.map((r) => r.name).join(' | '));
   const framed = everywhere.find((r) => r.name === 'Accept all cookies');
   check('and its ref is namespaced to the frame that minted it', !!framed && /^f\d+:e\d+~/.test(framed.ref), framed?.ref);
+  // --- the cap is a LITERAL inside findInPage, mirrored by FIND_CAP ---------
+  // It cannot reference the constant: findInPage is shipped into the page by
+  // evaluate(), where module scope does not exist, so `FIND_CAP` there throws
+  // ReferenceError and findEverywhere catches it into an empty array — every
+  // page then reports ZERO controls. Done exactly that on 2026-09-19. This
+  // asserts the mirror still matches, empirically, from outside the page.
+  await page.setContent('<div>' + Array.from({ length: FIND_CAP + 25 }, (_, i) => `<button>btn ${i}</button>`).join('') + '</div>');
+  const capped = await snap();
+  check('a page with more controls than the cap returns exactly FIND_CAP', capped.length === FIND_CAP, `${capped.length} vs FIND_CAP=${FIND_CAP}`);
+  check('...and the ordinary path is not broken by the in-page scope trap', capped.length > 0, `${capped.length} found`);
 } finally {
   await browser.close();
 }

@@ -1,0 +1,20 @@
+{
+  // browser-bridge is the ONE package that is half Node and half browser: most
+  // of it is a Fastify server, but find-in-page.ts and the page.evaluate bodies
+  // run INSIDE Chromium and legitimately reference document, Element, ShadowRoot
+  // and getComputedStyle. Under the root config (lib: ES2022, no DOM) that is 23
+  // errors, which is why this app was left out of `pnpm typecheck` entirely —
+  // and being outside the typechecker is exactly how the doctor's array/vs/map
+  // confusion and the graph §8.3 gap shipped unnoticed.
+  //
+  // Adding DOM to the ROOT config would be the wrong fix: it would let every
+  // Node file in the monorepo reference `document` and compile happily until it
+  // crashed at runtime. Scoping DOM to the one package that actually has a
+  // browser context keeps that guarantee everywhere else.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts"]
+}

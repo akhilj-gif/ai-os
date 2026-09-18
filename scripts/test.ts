@@ -4,6 +4,9 @@
 // forge, kernel/memory-taint) run separately against a live stack; the eval gym
 // is `pnpm eval`. One of those is security-critical and worth naming:
 //   tsx packages/kernel/src/graph-untrusted-smoke.ts
+//   tsx packages/kernel/src/pending-ttl-smoke.ts
+// Pins that an approval card EXPIRES (24h): decidePendingAction used to check
+// only status=pending, so a 71-day-old purge_all_data card was still armed.
 // It pins §8.3 on the GRAPH driver, which — unlike executor.ts — enforced none
 // of it until 2026-09-04: a write-class tool ran there under untrusted context.
 // Needs Postgres, because the taint latch is persisted on the task row.
