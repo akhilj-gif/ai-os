@@ -661,7 +661,12 @@ async function fetchWithRateLimitRetry(
     }
     const body = lastRes ? await lastRes.clone().text() : '';
     const headerWait = (lastRes && Number(lastRes.headers.get('retry-after')) * 1000) || 0;
-    const bodyWait = (Number(body.match(/retry in (\d+(?:\.\d+)?)s/i)?.[1]) || 0) * 1000;
+    // Both shapes the providers actually send: "retry in 8.5s" and Groq's
+    // "Please try again in 15m17.136s". Matching only the seconds group of the
+    // latter would read a 15-minute wait as 17 seconds — worse than reading
+    // nothing, because it looks like a hint worth honouring.
+    const dur = body.match(/(?:retry in|try again in)\s*(?:(\d+)h)?(?:(\d+)m)?([\d.]+)s/i);
+    const bodyWait = dur ? ((Number(dur[1]) || 0) * 3600 + (Number(dur[2]) || 0) * 60 + (Number(dur[3]) || 0)) * 1000 : 0;
     // Jitter (0–4s): two callers that 429'd together would otherwise honor the
     // SAME hint and re-collide every round in lockstep (observed as a minutes-
     // long mutual livelock between a chat task and a background task).
@@ -673,9 +678,22 @@ async function fetchWithRateLimitRetry(
     // check. If there is no budget left to wait out, stop retrying and let the
     // chain move on.
     const budgetLeft = deadline - Date.now();
-    const waitMs = Math.min(Math.max(headerWait, bodyWait, round * 5_000) + 1_000 + jitter, MAX_WAIT_MS, Math.max(0, budgetLeft));
-    if (waitMs <= 0 || budgetLeft <= 0) {
-      console.warn(`[model-router] ${label}: ${budgetMs}ms budget spent — not waiting out the rate limit, failing over`);
+    const wanted = Math.max(headerWait, bodyWait, round * 5_000) + 1_000 + jitter;
+    const waitMs = Math.min(wanted, MAX_WAIT_MS, Math.max(0, budgetLeft));
+    // Only sleep if an ATTEMPT can still follow it. Clamping the wait down to
+    // the remaining budget meant a provider saying "retry after 58s" with 59s
+    // of budget slept the whole 59s and then hit the deadline check at the top
+    // of the next round and threw — the sleep consumed exactly the budget the
+    // attempt it was waiting for would have needed. Measured: that futile sleep
+    // WAS the 60 seconds the user waited on every failing turn, almost all of
+    // it spent in setTimeout rather than computing. Failing over immediately is
+    // strictly better: the next provider might answer, and a wait that cannot
+    // be followed by a request cannot possibly help.
+    const MIN_ATTEMPT_MS = 2_000;
+    if (waitMs <= 0 || budgetLeft <= 0 || wanted + MIN_ATTEMPT_MS > budgetLeft) {
+      console.warn(
+        `[model-router] ${label}: rate-limited and the hint (${Math.round(wanted / 1000)}s) outlasts the remaining budget (${Math.round(Math.max(0, budgetLeft) / 1000)}s) — failing over now instead of sleeping`,
+      );
       if (lastRes) return lastRes;
       throw new Error(`INFRA_NETWORK: ${label} budget spent while rate-limited`);
     }

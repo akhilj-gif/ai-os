@@ -45,7 +45,7 @@ import {
 } from '@ai-os/kernel';
 import { MemoryService, recordExperience, updateKnowledgeGraph, memoryAnalytics, cognitiveBriefing, consolidateInsights } from '@ai-os/memory';
 import { failoverChain, transcribe, synthesize, callModel, describeImages } from '@ai-os/model-router';
-import { composeRegistry, packPrompts, loadEnabledPacks, installPack, setPackEnabled, listPacks, PACKS, uberConfigured, uberAuthorizeUrl, exchangeUberCode, forgePack, installDynamicPack, listStagedPacks } from '@ai-os/packs';
+import { composeRegistry, packGuides, loadEnabledPacks, installPack, setPackEnabled, listPacks, PACKS, uberConfigured, uberAuthorizeUrl, exchangeUberCode, forgePack, installDynamicPack, listStagedPacks } from '@ai-os/packs';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const memory = new MemoryService(pool);
@@ -99,8 +99,14 @@ const packRegistry = () => {
   });
   return r;
 };
+// Per-pack guidance is NO LONGER concatenated here. It was 2,632 tokens on
+// every single chat turn - 15 packs explaining cabs, Gmail and X before the
+// user had said anything - against Groq's 7,000-token/min ceiling, which is
+// why even "hi" was rejected 413 and took 60s to fail. It now travels as data
+// (packGuides) and the executor ships only the guides whose tools it actually
+// offered this turn. The forge line stays: it is not about any one pack, it is
+// what the OS should do when NO pack fits.
 const packPrompt = () =>
-  packPrompts(enabledPacks) +
   '\n[forge] If the user asks for a capability no current tool provides and it could be served by a public web API, offer to BUILD it: call pack_forge with their request. After it stages, tell them the pack name/tools and that installing needs their approval (pack_install).';
 const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', {
   maxRetriesPerRequest: 1,
@@ -474,10 +480,10 @@ async function completeChatTask(taskId: string, agentMode: 'auto' | 'force' | 'o
   const result = useAgents
     ? await runAgentTask(pool, taskId, {
         registry: packRegistry(),
-        extraSystem: packPrompt(),
+        extraSystem: packPrompt(), packGuides: packGuides(enabledPacks),
         say: async (content) => { await addMessage(pool, { sessionId, role: 'assistant', content, taskId }); },
       })
-    : await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true, history: prior, precomputedMemory, precomputedMemoryUntrusted });
+    : await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), packGuides: packGuides(enabledPacks), enableMemory: true, history: prior, precomputedMemory, precomputedMemoryUntrusted });
   await addMessage(pool, { sessionId, role: 'assistant', content: result.text, taskId });
 
   // Learn from doing (Memory OS Phase 1): distill this task's execution into an
@@ -811,7 +817,7 @@ async function runAutopilotCycle(traceId: string): Promise<{ mode: string; ran: 
       [s.action, traceId],
     );
     const taskId = rows[0]!.id;
-    const r = await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true, readOnly });
+    const r = await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), packGuides: packGuides(enabledPacks), enableMemory: true, readOnly });
     ran.push({ action: s.action!, status: r.status, text: r.text.slice(0, 400) });
     void recordExperience(pool, { taskId, replyText: r.text }).catch(() => undefined);
   }
@@ -842,7 +848,7 @@ async function advanceStandingGoal(g: StandingGoalRow, traceId: string): Promise
     [prompt, traceId],
   );
   const taskId = rows[0]!.id;
-  const r = await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), enableMemory: true, readOnly: true });
+  const r = await runTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), packGuides: packGuides(enabledPacks), enableMemory: true, readOnly: true });
   const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
   const entry = `[${stamp}] ${r.text.slice(0, 400).replace(/\s+/g, ' ')}`;
   await pool.query(
@@ -1805,7 +1811,7 @@ function resumeTaskById(taskId: string, why: 'boot' | 'coordinator'): Promise<vo
       if (shape.has_plan) {
         app.log.info({ taskId, why }, 'resuming orphaned orchestration from persisted plan');
         trace.recordSafe({ traceId: newTraceId(), taskId, component: 'api', event: 'task.resume_on_boot', payload: { orchestration: true, why } });
-        await resumeAgentTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), say })
+        await resumeAgentTask(pool, taskId, { registry: packRegistry(), extraSystem: packPrompt(), packGuides: packGuides(enabledPacks), say })
           .then(async (result) => {
             if (result) {
               if (say && result.text) await say(result.text);

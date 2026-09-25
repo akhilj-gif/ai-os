@@ -28,6 +28,7 @@ import type pg from 'pg';
 import { TraceStore } from '@ai-os/shared';
 import { callModel } from '@ai-os/model-router';
 import type { ToolRegistry } from '@ai-os/tools';
+import type { PackGuide } from './tool-select.js';
 import { runTask, type TaskRunResult } from './executor.js';
 
 // ---------------------------------------------------------------------------
@@ -334,6 +335,10 @@ async function synthesize(goal: string, results: ChildResult[], traceId: string)
 export interface AgentTaskOptions {
   registry: ToolRegistry;
   extraSystem?: string;
+  /** Pack guidance as data, selected per turn by the executor. Threaded down to
+   *  every child so a specialist gets the instructions for ITS toolkit and not
+   *  for the other fourteen packs. */
+  packGuides?: PackGuide[];
   /** Post a progress line into the chat (plan announcement, per-agent ticks). */
   say?: (content: string) => Promise<void>;
   /** M12b: the whole orchestration starts §8.3-tainted — set when the goal was
@@ -363,13 +368,13 @@ export async function runAgentTask(pool: pg.Pool, taskId: string, opts: AgentTas
   } catch (err) {
     // Planning failed → degrade gracefully to the ordinary single loop.
     await trace.record({ traceId, taskId, component: 'kernel', event: 'agents.plan_failed', payload: { error: String(err) } });
-    return runTask(pool, taskId, { registry: opts.registry, extraSystem: opts.extraSystem, enableMemory: true, initialUntrusted: opts.initialUntrusted });
+    return runTask(pool, taskId, { registry: opts.registry, extraSystem: opts.extraSystem, packGuides: opts.packGuides, enableMemory: true, initialUntrusted: opts.initialUntrusted });
   }
 
   // One subtask = no orchestration worth paying for — run the plain loop.
   if (subtasks.length === 1) {
     await trace.record({ traceId, taskId, component: 'kernel', event: 'agents.collapsed', payload: { agent: subtasks[0]!.agent } });
-    return runTask(pool, taskId, { registry: opts.registry, extraSystem: opts.extraSystem, enableMemory: true, initialUntrusted: opts.initialUntrusted });
+    return runTask(pool, taskId, { registry: opts.registry, extraSystem: opts.extraSystem, packGuides: opts.packGuides, enableMemory: true, initialUntrusted: opts.initialUntrusted });
   }
 
   await pool.query(`UPDATE tasks SET status='running', updated_at=now() WHERE id=$1`, [taskId]);
@@ -478,6 +483,7 @@ async function driveOrchestration(
         .filter(Boolean)
         .join('\n\n');
       const run = await runTask(pool, childId, {
+        packGuides: opts.packGuides,
         registry: opts.registry,
         extraSystem: extra,
         allowedTools: agent.tools.length ? agent.tools : undefined,

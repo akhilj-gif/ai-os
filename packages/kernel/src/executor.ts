@@ -9,7 +9,7 @@ import { TraceStore, logger } from '@ai-os/shared';
 import { chat, type ChatMessage } from '@ai-os/model-router';
 import { buildRegistry, type ToolRegistry } from '@ai-os/tools';
 import { TrustGate, blockedByUntrustedContext, redactForAudit } from '@ai-os/trust';
-import { selectTools, omittedToolsNote } from './tool-select.js';
+import { selectTools, omittedToolsNote, selectPackGuides, type PackGuide } from './tool-select.js';
 import { extractAndStore } from '@ai-os/memory';
 import { systemPrompt } from './prompts.js';
 import { assembleMemoryContext, compactHistory, shrinkToolResults } from './context.js';
@@ -33,7 +33,21 @@ const CONTEXT_TOKEN_BUDGET = Number(process.env.AIOS_CONTEXT_TOKEN_BUDGET) || 64
 // task-detail page. But dumping it into the CHAT reads as alarming and gives no next
 // step — so the chat gets a plain-language line instead. Falls through to a trimmed
 // raw message for anything we don't recognise (never a 500-char JSON blob).
-function humanizeFailure(msg: string): string {
+export function humanizeFailure(msg: string): string {
+  // 413 FIRST, because the generic rate-limit branch below matches it too and
+  // then gives actively harmful advice. A 413 means the request itself did not
+  // fit the per-minute window ("Limit 7000, Requested 7267"); waiting changes
+  // nothing, the identical request fails identically forever. The old message
+  // told the user it "usually clears within a minute, so please try again" —
+  // so the rational response was to retry, indefinitely, on something that
+  // could never work. The provider already states the numbers; show them
+  // rather than paraphrasing, and say what actually helps.
+  const tooBig = /\b413\b|Request too large/i.test(msg);
+  if (tooBig) {
+    const nums = /Limit (\d+), (?:Used (\d+), )?Requested (\d+)/i.exec(msg);
+    const detail = nums ? ` (the request was ${nums[3]} tokens against a ${nums[1]}-per-minute limit)` : '';
+    return `⚠ That request was too large for the free model tier's per-minute window${detail}. Retrying will not help — the same request is the same size. Starting a new chat drops the conversation history, which is usually what has grown.`;
+  }
   if (/INFRA_RATELIMIT|\b429\b|\b503\b|quota|rate.?limit/i.test(msg)) {
     return '⚠ I couldn’t finish that — the AI model provider is rate-limited right now. It usually clears within a minute, so please try again in a moment.';
   }
@@ -145,6 +159,11 @@ export interface RunTaskOptions {
   /** M11 agents: restrict this run to a named subset of the registry's tools —
    *  a specialist sub-agent only SEES (and can only call) its own toolkit. */
   allowedTools?: string[];
+  /** Pack prompts paired with the tools they describe. Only the guides whose
+   *  tools survive per-turn selection are shipped — the alternative (a
+   *  pre-joined extraSystem string) cost 2,632 tokens on EVERY turn, over a
+   *  third of Groq's 7,000/min budget, to explain tools that were not offered. */
+  packGuides?: PackGuide[];
   /** M11 agents: start with the §8.3 untrusted-content latch already ON —
    *  set when a dependency subtask's output was untrusted-derived, so the
    *  taint propagates ACROSS agents instead of resetting per child task. */
@@ -235,8 +254,22 @@ export async function runTask(
   // paying 5,830 tokens of catalog, which pushed the prompt to ~10,965 and over
   // Groq's 7,000 ITPM ceiling — so the fast provider 413'd on every call and the
   // request fell through to a quota-exhausted Gemini. See tool-select.ts.
-  const selection = allowed ? { selected: fullCatalog, omitted: [] as string[] } : selectTools(fullCatalog, [task.goal, ...(opts.history ?? []).slice(-4).map((m) => (typeof m.content === 'string' ? m.content : ''))].join(' '));
+  const selection = allowed ? { selected: fullCatalog, omitted: [] as string[] } : selectTools(fullCatalog, task.goal, 14, (opts.history ?? []).slice(-4).map((m) => (typeof m.content === 'string' ? m.content : '')).join(' '));
   let toolDefs = selection.selected;
+  // Pack guidance follows the tools, so the pairing is always exact: guidance
+  // is never shipped for a tool that is not offered, and — via the
+  // tools_expand branch below — a tool is never offered without its guidance.
+  const appendSystem = (extra: string): void => {
+    if (!extra) return;
+    messages = messages.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}
+
+${extra}` } : m));
+  };
+  if (opts.packGuides?.length) {
+    const guides = selectPackGuides(opts.packGuides, toolDefs.map((t) => t.name));
+    appendSystem(guides);
+    await trace.record({ traceId, taskId, component: 'kernel', event: 'packs.guides_selected', payload: { chars: guides.length, of: opts.packGuides.length } });
+  }
   if (selection.omitted.length) {
     // Keep omitted tools DISCOVERABLE, or filtering becomes silent capability
     // loss — the exact failure mode this repo keeps paying for. Two halves:
@@ -261,6 +294,26 @@ ${omittedToolsNote(selection.omitted)}` } : m));
       ...toolDefs,
     ];
   }
+  // Turn budget, recorded every turn. Groq admits 7,000 input tokens per minute
+  // and reports the size it rejected ("Requested 7267") but not the shape, so
+  // without this the only way to learn WHY a turn was too large is to rebuild
+  // the prompt by hand in a script and hope it matches the live path — which it
+  // did not, by a factor of three. ~4 chars/token; the provider's count is the
+  // arbiter, this is for attribution.
+  const estTok = (t: string): number => Math.ceil(t.length / 4);
+  const budget = {
+    system: estTok(messages.find((m) => m.role === 'system')?.content?.toString() ?? ''),
+    history: messages.filter((m) => m.role !== 'system').reduce((a, m) => a + estTok(typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '')), 0),
+    tools: estTok(JSON.stringify(toolDefs.map((t) => ({ n: t.name, d: t.description, p: t.inputSchema })))),
+  };
+  await trace.record({
+    traceId,
+    taskId,
+    component: 'kernel',
+    event: 'turn.budget',
+    payload: { ...budget, total: budget.system + budget.history + budget.tools, tools_n: toolDefs.length, ceiling: 7000 },
+  });
+
   const untrustedTools = new Set(toolDefs.filter((t) => t.untrustedOutput).map((t) => t.name));
   // Structural injection defense (§8.3): once untrusted content is in context,
   // the trust gate blocks mutating actions. Persists across iterations.
@@ -406,11 +459,33 @@ ${omittedToolsNote(selection.omitted)}` } : m));
           (t) => !have.has(t.name) && (t.name.toLowerCase().includes(q) || (t.description ?? '').toLowerCase().includes(q)),
         );
         toolDefs = [...toolDefs, ...add];
+        // A tool pulled back mid-run needs its pack's instructions too, or the
+        // model gets a schema with none of the usage rules that make it
+        // correct (e.g. that calendar_create_event is approval-queued). Only
+        // the newly-added tools are consulted, so nothing is repeated.
+        if (add.length && opts.packGuides?.length) {
+          const already = new Set(toolDefs.filter((t) => !add.includes(t)).map((t) => t.name));
+          const fresh = opts.packGuides.filter((g) => !g.tools.some((t) => already.has(t)));
+          appendSystem(selectPackGuides(fresh, add.map((t) => t.name)));
+        }
         const payload = add.length
           ? { loaded: add.map((t) => t.name), note: 'Schemas are now available — call the one you need on this next step.' }
           : { loaded: [], note: `No installed tool matches "${q}". Do not invent one; tell the user it is not available.` };
-        messages.push({ role: 'assistant', content: `tools_expand(${JSON.stringify(tc.args)})` });
-        messages.push({ role: 'user', content: `TOOL RESULT tools_expand: ${JSON.stringify(payload)}` });
+        // Answer the tool_call the way EVERY other tool does. This branch used
+        // to push a synthetic assistant line plus a user line, which left the
+        // real tool_call (already in `messages` via resp.message above)
+        // unanswered — violating the invariant this very file documents 130
+        // lines down: "the OpenAI message format requires every tool_call in an
+        // assistant turn to be answered before the next turn". The provider
+        // rejects that with a 400, which isInfraFailure does not classify as
+        // infra, so there is no failover and humanizeFailure has no branch for
+        // it — the turn dies and the user is shown raw JSON.
+        //
+        // It is the worst possible place for that bug: tools_expand is the ONLY
+        // route to the tools per-turn selection omitted, so the escape hatch
+        // built to prevent silent capability loss turned every use of a
+        // non-selected tool into a hard, loud failure.
+        messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(payload) });
         await trace.record({ traceId, taskId, component: 'kernel', event: 'tools.expanded', payload: { query: q, loaded: add.map((t) => t.name) } });
         continue;
       }

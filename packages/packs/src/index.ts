@@ -592,6 +592,17 @@ export function packPrompts(enabled: Set<string>): string {
     .join('\n');
 }
 
+/** Each enabled pack's prompt PAIRED with the tools it applies to, so a caller
+ *  can ship only the guidance whose tools are actually on offer this turn.
+ *  packPrompts() above concatenates all of them unconditionally, which cost
+ *  2,632 tokens on every chat turn against a 7,000/min ceiling — see
+ *  kernel/tool-select.ts selectPackGuides for the measurement. */
+export function packGuides(enabled: Set<string>): Array<{ name: string; tools: string[]; prompt: string }> {
+  return Object.values(allPacks())
+    .filter((p) => enabled.has(p.name) && p.prompt)
+    .map((p) => ({ name: p.name, tools: (p.tools ?? []).map((t) => t.name), prompt: p.prompt! }));
+}
+
 export async function loadEnabledPacks(pool: pg.Pool): Promise<Set<string>> {
   const { rows } = await pool.query<{ name: string }>(`SELECT name FROM capability_packs WHERE enabled`);
   const enabled = new Set<string>();

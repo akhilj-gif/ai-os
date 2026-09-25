@@ -44,6 +44,7 @@ const SMOKES = [
   'packages/packs/src/x-smoke.ts',
   'packages/tools/src/tools/instagram-smoke.ts', // instagram pack — pins the mock client + the caption/hashtag/public-image limits
   'packages/tools/src/tools/connectors-smoke.ts', // app connectors — pins the slug round trip (save-then-run) and the arg contracts
+  'packages/kernel/src/turn-budget-smoke.ts', // per-turn prompt cost + honest failure text — pins the 2,632-token pack-prompt cut and the 413-is-not-transient message
   'packages/kernel/src/recovery-smoke.ts', // failure recovery policy — pins that transient failures retry AND that a trust refusal never does
   'packages/packs/src/mobility-smoke.ts',
   'packages/packs/src/mobility-decide-smoke.ts',
