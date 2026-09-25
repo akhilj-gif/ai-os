@@ -14,6 +14,10 @@
 // message said the problem "usually clears within a minute, so please try
 // again", which is precisely wrong for a request that is simply too big.
 import { selectPackGuides, selectTools, HISTORY_SLOTS, type PackGuide } from './tool-select.js';
+
+/** Mirror of tool-select's private `words()`. Kept in step by the ASCII check
+ *  below, which fails if the two ever drift. */
+const probeWords = (s: string): string[] => (s.toLowerCase().match(/[\p{L}\p{N}\p{M}_]+/gu) ?? []).filter((w) => w.length > 2 && !['the','a','an','and','to','for','with','my','me','can','you','do','what'].includes(w));
 import { humanizeFailure } from './executor.js';
 
 let fail = 0;
@@ -105,6 +109,26 @@ check('...without unrelated ones', !ask.selected.some((t) => t.name === 'x_publi
 const followUp = selectTools(TOOLS, 'yes do it', 14, 'can you book a cab with mobility_book');
 check('a follow-up still reaches the tool the last turn named', followUp.selected.some((t) => t.name === 'mobility_book'), followUp.selected.map((t) => t.name).join(','));
 check('...but carries at most ' + HISTORY_SLOTS + ' tools from history', followUp.selected.length <= 6 + HISTORY_SLOTS, followUp.selected.length + ' tools');
+
+console.log('');
+console.log('- an Indian-language message must not vanish -');
+// The owner is in India. Measured before this fix, the ASCII-only tokenizer
+// returned [] for both of these, so they scored against NO tool and were
+// offered only the six core ones - whatsapp_send_message was unreachable.
+const TELUGU = 'అమ్మకి వాట్సాప్ పంపు';   // "send whatsapp to amma"
+const HINDI = 'अम्मा को व्हाट्सएप भेजो';    // same, Devanagari
+const MIXED = 'मेरा cab book करो';   // "book my cab", mixed script
+check('a Telugu message produces tokens at all', probeWords(TELUGU).length > 0, JSON.stringify(probeWords(TELUGU)));
+check('a Hindi message produces tokens at all', probeWords(HINDI).length > 0, JSON.stringify(probeWords(HINDI)));
+// Mixed script is the common real case, and the English words in it must still
+// reach their tools.
+const mixedSel = selectTools(TOOLS, MIXED, 14, '');
+check('a mixed-script request still finds its tool', mixedSel.selected.some((t) => t.name === 'mobility_book'), mixedSel.selected.map((t) => t.name).join(','));
+// Even when nothing matches, the capability must stay REACHABLE - that is what
+// stops a non-English turn from being silent capability loss.
+const teluguSel = selectTools(TOOLS, TELUGU, 14, '');
+check('an unmatched non-English turn still gets the escape hatch', teluguSel.selected.some((t) => t.name === 'tools_expand') && teluguSel.omitted.length > 0, `${teluguSel.omitted.length} reachable`);
+check('...and ASCII behaviour is unchanged', JSON.stringify(probeWords('send a whatsapp to amma')) === JSON.stringify(['send', 'whatsapp', 'amma']), JSON.stringify(probeWords('send a whatsapp to amma')));
 
 console.log(`\n${fail === 0 ? 'ALL PASS' : fail + ' FAILED'}`);
 process.exit(fail ? 1 : 0);

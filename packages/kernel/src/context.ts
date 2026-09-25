@@ -7,7 +7,19 @@ import type pg from 'pg';
 import { MemoryService, graphForText, type MemoryType } from '@ai-os/memory';
 import type { ChatMessage } from '@ai-os/model-router';
 
-const approxTokens = (s: string): number => Math.ceil(s.length / 4);
+/** ~4 chars/token holds for English and badly overestimates how much non-Latin
+ *  text fits: Devanagari and Telugu are multi-byte and tokenize closer to 1–1.5
+ *  chars/token, so chars/4 undercounts a Hindi or Telugu message roughly 3x.
+ *  That matters because this number is the ONLY thing standing between a long
+ *  conversation and the provider's hard per-minute input limit — undercounting
+ *  means the budget guard passes a request that is actually over, and the turn
+ *  dies with a 413 the guard was there to prevent. Counting non-Latin
+ *  characters at ~1.4/token keeps the estimate conservative where it is wrong,
+ *  which is the safe direction for a ceiling check. */
+const approxTokens = (s: string): number => {
+  const nonLatin = (s.match(/[^\p{Script=Latin}\p{N}\p{P}\p{Z}\p{C}]/gu) ?? []).length;
+  return Math.ceil((s.length - nonLatin) / 4 + nonLatin / 1.4);
+};
 
 /** Build the MEMORY context block for a task: preferences (always) + relevant
  *  recalled memories (ranked), trimmed to `budgetTokens`.

@@ -47,8 +47,32 @@ const STOP = new Set([
   'those','it','its','be','been','being','have','has','had','from','by','at','as','not','no','yes','please','just','get',
 ]);
 
+// Unicode-aware, not /[a-z0-9_]+/. The ASCII class silently returned NOTHING
+// for a message written in an Indian script, which is not a hypothetical for
+// this OS's owner:
+//   "send a whatsapp to amma"  -> ["send","whatsapp","amma"]
+//   "అమ్మకి వాట్సాప్ పంపు"          -> []        (measured 2026-09-26)
+//   "अम्मा को व्हाट्सएप भेजो"        -> []
+// Zero words means zero tool scores, so a Telugu or Hindi request was offered
+// only the six core tools and could not reach whatsapp_send_message at all.
+// (\p{L} also picks up accented Latin — "café", "Müller" — which the old class
+// split mid-word.)
+//
+// This does not make matching cross-lingual on its own: tool names and
+// descriptions are English, so native-script words still score 0 against them.
+// What it fixes is the silent part — mixed-script messages ("मेरा cab book करो")
+// now tokenize properly, and the omitted-tool index plus tools_expand remain
+// the model's route to anything unmatched, which is the design's answer to
+// exactly this. Real cross-lingual selection needs embeddings, and an extra
+// embedding call per turn is not affordable on this tier.
+// \p{M} (combining marks) is NOT optional here, and leaving it out looks
+// correct while still being broken. Indic scripts write most vowels as
+// combining marks rather than letters, so "అమ్మకి" under /[\p{L}\p{N}]+/ splits
+// at every matra and virama into fragments shorter than the 3-char floor —
+// measured, Telugu still came back [] and Hindi returned the single fragment
+// "सएप". Marks are part of the word.
 const words = (s: string): string[] =>
-  (s.toLowerCase().match(/[a-z0-9_]+/g) ?? []).filter((w) => w.length > 2 && !STOP.has(w));
+  (s.toLowerCase().match(/[\p{L}\p{N}\p{M}_]+/gu) ?? []).filter((w) => w.length > 2 && !STOP.has(w));
 
 /** Score a tool against the turn's text by token overlap. Name matches count
  *  double — "send a whatsapp" should surface whatsapp_send_message ahead of a
