@@ -33,6 +33,24 @@ const CONTEXT_TOKEN_BUDGET = Number(process.env.AIOS_CONTEXT_TOKEN_BUDGET) || 64
 // task-detail page. But dumping it into the CHAT reads as alarming and gives no next
 // step — so the chat gets a plain-language line instead. Falls through to a trimmed
 // raw message for anything we don't recognise (never a 500-char JSON blob).
+/** True for a notice humanizeFailure() produced — or a model's imitation of
+ *  one. These are SYSTEM messages about a failed turn, stored in the chat so
+ *  the user sees them, and they must never be replayed to the model as things
+ *  the assistant said.
+ *
+ *  Measured 2026-09-27: after a stretch of provider rate limits, 10 of the 12
+ *  assistant turns the chat replayed as history were these notices. The model
+ *  did what in-context learning does and IMITATED them: asked "what is the
+ *  price of reliance right now?" on a healthy provider, it answered with the
+ *  literal fragment "⚠ I couldn’t finish that —", in one iteration, status
+ *  done. Each imitation is itself stored and replayed, so the poisoning is
+ *  self-reinforcing and outlives the outage that caused it.
+ *
+ *  Defined next to humanizeFailure so the two cannot drift; turn-budget-smoke
+ *  asserts every humanizeFailure output matches. */
+export const isFailureNotice = (text: string | null | undefined): boolean =>
+  /^⚠ (I couldn['’]t finish that|Task failed|That request was too large|The model produced)/.test(text ?? '');
+
 export function humanizeFailure(msg: string): string {
   // 413 FIRST, because the generic rate-limit branch below matches it too and
   // then gives actively harmful advice. A 413 means the request itself did not

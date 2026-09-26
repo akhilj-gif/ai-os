@@ -18,7 +18,7 @@ import { selectPackGuides, selectTools, HISTORY_SLOTS, type PackGuide } from './
 /** Mirror of tool-select's private `words()`. Kept in step by the ASCII check
  *  below, which fails if the two ever drift. */
 const probeWords = (s: string): string[] => (s.toLowerCase().match(/[\p{L}\p{N}\p{M}_]+/gu) ?? []).filter((w) => w.length > 2 && !['the','a','an','and','to','for','with','my','me','can','you','do','what'].includes(w));
-import { humanizeFailure } from './executor.js';
+import { humanizeFailure, isFailureNotice } from './executor.js';
 
 let fail = 0;
 const check = (name: string, ok: boolean, extra = ''): void => {
@@ -129,6 +129,30 @@ check('a mixed-script request still finds its tool', mixedSel.selected.some((t) 
 const teluguSel = selectTools(TOOLS, TELUGU, 14, '');
 check('an unmatched non-English turn still gets the escape hatch', teluguSel.selected.some((t) => t.name === 'tools_expand') && teluguSel.omitted.length > 0, `${teluguSel.omitted.length} reachable`);
 check('...and ASCII behaviour is unchanged', JSON.stringify(probeWords('send a whatsapp to amma')) === JSON.stringify(['send', 'whatsapp', 'amma']), JSON.stringify(probeWords('send a whatsapp to amma')));
+
+console.log('');
+console.log('- failure notices are never replayed to the model -');
+// Measured live: 10 of 12 replayed assistant turns were these notices, and the
+// model began answering a healthy request with the fragment
+// '⚠ I couldn’t finish that —'. isFailureNotice is what the chat's history
+// builder uses to keep them out of context, so it must recognise EVERY shape
+// humanizeFailure can produce - including one added later.
+for (const raw of [
+  'INFRA_RATELIMIT 413 (groq): Request too large ... Limit 7000, Requested 7267',
+  'INFRA_RATELIMIT 429 (groq): Rate limit reached',
+  'INFRA_NETWORK: fetch failed',
+  'groq 400: tool_use_failed malformed',
+  'something nobody anticipated',
+]) {
+  const notice = humanizeFailure(raw);
+  check('recognised as a notice: ' + notice.slice(0, 44), isFailureNotice(notice));
+}
+check('the imitated fragment the model actually produced is recognised', isFailureNotice('⚠ I couldn’t finish that —'));
+check('...with a straight apostrophe too', isFailureNotice("⚠ I couldn't finish that"));
+// A real answer must not be dropped from history just for mentioning a warning.
+check('a normal answer is NOT a notice', !isFailureNotice('RELIANCE is ₹1,226 as of Fri 03:14 pm.'));
+check('...nor one that uses the warning glyph for content', !isFailureNotice('⚠ Note: the market is closed until Monday 09:15.'));
+check('...nor an empty message', !isFailureNotice('') && !isFailureNotice(null));
 
 console.log(`\n${fail === 0 ? 'ALL PASS' : fail + ' FAILED'}`);
 process.exit(fail ? 1 : 0);

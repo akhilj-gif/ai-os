@@ -6,6 +6,11 @@
 //   tsx packages/kernel/src/graph-untrusted-smoke.ts
 //   tsx packages/kernel/src/pending-ttl-smoke.ts
 //   tsx packages/kernel/src/graph-recovery-smoke.ts
+//   tsx packages/kernel/src/market-db-smoke.ts
+// The markets suite pins what goes wrong in trading bots specifically: a rule
+// firing twice (the runaway buy), two orders spending the same cash, a fill at
+// a closed-market price, and a disabled pack that keeps trading. It runs in a
+// throwaway schema because the paper account is derived from EVERY trade row.
 // The recovery suite pins that a rate-limited step is retried/parked instead of
 // killing the task (85% of this system's step failures were transient), and
 // that a MUTATING tool is still never re-fired. Needs Postgres for the durable
@@ -43,6 +48,8 @@ const SMOKES = [
   'packages/kernel/src/remote-smoke.ts',
   'packages/packs/src/x-smoke.ts',
   'packages/tools/src/tools/instagram-smoke.ts', // instagram pack — pins the mock client + the caption/hashtag/public-image limits
+  'packages/model-router/src/signature-smoke.ts', // mid-turn failover replays Groq's unsigned tool calls to Gemini — pins the documented placeholder and that real signatures pass through
+  'packages/tools/src/tools/market-smoke.ts', // markets pack — average-cost P&L, overspend/short refusals, market hours, quotes carry their age and no provider prose
   'packages/tools/src/tools/connectors-smoke.ts', // app connectors — pins the slug round trip (save-then-run) and the arg contracts
   'packages/kernel/src/turn-budget-smoke.ts', // per-turn prompt cost + honest failure text — pins the 2,632-token pack-prompt cut and the 413-is-not-transient message
   'packages/kernel/src/recovery-smoke.ts', // failure recovery policy — pins that transient failures retry AND that a trust refusal never does

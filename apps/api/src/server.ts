@@ -23,6 +23,7 @@ import {
   ensureDefaultSession,
   addMessage,
   listMessages,
+  isFailureNotice,
   planAndStart,
   runGraph,
   pauseTask,
@@ -431,6 +432,12 @@ async function completeChatTask(taskId: string, agentMode: 'auto' | 'force' | 'o
   // this task's own just-added message) so the model sees the ongoing chat, not a
   // cold start. Without this every message was a brand-new amnesiac task.
   const prior = (await listMessages(pool, sessionId))
+    // Failure notices stay in the chat for the USER, but are never replayed to
+    // the MODEL as things the assistant said: after a rate-limit stretch, 10 of
+    // the 12 replayed assistant turns were "⚠ I couldn't finish that…" and the
+    // model began answering healthy requests with that exact fragment. See
+    // isFailureNotice in kernel/executor.ts.
+    .filter((m) => !(m.role === 'assistant' && isFailureNotice(m.content)))
     .filter((m) => m.task_id !== taskId && (m.role === 'user' || m.role === 'assistant') && m.content?.trim())
     .slice(-CHAT_HISTORY_TURNS)
     .map((m) => ({
