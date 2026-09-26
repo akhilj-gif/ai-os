@@ -42,6 +42,20 @@ export { whatsappListChats, whatsappReadMessages, whatsappSearchContacts, whatsa
 export { xGetMe, xDraftPost, xPublishPost, xMockOutbox, X_MAX_CHARS } from './tools/x.js';
 export { appScrape, appSave, appList, appRun, type Recipe } from './tools/connectors.js';
 export {
+  marketQuote,
+  paperOrder,
+  paperPortfolio,
+  marketRuleAdd,
+  marketRuleList,
+  marketRuleRemove,
+  evaluateRules,
+  fetchQuote,
+  PAPER_CAPITAL,
+  RULE_CHECK_MINUTES,
+  type Quote,
+  type FiredRule,
+} from './tools/market.js';
+export {
   instagramGetProfile,
   instagramRecentPosts,
   instagramPostInsights,

@@ -7,7 +7,7 @@
 import type pg from 'pg';
 import { createHash } from 'node:crypto';
 import { callModel } from '@ai-os/model-router';
-import { buildRegistry, type ToolRegistry } from '@ai-os/tools';
+import { buildRegistry, evaluateRules, type ToolRegistry } from '@ai-os/tools';
 import { MemoryService } from '@ai-os/memory';
 import { runReflection } from '@ai-os/memory';
 import type { JobExecutor, ExecutorContext, JobRow } from './scheduler.js';
@@ -241,8 +241,36 @@ export const learnExecutor: JobExecutor = async (pool) => {
   return { summary, output: { taskId: r.taskId, proposed: r.proposed, queued: r.queued, rejected: r.rejected }, notify };
 };
 
+/** market — the paper-trading rule loop (markets pack). Every tick evaluates
+ *  standing rules against live prices and executes the ones that trigger.
+ *
+ *  Deliberately NO model call anywhere on this path. 85% of this OS's failed
+ *  steps were transient model-provider errors; a stop-loss that needs the
+ *  rate-limited provider to decide whether to fire is a stop-loss that does not
+ *  fire. The model's part happened earlier, when the user's sentence became a
+ *  structured rule. From here it is arithmetic.
+ *
+ *  Gated on the pack being ENABLED, like watch: disabling the markets pack must
+ *  actually stop trading, not just hide the tools while leftover rules keep
+ *  executing in the background. */
+export const marketExecutor: JobExecutor = async (pool, _job, ctx) => {
+  if (!reg(ctx).get('market_quote')) {
+    return { summary: 'markets pack disabled — rules not evaluated' };
+  }
+  const r = await evaluateRules(pool, { now: ctx.now });
+  if (!r.fired.length) return { summary: r.summary };
+  return {
+    summary: r.summary,
+    notify: {
+      kind: 'market',
+      title: `📈 ${r.fired.length} paper rule${r.fired.length === 1 ? '' : 's'} fired`,
+      body: `${r.fired.map((f) => `• ${f.result}`).join('\n')}\n\n(paper trading — no real money)`,
+    },
+  };
+};
+
 export function defaultExecutors(): Record<string, JobExecutor> {
-  return { briefing: briefingExecutor, watch: watchExecutor, reflect: reflectExecutor, act: actExecutor, learn: learnExecutor };
+  return { briefing: briefingExecutor, watch: watchExecutor, reflect: reflectExecutor, act: actExecutor, learn: learnExecutor, market: marketExecutor };
 }
 
 export type { JobRow };

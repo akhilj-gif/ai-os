@@ -34,6 +34,12 @@ import {
   instagramPostInsights,
   instagramDraftPost,
   instagramPublishPost,
+  marketQuote,
+  paperOrder,
+  paperPortfolio,
+  marketRuleAdd,
+  marketRuleList,
+  marketRuleRemove,
   xGetMe,
   xDraftPost,
   xPublishPost,
@@ -308,6 +314,48 @@ export const PACKS: Record<string, CapabilityPack> = {
       'NO FACEBOOK PAGE NEEDED on the default path: IG_ACCESS_TOKEN alone uses Instagram Login (graph.instagram.com, account addressed as `me`). Only add IG_BUSINESS_ACCOUNT_ID if you went through Facebook Login and have a Page linked.',
       'Long-lived tokens expire after 60 DAYS — the pack reports Meta error code 190 explicitly when that happens rather than failing as a generic 400.',
       'NO DM SUPPORT BY DESIGN: the sanctioned API cannot message anyone first (24h reply window only, 200/hour). A WhatsApp-style Instagram inbox assistant would need an unofficial client, which risks a permanent account ban — deliberately not built.',
+    ],
+  },
+  markets: {
+    name: 'markets',
+    version: '0.1.0',
+    description:
+      'Live stock prices (NSE/BSE/US, free, ~15 min delayed for NSE) plus a PAPER-TRADING account and standing rules that run on their own — buy-the-dip, stop-loss, target and price alerts, checked every 5 minutes in market hours with no model involved. Simulated money only; no broker is connected.',
+    tools: [marketQuote, paperOrder, paperPortfolio, marketRuleAdd, marketRuleList, marketRuleRemove],
+    prompt:
+      "Markets — PAPER TRADING ONLY: a simulated account starting at Rs 1,00,000; no broker is connected and no real money moves. Say \"paper\" whenever you report a trade. Free NSE prices are ~15 min delayed: always state the time a price is from. When the user says \"if\", \"when\" or \"once\" about a price (buy the dip, stop-loss, target, alert), CALL market_rule_add — rules run by themselves every 5 min in market hours, fire once, then switch off; tell the user that. Use paper_order only for an immediate trade, and it is refused while the market is closed. You are NOT a financial adviser: never recommend what to buy or sell, never predict prices, never call a trade good or bad — carry out the user's own instructions and report facts (price, fill, P&L).",
+    policies: [
+      { tool: 'market_quote', trustClass: 'read', autoApprove: true },
+      { tool: 'paper_portfolio', trustClass: 'read', autoApprove: true },
+      { tool: 'market_rule_list', trustClass: 'read', autoApprove: true },
+      // Writes, but only to this OS's own tables: a paper fill moves no real
+      // money and is visible to no one. They are still MUTATING, so §8.3
+      // refuses them once untrusted content is in context — a web page or an
+      // email cannot talk the OS into even a simulated trade.
+      { tool: 'paper_order', trustClass: 'write', autoApprove: true },
+      { tool: 'market_rule_add', trustClass: 'write', autoApprove: true },
+      { tool: 'market_rule_remove', trustClass: 'write', autoApprove: true },
+    ],
+    memories: [
+      {
+        type: 'procedural',
+        subject: 'markets-paper-trading',
+        content:
+          'The markets pack is PAPER TRADING: no real money. Conditional price instructions ("buy X if it drops to Y", "sell if it falls below Z", "tell me when it crosses W") become market_rule_add rules, which the OS executes on its own in market hours and which fire once. Free NSE prices are about 15 minutes delayed; always say what time a price is from.',
+      },
+      {
+        type: 'procedural',
+        subject: 'markets-no-advice',
+        content:
+          'Never recommend stocks, predict prices, or judge a trade as good or bad. The OS is not a licensed financial adviser; it executes the user\'s own instructions and reports facts.',
+      },
+    ],
+    evalSuites: [],
+    verifiedBy: 'market-smoke (pure accounting + rule logic) and market-db-smoke (fills, one-shot rules, job creation)',
+    requires: [
+      'Nothing to start: live prices come from Yahoo Finance free (no key), and trading is simulated.',
+      'Free NSE data is ~15 minutes delayed (measured: last candle 15:14 on a 15:30 close). Fine for alerts and swing rules, NOT for intraday scalping. Real-time needs a broker websocket.',
+      'LIVE TRADING is deliberately not built. It needs a broker account with an API (several Indian brokers offer one free to account holders) and, under SEBI\'s retail algo framework, typically a static IP registered with the broker for API order placement — to be confirmed against current rules before building.',
     ],
   },
   computer: {
