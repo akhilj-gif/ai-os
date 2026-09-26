@@ -4,6 +4,7 @@
 // message piled into one endless thread. Polling keeps the thread current even
 // if the server was killed mid-task and resumed (exit test).
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { Markdown } from './markdown';
 
 interface Msg {
   id: string;
@@ -347,12 +348,15 @@ export default function Home() {
               borderRadius: 10,
               fontSize: 14,
               lineHeight: 1.55,
-              whiteSpace: 'pre-wrap',
+              // What the user typed is shown exactly as typed. Replies are
+              // Markdown: before this they printed literal **asterisks**.
+              whiteSpace: m.role === 'user' ? 'pre-wrap' : 'normal',
+              overflowWrap: 'anywhere',
               background: m.role === 'user' ? '#1d2c55' : '#161825',
               border: `1px solid ${m.role === 'user' ? '#2c3f75' : '#23263a'}`,
             }}
           >
-            {m.content}
+            {m.role === 'user' ? m.content : <Markdown text={m.content ?? ''} />}
           </div>
         ))}
 

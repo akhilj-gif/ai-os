@@ -59,6 +59,7 @@ const SMOKES = [
   'apps/browser-bridge/src/find-in-page-smoke.ts',
   'apps/browser-bridge/src/ssrf-route-smoke.ts', // bridge SSRF guard covers EVERY http(s) request (security-critical)
   'apps/browser-bridge/src/ref-identity-smoke.ts', // element refs carry identity — pins the wrong-element-click regression // bridge SSRF guard covers EVERY http(s) request, not just documents (security-critical)
+  'apps/web/markdown-smoke.ts', // chat Markdown — replies render without literal **, and attacker text inside a reply can never become markup (security-critical)
   'apps/voice/src/lib/vad-smoke.ts',
 ];
 
